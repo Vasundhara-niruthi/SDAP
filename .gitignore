@@ -1,0 +1,45 @@
+# Environment files
+.env
+.env.example
+*.env
+**/.env
+**/.env.example
+
+# Python & Virtual Environments
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.venv/
+env/
+ENV/
+
+# Node modules & build outputs
+node_modules/
+dist/
+dist-ssr/
+
+# Large GIS and Satellite Data (>100MB or multi-GB rasters)
+*.shp
+*.shx
+*.dbf
+*.cpg
+*.tif
+*.tiff
+*.part
+sentinel-2_grids.geojson
+backend/data/reference_india_districts.geojson
+backend/data/archive/
+backend/data/raw_archive/
+backend/data/staging/
+backend/data/output/
+backend/data/delivery/
+backend_git_backup/
+
+# System & Editor files
+.DS_Store
+.vscode/
+.idea/
+*.log
+
+
