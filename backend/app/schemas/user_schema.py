@@ -18,6 +18,7 @@ class UserResponse(BaseModel):
     role: UserRole
     is_active: bool
     created_at: datetime
+    request_count: Optional[int] = 0
 
     class Config:
         from_attributes = True

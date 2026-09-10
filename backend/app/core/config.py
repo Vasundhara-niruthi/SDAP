@@ -40,6 +40,15 @@ class Settings(BaseSettings):
     OUTPUT_INDEX_DIR: str = "data/output"
     DELIVERY_DIR: str = "data/delivery"
 
+    # AWS Open Data Registry - Sentinel-2 Configuration (https://registry.opendata.aws/sentinel-2/)
+    AWS_SENTINEL_BUCKET: str = "sentinel-s2-l2a"
+    AWS_REGION: str = "eu-central-1"
+    AWS_SENTINEL_L1C_BUCKET: str = "sentinel-s2-l1c"
+    AWS_SENTINEL_SNS_TOPIC_L2A: str = "arn:aws:sns:eu-central-1:214830741341:SentinelS2L2A"
+    AWS_SENTINEL_SNS_TOPIC_L1C: str = "arn:aws:sns:eu-west-1:214830741341:NewSentinel2Product"
+    AWS_SENTINEL_COGS_BUCKET: str = "sentinel-cogs"
+    AWS_COGS_REGION: str = "us-west-2"
+
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
 

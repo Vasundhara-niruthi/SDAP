@@ -36,6 +36,8 @@ logger = logging.getLogger("sdap.verify_aws")
 
 BUCKET = "sentinel-cogs"
 REGION = "us-west-2"
+BUCKET = getattr(settings, "AWS_SENTINEL_BUCKET", "sentinel-s2-l2a")
+REGION = getattr(settings, "AWS_REGION", "eu-central-1")
 
 s3_client = boto3.client(
     "s3",
@@ -51,7 +53,19 @@ def verify_aws_scene_download(sample_tile: str = "44QLD"):
     # Sample S3 COG key (Sentinel-2 L2A scene for tile 44QLD)
     sample_prefix = f"sentinel-s2-l2a-cogs/44/Q/LD/2025/1/S2A_44QLD_20250102_0_L2A/"
     band_name = "B04.tif"
+    if "s2-l2a" in BUCKET.lower():
+        # Official AWS Open Data Sentinel-2 L2A registry
+        sample_prefix = "tiles/44/Q/LD/2025/1/12/0/R10m/"
+        band_name = "B04.jp2"
+        folder_name = "S2A_44QLD_20250112_0_L2A"
+    else:
+        # Sentinel-2 COGs
+        sample_prefix = "sentinel-s2-l2a-cogs/44/Q/LD/2025/1/S2A_44QLD_20250102_0_L2A/"
+        band_name = "B04.tif"
+        folder_name = "S2A_44QLD_20250102_0_L2A"
+
     s3_key = f"{sample_prefix}{band_name}"
+    target_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "archive", sample_tile, "2025", "1", folder_name)
 
     target_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "raw_archive", sample_tile, "2025", "1", "S2A_44QLD_20250102_0_L2A")
 

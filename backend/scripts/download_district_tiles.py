@@ -29,6 +29,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from sqlalchemy import text
 
+from app.core.config import settings
 from app.core.database import SessionLocal
 from app.models.sdap_models import SceneModel, RequestModel, ProcessJobModel
 from app.services.gap_check_service import perform_gap_check, get_all_mapped_districts, get_tiles_for_state
@@ -194,7 +195,15 @@ def run_district_acquisition_pipeline(
         append_request_log(db, request_id, f"  • S2 MGRS Tiles identified: {tiles}")
         append_request_log(db, request_id, f"  • Available on AWS S3:     {avail_count} total scenes")
         append_request_log(db, request_id, f"  • Already held in archive: {held_count} scenes (skipped)")
-        append_request_log(db, request_id, f"  • Genuinely missing:       {len(missing_scenes)} scenes to download")
+        for h_sc in gap_res.get("held_scenes", []):
+            dl_time = h_sc.get("downloaded_at", "previously")
+            arch_p = h_sc.get("archive_path", "")
+            append_request_log(
+                db, request_id,
+                f"  • [ALREADY DOWNLOADED - VERIFIED] Scene '{h_sc['scene_id']}' (Tile {h_sc['tile']}, Date {h_sc['sensing_date']}) "
+                f"cached at '{arch_p}' (Downloaded: {dl_time}). Skipping download."
+            )
+
         append_request_log(db, request_id, f"  ✓ Stage 1 Complete: Gap Check verified.")
         _update_job(db, gap_job, "COMPLETED")
 
@@ -211,12 +220,15 @@ def run_district_acquisition_pipeline(
 
         step2_msg = (
             f"STEP 2: Downloading {len(missing_scenes)} missing scenes "
-            f"from AWS S3 bucket 'sentinel-cogs'..."
+            f"from AWS S3 bucket '{settings.AWS_SENTINEL_BUCKET}'..."
         )
         logger.info(step2_msg)
         append_request_log(db, request_id, step2_msg)
         append_request_log(db, request_id, f"\n[STAGE 2/4] FETCHING & VERIFYING {len(missing_scenes)} MISSING SCENES FROM AWS S3")
-        append_request_log(db, request_id, f"  • Bucket: 'sentinel-cogs' (US-West-2) | Concurrency: 5 bands in parallel")
+        append_request_log(db, request_id, f"  • Bucket: '{settings.AWS_SENTINEL_BUCKET}' ({settings.AWS_REGION}) | Concurrency: 5 bands in parallel")
+
+        req_record = db.query(RequestModel).filter(RequestModel.id == request_id).first()
+        user_id = req_record.user_id if req_record else None
 
         downloaded_count = 0
         held_scenes = []
@@ -249,20 +261,15 @@ def run_district_acquisition_pipeline(
                 db.add(scene_obj)
                 db.commit()
 
-            dl_msg = f"  [{idx}/{len(missing_scenes)} - {pct}%] Downloading '{sc['folder']}' (Tile {sc['tile']}, Date {sc['sensing_date']})..."
+            dl_msg = f"  [{idx}/{len(missing_scenes)} - {pct}%] Processing '{sc['folder']}' (Tile {sc['tile']}, Date {sc['sensing_date']})..."
             logger.info(dl_msg)
             append_request_log(db, request_id, dl_msg)
 
-            ok, band_details = download_and_verify_scene(db, scene_obj)
+            ok, band_details, dl_log = download_and_verify_scene(db, scene_obj, user_id=user_id)
             if ok:
                 downloaded_count += 1
                 held_scenes.append(scene_obj)
-                total_mb = sum(b.get("size_bytes", 0) for b in band_details) / (1024 * 1024)
-                bands_summary = ", ".join([f"{b['band'].replace('.tif','')}: {b['size_bytes']/(1024*1024):.1f}MB" for b in band_details if b.get('ok')])
-                append_request_log(
-                    db, request_id,
-                    f"     ✓ OK: Scene '{sc['scene_id']}' verified ({len(band_details)} bands, {total_mb:.1f} MB: {bands_summary})"
-                )
+                append_request_log(db, request_id, f"     ✓ {dl_log}")
             else:
                 failed_bands = [b['band'] for b in band_details if not b.get('ok')]
                 append_request_log(
@@ -323,7 +330,7 @@ def run_district_acquisition_pipeline(
                 return False
 
             band_paths = {
-                f.band.replace(".tif", ""): f.path
+                os.path.splitext(f.band)[0]: f.path
                 for f in scene.files if f.verified == 1
             }
 

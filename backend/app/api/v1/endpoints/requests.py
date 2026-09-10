@@ -291,17 +291,24 @@ def create_request(
 def list_requests(
     skip: int = 0,
     limit: int = 100,
+    scope: Optional[str] = Query(None, description="'mine' to return only current user's requests"),
+    user_id: Optional[int] = Query(None, description="Filter requests by user ID (Admin only)"),
     db: Session = Depends(get_db),
     current_user: UserModel = Depends(get_current_user)
 ):
     """
     Retrieve satellite acquisition requests.
-    - Standard USER: sees ONLY their own submitted requests.
-    - ADMIN: sees all requests from all users.
+    - Standard USER: always sees ONLY their own submitted requests.
+    - ADMIN:
+      - if scope == 'mine': sees only their own requests.
+      - if user_id is provided: sees only that user's requests.
+      - otherwise: sees all requests.
     """
     query = db.query(RequestModel).options(joinedload(RequestModel.user))
-    if current_user.role != "ADMIN":
+    if current_user.role != "ADMIN" or scope == "mine":
         query = query.filter(RequestModel.user_id == current_user.id)
+    elif user_id is not None:
+        query = query.filter(RequestModel.user_id == user_id)
 
     requests_list = query.order_by(RequestModel.id.desc()).offset(skip).limit(limit).all()
     return [build_request_response(r) for r in requests_list]
@@ -321,71 +328,6 @@ def get_request(
     if not req:
         raise HTTPException(status_code=404, detail="Request not found.")
     return build_request_response(req)
-
-
-@router.get("/live-monitoring", summary="Get Real-Time Pipeline Progress (Admin Only)")
-def get_live_monitoring(
-    db: Session = Depends(get_db),
-    admin: UserModel = Depends(get_current_admin)
-):
-    """
-    Admin Live Pipeline & Work Activity Feed.
-    Provides real-time status, active pipeline stage, estimated completion %,
-    and tile processing telemetry for all user jobs.
-    """
-    all_requests = db.query(RequestModel).options(joinedload(RequestModel.user)).order_by(RequestModel.id.desc()).all()
-
-    monitoring_feed = []
-    for req in all_requests:
-        # Query the most recent job for this request
-        job = db.query(ProcessJobModel).filter(
-            ProcessJobModel.request_id == req.id
-        ).order_by(ProcessJobModel.job_id.desc()).first()
-
-        if job:
-            stage = job.stage
-            # Derive progress from stage + completion status
-            if job.status == "COMPLETED":
-                progress_pct = 100.0 if stage == "DELIVERY_CLIP" else STAGE_PROGRESS.get(stage, 0.0) + 5.0
-            elif job.status == "FAILED":
-                progress_pct = STAGE_PROGRESS.get(stage, 0.0)
-            else:
-                progress_pct = STAGE_PROGRESS.get(stage, 0.0)
-
-            active_tile_info = job.error_log or f"Stage: {stage} | Job Status: {job.status}"
-        else:
-            # Derive from request status when no job record exists
-            status_map = {
-                "HOLD_FOR_APPROVAL": ("AWAITING_APPROVAL", 0.0, "Request pending Admin approval (Storage > 2,000 GB)."),
-                "ACCEPTED": ("QUEUED", 0.0, "Queued for tile discovery and AWS S3 acquisition."),
-                "PROCESSING": ("PROCESSING", 50.0, "Tile processing in progress."),
-                "COMPLETED": ("COMPLETED", 100.0, "Processing complete. Clipped rasters archived and delivered."),
-                "STOPPED": ("STOPPED", 0.0, "Pipeline execution stopped by user."),
-                "REJECTED": ("REJECTED", 0.0, "Request rejected — exceeds storage limits."),
-            }
-            info = status_map.get(req.status, ("SUBMITTED", 0.0, f"Request status: {req.status}"))
-            stage, progress_pct, active_tile_info = info
-
-        monitoring_feed.append({
-            "request_id": req.id,
-            "request_title": req.request_title,
-            "user_name": req.user.full_name if req.user else "Unknown",
-            "user_email": req.user.email if req.user else "Unknown",
-            "satellite": req.satellite,
-            "location": f"{req.district}, {req.state}" if req.district else (req.state or "—"),
-            "estimated_gb": req.storage_estimated_gb,
-            "status": req.status,
-            "pipeline_stage": stage,
-            "progress_pct": progress_pct,
-            "live_telemetry": active_tile_info,
-            "submitted_at": req.created_at
-        })
-
-    return {
-        "timestamp": datetime.utcnow().isoformat(),
-        "total_active_jobs": len(all_requests),
-        "live_feed": monitoring_feed
-    }
 
 
 @router.patch("/{request_id}/status", response_model=RequestResponse, summary="Approve / Update Request Status (Admin Only)")

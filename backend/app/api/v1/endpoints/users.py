@@ -1,11 +1,13 @@
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
+from sqlalchemy import func
 from typing import List
 
 from app.core.database import get_db
 from app.core.security import get_current_admin, hash_password
 from app.models.sdap_models import UserModel, RequestModel
 from app.schemas.user_schema import UserCreate, UserResponse
+from app.schemas.request_schema import RequestResponse
 
 router = APIRouter()
 
@@ -36,7 +38,15 @@ def create_user(
     db.add(db_user)
     db.commit()
     db.refresh(db_user)
-    return db_user
+    return UserResponse(
+        id=db_user.id,
+        email=db_user.email,
+        full_name=db_user.full_name,
+        role=db_user.role,
+        is_active=db_user.is_active,
+        created_at=db_user.created_at,
+        request_count=0
+    )
 
 
 @router.get("/", response_model=List[UserResponse], summary="List All Users (Admin Only)")
@@ -47,9 +57,56 @@ def list_users(
     admin: UserModel = Depends(get_current_admin)
 ):
     """
-    Admin-only endpoint to list all users and view their roles & statuses.
+    Admin-only endpoint to list all users, roles, statuses, and total request counts.
     """
-    return db.query(UserModel).offset(skip).limit(limit).all()
+    users_with_counts = db.query(
+        UserModel,
+        func.count(RequestModel.id).label("request_count")
+    ).outerjoin(
+        RequestModel, UserModel.id == RequestModel.user_id
+    ).group_by(
+        UserModel.id
+    ).order_by(
+        UserModel.id.asc()
+    ).offset(skip).limit(limit).all()
+
+    response = []
+    for user, count in users_with_counts:
+        response.append(UserResponse(
+            id=user.id,
+            email=user.email,
+            full_name=user.full_name,
+            role=user.role,
+            is_active=user.is_active,
+            created_at=user.created_at,
+            request_count=count
+        ))
+    return response
+
+
+@router.get("/{user_id}/requests", response_model=List[RequestResponse], summary="Get Specific User's Requests (Admin Only)")
+def get_user_requests(
+    user_id: int,
+    db: Session = Depends(get_db),
+    admin: UserModel = Depends(get_current_admin)
+):
+    """
+    Admin-only endpoint to retrieve all satellite acquisition requests and logs for a specific user.
+    """
+    target_user = db.query(UserModel).filter(UserModel.id == user_id).first()
+    if not target_user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    user_requests = db.query(RequestModel).options(
+        joinedload(RequestModel.user)
+    ).filter(
+        RequestModel.user_id == user_id
+    ).order_by(
+        RequestModel.id.desc()
+    ).all()
+
+    from app.api.v1.endpoints.requests import build_request_response
+    return [build_request_response(r) for r in user_requests]
 
 
 @router.delete("/{user_id}", status_code=status.HTTP_204_NO_CONTENT, summary="Delete User Account (Admin Only)")

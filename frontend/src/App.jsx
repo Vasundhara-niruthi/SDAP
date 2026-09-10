@@ -3,7 +3,7 @@ import axios from 'axios';
 import {
   Satellite, Activity, HardDrive, User, LogOut, RefreshCw, FileText,
   CheckCircle, Clock, AlertTriangle, XCircle, Plus, Search, Database,
-  Calendar, MapPin, Sliders, Shield, Users, Check, ChevronRight, Info,
+  Calendar, MapPin, Sliders, Shield, Users, Check, ChevronRight, ChevronDown, Info,
   HelpCircle, X, Download, Play, Terminal, Eye, EyeOff, KeyRound, ArrowLeft, Square
 } from 'lucide-react';
 
@@ -117,8 +117,10 @@ export default function App() {
   // 6. Admin State
   // ---------------------------------------------------------------------------
   const [adminUsers, setAdminUsers] = useState([]);
-  const [adminLiveFeed, setAdminLiveFeed] = useState([]);
   const [loadingAdmin, setLoadingAdmin] = useState(false);
+  const [expandedUserId, setExpandedUserId] = useState(null);
+  const [userRequestsMap, setUserRequestsMap] = useState({});
+  const [loadingUserRequests, setLoadingUserRequests] = useState({});
   const [newAdminEmail, setNewAdminEmail] = useState('');
   const [newAdminPassword, setNewAdminPassword] = useState('');
   const [newAdminFullName, setNewAdminFullName] = useState('');
@@ -259,12 +261,12 @@ export default function App() {
     return () => { isCancelled = true; };
   }, [token]);
 
-  // Fetch Requests List (stable reference - only depends on token)
+  // Fetch Requests List (scoped to logged-in user - stable reference)
   const fetchRequests = useCallback(async () => {
     if (!token) return;
     setLoadingRequests(true);
     try {
-      const res = await axios.get(`${API_BASE}/requests/`, { headers: getAuthHeader() });
+      const res = await axios.get(`${API_BASE}/requests/?scope=mine`, { headers: getAuthHeader() });
       const data = res.data || [];
       setRequests(data);
 
@@ -281,23 +283,53 @@ export default function App() {
     }
   }, [token]);
 
-  // Fetch Admin Data
+  // Fetch Admin Users Directory
   const fetchAdminData = useCallback(async () => {
     if (!token || currentUser?.role !== 'ADMIN') return;
     setLoadingAdmin(true);
     try {
-      const [usersRes, liveRes] = await Promise.all([
-        axios.get(`${API_BASE}/users/`, { headers: getAuthHeader() }),
-        axios.get(`${API_BASE}/requests/live-monitoring`, { headers: getAuthHeader() })
-      ]);
+      const usersRes = await axios.get(`${API_BASE}/users/`, { headers: getAuthHeader() });
       setAdminUsers(usersRes.data || []);
-      setAdminLiveFeed(liveRes.data?.live_feed || []);
     } catch (err) {
-      console.error('Error loading admin feed:', err);
+      console.error('Error loading admin users directory:', err);
     } finally {
       setLoadingAdmin(false);
     }
   }, [token, currentUser]);
+
+  // Fetch Specific User's Requests (Admin Only)
+  const fetchUserRequests = useCallback(async (userId) => {
+    if (!userId) return;
+    setLoadingUserRequests(prev => ({ ...prev, [userId]: true }));
+    try {
+      const res = await axios.get(`${API_BASE}/users/${userId}/requests`, { headers: getAuthHeader() });
+      setUserRequestsMap(prev => ({ ...prev, [userId]: res.data || [] }));
+    } catch (err) {
+      console.error(`Error loading requests for user ${userId}:`, err);
+    } finally {
+      setLoadingUserRequests(prev => ({ ...prev, [userId]: false }));
+    }
+  }, []);
+
+  const toggleExpandUser = (userId) => {
+    if (expandedUserId === userId) {
+      setExpandedUserId(null);
+    } else {
+      setExpandedUserId(userId);
+      fetchUserRequests(userId);
+    }
+  };
+
+  const openLogsModal = (req) => {
+    selectedReqIdRef.current = req.id;
+    setSelectedReqForLogs(req);
+    setIsLogsModalOpen(true);
+  };
+
+  const closeLogsModal = () => {
+    selectedReqIdRef.current = null;
+    setIsLogsModalOpen(false);
+  };
 
   // Initial fetch of requests on login
   useEffect(() => {
@@ -322,15 +354,28 @@ export default function App() {
 
     if (!shouldPoll) return;
 
-    const interval = setInterval(() => {
+    const interval = setInterval(async () => {
       fetchRequests();
       if (activeTab === 'admin' && currentUser?.role === 'ADMIN') {
         fetchAdminData();
+        if (expandedUserId) {
+          fetchUserRequests(expandedUserId);
+        }
+      }
+      if (isLogsModalOpen && selectedReqIdRef.current) {
+        try {
+          const res = await axios.get(`${API_BASE}/requests/${selectedReqIdRef.current}`, { headers: getAuthHeader() });
+          if (res.data) {
+            setSelectedReqForLogs(res.data);
+          }
+        } catch (e) {
+          // ignore polling failure
+        }
       }
     }, 3000);
 
     return () => clearInterval(interval);
-  }, [token, requests, isLogsModalOpen, activeTab, currentUser?.role, fetchRequests, fetchAdminData]);
+  }, [token, requests, isLogsModalOpen, activeTab, currentUser?.role, expandedUserId, fetchRequests, fetchAdminData, fetchUserRequests]);
 
   // Auto scroll terminal log view when logs update
   useEffect(() => {
@@ -1366,10 +1411,7 @@ export default function App() {
                           }}
                           onMouseEnter={(e) => e.currentTarget.style.backgroundColor = '#f8fafc'}
                           onMouseLeave={(e) => e.currentTarget.style.backgroundColor = '#ffffff'}
-                          onClick={() => {
-                            setSelectedReqForLogs(req);
-                            setIsLogsModalOpen(true);
-                          }}
+                          onClick={() => openLogsModal(req)}
                         >
                           <td style={{ padding: '0.85rem 1rem', fontWeight: 700, color: '#2563eb' }}>#{req.id}</td>
                           <td style={{ padding: '0.85rem 1rem', fontWeight: 600, color: '#0f172a' }}>
@@ -1399,10 +1441,7 @@ export default function App() {
                           <td style={{ padding: '0.85rem 1rem', textAlign: 'right' }} onClick={(e) => e.stopPropagation()}>
                             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'flex-end', gap: '0.5rem' }}>
                               <button
-                                onClick={() => {
-                                  setSelectedReqForLogs(req);
-                                  setIsLogsModalOpen(true);
-                                }}
+                                onClick={() => openLogsModal(req)}
                                 style={{
                                   display: 'inline-flex',
                                   alignItems: 'center',
@@ -1868,87 +1907,22 @@ export default function App() {
         {/* ========================================================================= */}
         {activeTab === 'admin' && currentUser.role === 'ADMIN' && (
           <div style={{ display: 'flex', flexDirection: 'column', gap: '1.5rem' }}>
-            
-            {/* Live Pipeline Telemetry Feed */}
+
+            {/* User Management & Per-User Requests/Logs Section */}
             <div style={{
               backgroundColor: '#ffffff',
               borderRadius: '0.75rem',
               border: '1px solid #e2e8f0',
               padding: '1.5rem'
             }}>
-              <h3 style={{ fontSize: '1.1rem', fontWeight: 700, color: '#0f172a', marginBottom: '1rem', display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-                <Activity size={18} color="#2563eb" /> Real-Time Pipeline Telemetry & Active Jobs
-              </h3>
-
-              <div style={{ overflowX: 'auto' }}>
-                <table style={{ width: '100%', borderCollapse: 'collapse', textAlign: 'left', fontSize: '0.85rem' }}>
-                  <thead>
-                    <tr style={{ backgroundColor: '#f8fafc', borderBottom: '1px solid #e2e8f0', color: '#475569', fontWeight: 600 }}>
-                      <th style={{ padding: '0.75rem 0.85rem' }}>Job ID</th>
-                      <th style={{ padding: '0.75rem 0.85rem' }}>User</th>
-                      <th style={{ padding: '0.75rem 0.85rem' }}>Location</th>
-                      <th style={{ padding: '0.75rem 0.85rem' }}>Stage</th>
-                      <th style={{ padding: '0.75rem 0.85rem' }}>Progress</th>
-                      <th style={{ padding: '0.75rem 0.85rem' }}>Live Telemetry</th>
-                      <th style={{ padding: '0.75rem 0.85rem', textAlign: 'right' }}>Admin Controls</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {adminLiveFeed.length === 0 ? (
-                      <tr>
-                        <td colSpan={7} style={{ padding: '2rem', textAlign: 'center', color: '#64748b' }}>No active telemetry jobs found.</td>
-                      </tr>
-                    ) : (
-                      adminLiveFeed.map((feedItem) => (
-                        <tr key={feedItem.request_id} style={{ borderBottom: '1px solid #f1f5f9' }}>
-                          <td style={{ padding: '0.75rem 0.85rem', fontWeight: 700 }}>#{feedItem.request_id}</td>
-                          <td style={{ padding: '0.75rem 0.85rem' }}>{feedItem.user_name}</td>
-                          <td style={{ padding: '0.75rem 0.85rem' }}>{feedItem.location}</td>
-                          <td style={{ padding: '0.75rem 0.85rem', fontWeight: 600, color: '#2563eb' }}>{feedItem.pipeline_stage}</td>
-                          <td style={{ padding: '0.75rem 0.85rem', width: '140px' }}>
-                            <div style={{ backgroundColor: '#e2e8f0', height: '8px', borderRadius: '4px', overflow: 'hidden' }}>
-                              <div style={{ backgroundColor: '#2563eb', height: '100%', width: `${feedItem.progress_pct}%`, transition: 'width 0.3s' }} />
-                            </div>
-                            <span style={{ fontSize: '0.72rem', color: '#64748b' }}>{feedItem.progress_pct}%</span>
-                          </td>
-                          <td style={{ padding: '0.75rem 0.85rem', color: '#334155', fontSize: '0.8rem' }}>{feedItem.live_telemetry}</td>
-                          <td style={{ padding: '0.75rem 0.85rem', textAlign: 'right' }}>
-                            {feedItem.status === 'HOLD_FOR_APPROVAL' && (
-                              <button
-                                onClick={() => handleApproveStatus(feedItem.request_id, 'ACCEPTED')}
-                                style={{
-                                  padding: '0.3rem 0.6rem',
-                                  backgroundColor: '#166534',
-                                  color: '#ffffff',
-                                  border: 'none',
-                                  borderRadius: '0.25rem',
-                                  fontSize: '0.75rem',
-                                  fontWeight: 600,
-                                  cursor: 'pointer'
-                                }}
-                              >
-                                Approve Request
-                              </button>
-                            )}
-                          </td>
-                        </tr>
-                      ))
-                    )}
-                  </tbody>
-                </table>
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '1rem', flexWrap: 'wrap', gap: '0.5rem' }}>
+                <h3 style={{ fontSize: '1.1rem', fontWeight: 700, color: '#0f172a', margin: 0, display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                  <Users size={18} color="#2563eb" /> System User Directory & Access Controls
+                </h3>
+                <span style={{ fontSize: '0.8rem', color: '#64748b' }}>
+                  Select any user below to view their individual requests and pipeline execution logs.
+                </span>
               </div>
-            </div>
-
-            {/* User Management Section */}
-            <div style={{
-              backgroundColor: '#ffffff',
-              borderRadius: '0.75rem',
-              border: '1px solid #e2e8f0',
-              padding: '1.5rem'
-            }}>
-              <h3 style={{ fontSize: '1.1rem', fontWeight: 700, color: '#0f172a', marginBottom: '1rem', display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-                <Users size={18} color="#2563eb" /> System User Directory & Access Controls
-              </h3>
 
               {adminUserMsg && (
                 <div style={{
@@ -2016,7 +1990,8 @@ export default function App() {
                     fontSize: '0.85rem',
                     border: 'none',
                     borderRadius: '0.375rem',
-                    cursor: 'pointer'
+                    cursor: 'pointer',
+                    padding: '0.45rem 0.75rem'
                   }}
                 >
                   + Add User
@@ -2024,7 +1999,7 @@ export default function App() {
               </form>
 
               {/* Users Directory Table */}
-              <div style={{ overflowX: 'auto' }}>
+              <div style={{ overflowX: 'auto', border: '1px solid #e2e8f0', borderRadius: '0.5rem' }}>
                 <table style={{ width: '100%', borderCollapse: 'collapse', textAlign: 'left', fontSize: '0.85rem' }}>
                   <thead>
                     <tr style={{ backgroundColor: '#f8fafc', borderBottom: '1px solid #e2e8f0', color: '#475569', fontWeight: 600 }}>
@@ -2032,23 +2007,271 @@ export default function App() {
                       <th style={{ padding: '0.75rem 0.85rem' }}>Full Name</th>
                       <th style={{ padding: '0.75rem 0.85rem' }}>Email</th>
                       <th style={{ padding: '0.75rem 0.85rem' }}>Role</th>
+                      <th style={{ padding: '0.75rem 0.85rem' }}>Total Requests</th>
                       <th style={{ padding: '0.75rem 0.85rem' }}>Account Status</th>
+                      <th style={{ padding: '0.75rem 0.85rem', textAlign: 'right' }}>User Work & Logs</th>
                     </tr>
                   </thead>
                   <tbody>
-                    {adminUsers.map((u) => (
-                      <tr key={u.id} style={{ borderBottom: '1px solid #f1f5f9' }}>
-                        <td style={{ padding: '0.75rem 0.85rem', fontWeight: 600 }}>#{u.id}</td>
-                        <td style={{ padding: '0.75rem 0.85rem' }}>{u.full_name || '—'}</td>
-                        <td style={{ padding: '0.75rem 0.85rem' }}>{u.email}</td>
-                        <td style={{ padding: '0.75rem 0.85rem', fontWeight: 600, color: u.role === 'ADMIN' ? '#1d4ed8' : '#475569' }}>
-                          {u.role}
-                        </td>
-                        <td style={{ padding: '0.75rem 0.85rem' }}>
-                          <span style={{ color: '#166534', fontWeight: 600 }}>ACTIVE</span>
-                        </td>
+                    {adminUsers.length === 0 ? (
+                      <tr>
+                        <td colSpan={7} style={{ padding: '2rem', textAlign: 'center', color: '#64748b' }}>No users found in directory.</td>
                       </tr>
-                    ))}
+                    ) : (
+                      adminUsers.map((u) => {
+                        const isExpanded = expandedUserId === u.id;
+                        const userReqs = userRequestsMap[u.id] || [];
+                        const isLoadingReqs = loadingUserRequests[u.id];
+
+                        return (
+                          <React.Fragment key={u.id}>
+                            <tr
+                              style={{
+                                borderBottom: isExpanded ? 'none' : '1px solid #f1f5f9',
+                                backgroundColor: isExpanded ? '#eff6ff' : '#ffffff',
+                                transition: 'background-color 0.15s'
+                              }}
+                            >
+                              <td style={{ padding: '0.75rem 0.85rem', fontWeight: 600 }}>#{u.id}</td>
+                              <td style={{ padding: '0.75rem 0.85rem', fontWeight: 600, color: '#0f172a' }}>{u.full_name || '—'}</td>
+                              <td style={{ padding: '0.75rem 0.85rem', color: '#334155' }}>{u.email}</td>
+                              <td style={{ padding: '0.75rem 0.85rem' }}>
+                                <span style={{
+                                  padding: '0.2rem 0.5rem',
+                                  borderRadius: '0.25rem',
+                                  fontSize: '0.72rem',
+                                  fontWeight: 700,
+                                  backgroundColor: u.role === 'ADMIN' ? '#dbeafe' : '#f1f5f9',
+                                  color: u.role === 'ADMIN' ? '#1d4ed8' : '#475569'
+                                }}>
+                                  {u.role}
+                                </span>
+                              </td>
+                              <td style={{ padding: '0.75rem 0.85rem' }}>
+                                <span style={{
+                                  padding: '0.2rem 0.5rem',
+                                  borderRadius: '0.25rem',
+                                  fontSize: '0.75rem',
+                                  fontWeight: 600,
+                                  backgroundColor: (u.request_count > 0 || userReqs.length > 0) ? '#dcfce7' : '#f8fafc',
+                                  color: (u.request_count > 0 || userReqs.length > 0) ? '#166534' : '#94a3b8'
+                                }}>
+                                  {u.request_count ?? userReqs.length} Requests
+                                </span>
+                              </td>
+                              <td style={{ padding: '0.75rem 0.85rem' }}>
+                                <span style={{ color: '#166534', fontWeight: 600, fontSize: '0.75rem' }}>● ACTIVE</span>
+                              </td>
+                              <td style={{ padding: '0.75rem 0.85rem', textAlign: 'right' }}>
+                                <button
+                                  onClick={() => toggleExpandUser(u.id)}
+                                  style={{
+                                    display: 'inline-flex',
+                                    alignItems: 'center',
+                                    gap: '0.35rem',
+                                    padding: '0.35rem 0.7rem',
+                                    backgroundColor: isExpanded ? '#2563eb' : '#ffffff',
+                                    color: isExpanded ? '#ffffff' : '#2563eb',
+                                    border: '1px solid #2563eb',
+                                    borderRadius: '0.375rem',
+                                    fontSize: '0.78rem',
+                                    fontWeight: 600,
+                                    cursor: 'pointer'
+                                  }}
+                                >
+                                  {isExpanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+                                  {isExpanded ? 'Hide Requests' : 'View Requests & Logs'}
+                                </button>
+                              </td>
+                            </tr>
+
+                            {/* Accordion: User Requests & Execution Logs Sub-Panel */}
+                            {isExpanded && (
+                              <tr style={{ borderBottom: '2px solid #cbd5e1' }}>
+                                <td colSpan={7} style={{ padding: '1rem 1.25rem', backgroundColor: '#f8fafc' }}>
+                                  <div style={{
+                                    backgroundColor: '#ffffff',
+                                    border: '1px solid #e2e8f0',
+                                    borderRadius: '0.5rem',
+                                    padding: '1rem',
+                                    boxShadow: '0 1px 3px rgba(0,0,0,0.04)'
+                                  }}>
+                                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '0.75rem' }}>
+                                      <h4 style={{ fontSize: '0.92rem', fontWeight: 700, color: '#0f172a', margin: 0, display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
+                                        <FileText size={15} color="#2563eb" /> Requests & Pipeline Logs for {u.full_name} ({u.email})
+                                      </h4>
+                                      <button
+                                        onClick={() => fetchUserRequests(u.id)}
+                                        style={{
+                                          display: 'flex',
+                                          alignItems: 'center',
+                                          gap: '0.25rem',
+                                          padding: '0.25rem 0.5rem',
+                                          border: '1px solid #cbd5e1',
+                                          borderRadius: '0.25rem',
+                                          backgroundColor: '#ffffff',
+                                          fontSize: '0.75rem',
+                                          color: '#475569',
+                                          cursor: 'pointer'
+                                        }}
+                                      >
+                                        <RefreshCw size={11} className={isLoadingReqs ? 'animate-spin' : ''} /> Refresh
+                                      </button>
+                                    </div>
+
+                                    {isLoadingReqs ? (
+                                      <div style={{ padding: '2rem', textAlign: 'center', color: '#64748b', fontSize: '0.85rem' }}>
+                                        <RefreshCw size={18} className="animate-spin" style={{ display: 'inline', marginRight: '0.5rem' }} />
+                                        Loading user requests...
+                                      </div>
+                                    ) : userReqs.length === 0 ? (
+                                      <div style={{ padding: '1.5rem', textAlign: 'center', color: '#94a3b8', fontSize: '0.82rem' }}>
+                                        No satellite requests have been submitted by this user yet.
+                                      </div>
+                                    ) : (
+                                      <div style={{ overflowX: 'auto' }}>
+                                        <table style={{ width: '100%', borderCollapse: 'collapse', textAlign: 'left', fontSize: '0.82rem' }}>
+                                          <thead>
+                                            <tr style={{ backgroundColor: '#f1f5f9', borderBottom: '1px solid #e2e8f0', color: '#475569', fontWeight: 600 }}>
+                                              <th style={{ padding: '0.6rem 0.75rem' }}>Req #</th>
+                                              <th style={{ padding: '0.6rem 0.75rem' }}>Title</th>
+                                              <th style={{ padding: '0.6rem 0.75rem' }}>Location</th>
+                                              <th style={{ padding: '0.6rem 0.75rem' }}>Satellite</th>
+                                              <th style={{ padding: '0.6rem 0.75rem' }}>Est. Storage</th>
+                                              <th style={{ padding: '0.6rem 0.75rem' }}>Status</th>
+                                              <th style={{ padding: '0.6rem 0.75rem' }}>Submitted At</th>
+                                              <th style={{ padding: '0.6rem 0.75rem', textAlign: 'right' }}>Controls & Logs</th>
+                                            </tr>
+                                          </thead>
+                                          <tbody>
+                                            {userReqs.map((req) => (
+                                              <tr key={req.id} style={{ borderBottom: '1px solid #f1f5f9' }}>
+                                                <td style={{ padding: '0.6rem 0.75rem', fontWeight: 700, color: '#2563eb' }}>#{req.id}</td>
+                                                <td style={{ padding: '0.6rem 0.75rem', fontWeight: 600, color: '#0f172a' }}>{req.request_title}</td>
+                                                <td style={{ padding: '0.6rem 0.75rem', color: '#334155' }}>
+                                                  {req.district ? `${req.district}, ${req.state}` : req.state || 'All India'}
+                                                </td>
+                                                <td style={{ padding: '0.6rem 0.75rem' }}>
+                                                  <span style={{ fontWeight: 600 }}>{req.satellite}</span>
+                                                  <div style={{ fontSize: '0.7rem', color: '#64748b' }}>
+                                                    {Array.isArray(req.indices) ? req.indices.join(', ') : req.indices}
+                                                  </div>
+                                                </td>
+                                                <td style={{ padding: '0.6rem 0.75rem', fontWeight: 600 }}>
+                                                  {req.storage_estimated_gb ? `${req.storage_estimated_gb} GB` : '—'}
+                                                </td>
+                                                <td style={{ padding: '0.6rem 0.75rem' }}>
+                                                  {renderStatusBadge(req.status)}
+                                                </td>
+                                                <td style={{ padding: '0.6rem 0.75rem', color: '#64748b', fontSize: '0.75rem' }}>
+                                                  {new Date(req.created_at).toLocaleString()}
+                                                </td>
+                                                <td style={{ padding: '0.6rem 0.75rem', textAlign: 'right' }}>
+                                                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'flex-end', gap: '0.4rem' }}>
+                                                    {/* View Execution Logs */}
+                                                    <button
+                                                      onClick={() => openLogsModal(req)}
+                                                      title="View Pipeline Execution Logs"
+                                                      style={{
+                                                        display: 'inline-flex',
+                                                        alignItems: 'center',
+                                                        gap: '0.25rem',
+                                                        padding: '0.3rem 0.55rem',
+                                                        borderRadius: '0.375rem',
+                                                        border: '1px solid #cbd5e1',
+                                                        backgroundColor: '#ffffff',
+                                                        fontSize: '0.75rem',
+                                                        fontWeight: 600,
+                                                        color: '#334155',
+                                                        cursor: 'pointer'
+                                                      }}
+                                                    >
+                                                      <Terminal size={12} color="#2563eb" /> Logs
+                                                    </button>
+
+                                                    {/* Approve if Hold for Approval */}
+                                                    {req.status === 'HOLD_FOR_APPROVAL' && (
+                                                      <button
+                                                        onClick={async () => {
+                                                          await handleApproveStatus(req.id, 'ACCEPTED');
+                                                          fetchUserRequests(u.id);
+                                                        }}
+                                                        style={{
+                                                          padding: '0.3rem 0.55rem',
+                                                          backgroundColor: '#166534',
+                                                          color: '#ffffff',
+                                                          border: 'none',
+                                                          borderRadius: '0.375rem',
+                                                          fontSize: '0.75rem',
+                                                          fontWeight: 600,
+                                                          cursor: 'pointer'
+                                                        }}
+                                                      >
+                                                        Approve
+                                                      </button>
+                                                    )}
+
+                                                    {/* Stop if Processing */}
+                                                    {req.status === 'PROCESSING' && (
+                                                      <button
+                                                        onClick={async () => {
+                                                          await handleStop(req.id);
+                                                          fetchUserRequests(u.id);
+                                                        }}
+                                                        disabled={stoppingId === req.id}
+                                                        style={{
+                                                          padding: '0.3rem 0.55rem',
+                                                          backgroundColor: '#dc2626',
+                                                          color: '#ffffff',
+                                                          border: 'none',
+                                                          borderRadius: '0.375rem',
+                                                          fontSize: '0.75rem',
+                                                          fontWeight: 600,
+                                                          cursor: 'pointer'
+                                                        }}
+                                                      >
+                                                        {stoppingId === req.id ? '...' : 'Stop'}
+                                                      </button>
+                                                    )}
+
+                                                    {/* Rerun if not currently running */}
+                                                    {req.status !== 'PROCESSING' && (
+                                                      <button
+                                                        onClick={async () => {
+                                                          await handleRerun(req.id);
+                                                          fetchUserRequests(u.id);
+                                                        }}
+                                                        disabled={rerunningId === req.id}
+                                                        style={{
+                                                          padding: '0.3rem 0.55rem',
+                                                          backgroundColor: '#2563eb',
+                                                          color: '#ffffff',
+                                                          border: 'none',
+                                                          borderRadius: '0.375rem',
+                                                          fontSize: '0.75rem',
+                                                          fontWeight: 600,
+                                                          cursor: 'pointer'
+                                                        }}
+                                                      >
+                                                        {rerunningId === req.id ? '...' : 'Rerun'}
+                                                      </button>
+                                                    )}
+                                                  </div>
+                                                </td>
+                                              </tr>
+                                            ))}
+                                          </tbody>
+                                        </table>
+                                      </div>
+                                    )}
+                                  </div>
+                                </td>
+                              </tr>
+                            )}
+                          </React.Fragment>
+                        );
+                      })
+                    )}
                   </tbody>
                 </table>
               </div>
@@ -2087,7 +2310,7 @@ export default function App() {
               </div>
 
               <button
-                onClick={() => setIsLogsModalOpen(false)}
+                onClick={closeLogsModal}
                 style={{
                   border: 'none',
                   background: 'none',

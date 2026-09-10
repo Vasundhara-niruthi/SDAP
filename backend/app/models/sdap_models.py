@@ -119,3 +119,40 @@ class DistrictTileMappingModel(Base):
     tile_id = Column(String(50), nullable=False, index=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
+
+class TileSceneMetadataModel(Base):
+    """
+    Model for tracking Sentinel-2 Open Data Registry tile hierarchy and metadata.
+    Path structure: tiles/{utm_zone}/{latitude_band}/{grid_square}/{year}/{month}/{day}/{sequence}/
+    Stores both raw metadata.xml (100% fidelity) and split structured JSON (fast SQL queryability).
+    Tracks download status, user identity, and local storage archive path for deduplication.
+    """
+    __tablename__ = "tile_scene_metadata"
+
+    id = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    utm_zone = Column(String(10), nullable=False, index=True)
+    latitude_band = Column(String(5), nullable=False, index=True)
+    grid_square = Column(String(10), nullable=False, index=True)
+    year = Column(Integer, nullable=False, index=True)
+    month = Column(Integer, nullable=False, index=True)
+    day = Column(Integer, nullable=False, index=True)
+    sequence = Column(Integer, nullable=False, default=0, index=True)
+    tile_path = Column(String(255), unique=True, nullable=False, index=True) # e.g. "tiles/44/Q/LD/2025/1/12/0/"
+    tile_id = Column(String(50), nullable=False, index=True) # e.g. "44QLD"
+    sensing_date = Column(String(20), nullable=False, index=True) # e.g. "2025-01-12"
+    product_name = Column(String(255), nullable=True) # e.g. "S2A_MSIL2A_20250112T051151_N0511_R019_T44QLD_20250112T094050"
+    cloud_coverage_percentage = Column(Float, nullable=True)
+    data_coverage_percentage = Column(Float, nullable=True)
+    epsg_code = Column(String(50), nullable=True) # e.g. "EPSG:32644"
+    download_status = Column(String(50), default="NOT_DOWNLOADED", index=True) # 'NOT_DOWNLOADED', 'DOWNLOADED', 'FAILED'
+    downloaded_at = Column(DateTime, nullable=True)
+    downloaded_by_user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    archive_path = Column(Text, nullable=True)
+    raw_metadata_xml = Column(Text, nullable=True) # Complete original XML string
+    parsed_metadata = Column(JSON, nullable=True) # Split structured key fields
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    downloaded_by_user = relationship("UserModel")
+
+
