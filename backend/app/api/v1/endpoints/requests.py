@@ -12,9 +12,12 @@ from app.core.security import get_current_user, get_current_admin
 from app.models.sdap_models import RequestModel, UserModel, ProcessJobModel
 from app.schemas.request_schema import RequestCreate, RequestResponse, RequestEstimateResponse
 
+import threading
 active_request_threads = set()
 active_threads_lock = threading.Lock()
 
+logger = logging.getLogger("sdap.requests")
+router = APIRouter()
 def trigger_pipeline_in_thread(request_id: int):
     """Launches the pipeline in a dedicated daemon thread if not already running."""
     with active_threads_lock:
@@ -23,6 +26,9 @@ def trigger_pipeline_in_thread(request_id: int):
             return
         active_request_threads.add(request_id)
 
+def trigger_pipeline_in_thread(request_id: int):
+    """Launches the pipeline in a dedicated daemon thread so FastAPI workers stay 100% responsive."""
+    t = threading.Thread(target=run_pipeline_background, args=(request_id,), daemon=True)
     def _worker():
         try:
             run_pipeline_background(request_id)
@@ -330,6 +336,7 @@ def create_request(
 
     # Trigger background pipeline for auto-accepted requests
     if db_req.status == "ACCEPTED":
+        background_tasks.add_task(run_pipeline_background, db_req.id)
         trigger_pipeline_in_thread(db_req.id)
 
     return build_request_response(db_req)
@@ -401,6 +408,7 @@ def update_request_status(
 
     # Auto-trigger pipeline when admin approves a held request
     if new_status == "ACCEPTED":
+        background_tasks.add_task(run_pipeline_background, db_req.id)
         trigger_pipeline_in_thread(db_req.id)
 
     return build_request_response(db_req)
@@ -465,6 +473,7 @@ def rerun_request_pipeline(
     req.status = "PROCESSING"
     db.commit()
 
+    background_tasks.add_task(run_pipeline_background, request_id)
     trigger_pipeline_in_thread(request_id)
     return build_request_response(req)
 
@@ -486,6 +495,7 @@ def process_request_pipeline(
     req.status = "PROCESSING"
     db.commit()
 
+    background_tasks.add_task(run_pipeline_background, request_id)
     trigger_pipeline_in_thread(request_id)
     return {"request_id": req.id, "status": req.status, "message": f"Pipeline triggered for request #{req.id}."}
     return {"request_id": req.id, "status": req.status, "message": f"Pipeline triggered for request #{req.id}."}

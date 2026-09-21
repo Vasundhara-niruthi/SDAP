@@ -601,13 +601,13 @@ def download_and_verify_scene(
             os.makedirs(scene_archive_dir, exist_ok=True)
             safe_move_file(staged_path, target_path)
 
-            if request_id and db:
+            if request_id:
                 try:
                     mb = size / (1024 * 1024)
                     b_msg = f"     ↳ Band '{local_filename}' ({mb:.1f} MB) downloaded & verified on NAS."
                     logger.info(b_msg)
                     from scripts.download_district_tiles import append_request_log
-                    append_request_log(db, request_id, b_msg)
+                    append_request_log(None, request_id, b_msg)
                 except Exception:
                     pass
 
