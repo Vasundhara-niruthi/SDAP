@@ -462,7 +462,6 @@ def download_and_verify_scene(
     db: Session,
     scene: SceneModel,
     bands: list[str] = None,
-    user_id: int = None
     user_id: int = None,
     request_id: int = None
 ) -> tuple[bool, list[dict], str]:
