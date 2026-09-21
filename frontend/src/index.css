@@ -98,7 +98,7 @@ html, body, #root {
   background: #ffffff;
   border-radius: 0.75rem;
   width: 100%;
-  max-width: 920px;
+  max-width: 1080px;
   max-height: 90vh;
   display: flex;
   flex-direction: column;

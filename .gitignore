@@ -30,6 +30,11 @@ dist-ssr/
 *.part
 sentinel-2_grids.geojson
 backend/data/reference_india_districts.geojson
+backend/data/archive/
+backend/data/raw_archive/
+backend/data/staging/
+backend/data/output/
+backend/data/delivery/
 data/
 **/data/
 backend/data/

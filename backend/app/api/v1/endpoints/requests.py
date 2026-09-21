@@ -1,4 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks, Query
+from fastapi.responses import FileResponse
+import os
+import logging
 from sqlalchemy.orm import Session, joinedload
 from sqlalchemy import text
 from typing import List, Optional
@@ -9,7 +12,15 @@ from app.core.security import get_current_user, get_current_admin
 from app.models.sdap_models import RequestModel, UserModel, ProcessJobModel
 from app.schemas.request_schema import RequestCreate, RequestResponse, RequestEstimateResponse
 
+import threading
+
+logger = logging.getLogger("sdap.requests")
 router = APIRouter()
+
+def trigger_pipeline_in_thread(request_id: int):
+    """Launches the pipeline in a dedicated daemon thread so FastAPI workers stay 100% responsive."""
+    t = threading.Thread(target=run_pipeline_background, args=(request_id,), daemon=True)
+    t.start()
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Storage thresholds (SRS 8.3)
@@ -68,8 +79,30 @@ def estimate_request_storage(req: RequestCreate, db: Session = None) -> dict:
 
     acquisitions_per_month = 2.5 if req.satellite == "Sentinel-1" else 6.0
     scene_size_gb = 0.615 if req.satellite == "Sentinel-1" else 0.270
+    is_s1 = "Sentinel-1" in req.satellite
+    is_s2 = "Sentinel-2" in req.satellite or not is_s1
 
     total_gb = tile_count * acquisitions_per_month * months * scene_size_gb
+    if is_s1 and is_s2:
+        s1_acq = 2.5
+        s1_size = 0.615
+        s2_acq = 6.0
+        s2_size = 0.270
+        total_gb = (tile_count * s1_acq * months * s1_size) + (tile_count * s2_acq * months * s2_size)
+        scene_count = int(tile_count * (s1_acq + s2_acq) * months)
+        acquisitions_per_month = s1_acq + s2_acq
+        scene_size_gb = round((s1_size + s2_size) / 2, 3)
+    elif is_s1:
+        acquisitions_per_month = 2.5
+        scene_size_gb = 0.615
+        total_gb = tile_count * acquisitions_per_month * months * scene_size_gb
+        scene_count = int(tile_count * acquisitions_per_month * months)
+    else:
+        acquisitions_per_month = 6.0
+        scene_size_gb = 0.270
+        total_gb = tile_count * acquisitions_per_month * months * scene_size_gb
+        scene_count = int(tile_count * acquisitions_per_month * months)
+
     total_gb = round(total_gb, 2)
     scene_count = int(tile_count * acquisitions_per_month * months)
 
@@ -109,6 +142,9 @@ def run_pipeline_background(request_id: int):
         db.commit()
 
         district_name = req.district or req.state or "Khammam"
+        district_name = req.district or req.state
+        if not district_name:
+            raise ValueError(f"Request #{request_id} does not specify a valid district or state.")
         start_str = req.start_date.strftime("%Y-%m-%d")
         end_str = req.end_date.strftime("%Y-%m-%d")
         indices = req.indices if isinstance(req.indices, list) and req.indices else ["NDVI", "LSWI"]
@@ -198,8 +234,10 @@ def estimate_request(
     if end_dt < start_dt:
         raise HTTPException(status_code=422, detail="end_date must be >= start_date.")
 
-    if satellite not in {"Sentinel-1", "Sentinel-2"}:
-        raise HTTPException(status_code=422, detail="satellite must be 'Sentinel-1' or 'Sentinel-2'.")
+    parts = [p.strip() for p in satellite.replace("+", ",").replace("&", ",").split(",") if p.strip()]
+    if not parts or not all(p in {"Sentinel-1", "Sentinel-2"} for p in parts):
+        raise HTTPException(status_code=422, detail="satellite must be 'Sentinel-1', 'Sentinel-2', or both.")
+    clean_sat = ", ".join(sorted(list(set(parts))))
 
     # Build a lightweight object for the estimator
     class _Req:
@@ -207,7 +245,7 @@ def estimate_request(
     r = _Req()
     r.state = state
     r.district = district
-    r.satellite = satellite
+    r.satellite = clean_sat
     r.start_date = start_dt
     r.end_date = end_dt
 
@@ -216,7 +254,7 @@ def estimate_request(
     return RequestEstimateResponse(
         state=state,
         district=district,
-        satellite=satellite,
+        satellite=clean_sat,
         start_date=start_dt,
         end_date=end_dt,
         **est
@@ -283,6 +321,7 @@ def create_request(
     # Trigger background pipeline for auto-accepted requests
     if db_req.status == "ACCEPTED":
         background_tasks.add_task(run_pipeline_background, db_req.id)
+        trigger_pipeline_in_thread(db_req.id)
 
     return build_request_response(db_req)
 
@@ -354,6 +393,7 @@ def update_request_status(
     # Auto-trigger pipeline when admin approves a held request
     if new_status == "ACCEPTED":
         background_tasks.add_task(run_pipeline_background, db_req.id)
+        trigger_pipeline_in_thread(db_req.id)
 
     return build_request_response(db_req)
 
@@ -418,6 +458,7 @@ def rerun_request_pipeline(
     db.commit()
 
     background_tasks.add_task(run_pipeline_background, request_id)
+    trigger_pipeline_in_thread(request_id)
     return build_request_response(req)
 
 
@@ -439,4 +480,153 @@ def process_request_pipeline(
     db.commit()
 
     background_tasks.add_task(run_pipeline_background, request_id)
+    trigger_pipeline_in_thread(request_id)
     return {"request_id": req.id, "status": req.status, "message": f"Pipeline triggered for request #{req.id}."}
+
+
+@router.get("/tifs/available-regions", summary="Get all States and Districts with downloaded GeoTIFF rasters")
+def get_downloaded_regions(
+    db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_user)
+):
+    """
+    Returns only the States and Districts that have actual held scenes and downloaded
+    GeoTIFF rasters stored in PostgreSQL. Used to populate the frontend Data Retrieval Form.
+    """
+    from app.services.downloader_service import get_available_downloaded_regions
+    return get_available_downloaded_regions(db)
+
+
+@router.get("/tifs/download-file", summary="Download a specific GeoTIFF raster file directly")
+def download_tif_file(
+    file_path: str = Query(..., description="Path to the GeoTIFF .tif file"),
+    token: Optional[str] = Query(None, description="Optional JWT authentication token"),
+    db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_user)
+):
+    """
+    Streams a downloaded GeoTIFF raster file directly to the user's browser for download.
+    """
+    from app.services.downloader_service import resolve_tif_path
+    resolved_path, exists = resolve_tif_path(file_path)
+
+    if not exists or not os.path.exists(resolved_path):
+        raise HTTPException(
+            status_code=404,
+            detail=f"GeoTIFF raster file not found on disk: {file_path}"
+        )
+
+    filename = os.path.basename(resolved_path)
+    return FileResponse(
+        path=resolved_path,
+        filename=filename,
+        media_type="image/tiff"
+    )
+
+
+@router.get("/tifs/download-zip", summary="Batch download matching GeoTIFF rasters as a ZIP archive")
+def download_tifs_zip(
+    state: Optional[str] = Query(None),
+    district: Optional[str] = Query(None),
+    satellite: Optional[str] = Query(None),
+    band: Optional[str] = Query(None),
+    start_date: Optional[str] = Query(None),
+    end_date: Optional[str] = Query(None),
+    token: Optional[str] = Query(None, description="Optional JWT authentication token"),
+    db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_user)
+):
+    """
+    Bundles all matching verified GeoTIFF rasters into a ZIP archive and streams it to the user.
+    """
+    import zipfile
+    import tempfile
+    from app.services.downloader_service import search_downloaded_tifs_by_region, resolve_tif_path
+
+    ret = search_downloaded_tifs_by_region(
+        db=db, state=state, district=district, satellite=satellite,
+        band=band, start_date=start_date, end_date=end_date
+    )
+
+    tifs = ret.get("tifs", [])
+    if not tifs:
+        raise HTTPException(status_code=404, detail="No matching downloaded GeoTIFF files found to archive.")
+
+    tmp_dir = tempfile.mkdtemp()
+    zip_filename = f"SDAP_GeoTIFFs_{district or state or 'Batch'}.zip"
+    zip_path = os.path.join(tmp_dir, zip_filename)
+
+    with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_STORED) as zf:
+        for item in tifs:
+            p, exists = resolve_tif_path(item["path"])
+            if exists and os.path.exists(p):
+                norm_p = os.path.normpath(p)
+                parts = norm_p.split(os.sep)
+                if "archive" in parts:
+                    arch_idx = parts.index("archive")
+                    rel_parts = parts[arch_idx + 1:]
+                    arcname = "/".join(rel_parts)
+                elif "data" in parts:
+                    data_idx = parts.index("data")
+                    rel_parts = parts[data_idx + 1:]
+                    arcname = "/".join(rel_parts)
+                else:
+                    arcname = f"{item['tile']}/{item['scene_id']}/{item['band']}.tif"
+                zf.write(p, arcname=arcname)
+
+    return FileResponse(
+        path=zip_path,
+        filename=zip_filename,
+        media_type="application/zip"
+    )
+
+
+@router.get("/tifs/retrieve", summary="Retrieve downloaded GeoTIFF rasters by State and District")
+def retrieve_tifs_by_region(
+    state: Optional[str] = Query(None, description="Filter by State name (e.g. Telangana, Odisha)"),
+    district: Optional[str] = Query(None, description="Filter by District name (e.g. Khammam, Cuttack)"),
+    satellite: Optional[str] = Query(None, description="Filter by Satellite (Sentinel-1, Sentinel-2)"),
+    band: Optional[str] = Query(None, description="Filter by Band name (e.g. B04, B08, TCI, SCL, VV, VH)"),
+    start_date: Optional[str] = Query(None, description="Filter start date YYYY-MM-DD"),
+    end_date: Optional[str] = Query(None, description="Filter end date YYYY-MM-DD"),
+    db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_user)
+):
+    """
+    Matches the State and District to tile IDs in district_tiles_mapping, queries PostgreSQL
+    for all stored GeoTIFF (.tif) file paths in held scenes, and returns verified file paths
+    and metadata for user retrieval and next processing steps.
+    """
+    from app.services.downloader_service import search_downloaded_tifs_by_region
+    return search_downloaded_tifs_by_region(
+        db=db,
+        state=state,
+        district=district,
+        satellite=satellite,
+        band=band,
+        start_date=start_date,
+        end_date=end_date
+    )
+
+
+@router.get("/{request_id}/tifs", summary="Retrieve all downloaded GeoTIFF file paths for a request")
+def get_request_tifs(
+    request_id: int,
+    db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_user)
+):
+    """
+    Returns all verified GeoTIFF raster file paths (.tif / .tiff) downloaded for a specific request.
+    Enables users and subsequent processing pipelines (Stage 3 Indexing, Stage 4 Delivery Clipping)
+    to easily discover and load the exact raster files.
+    """
+    req = db.query(RequestModel).filter(RequestModel.id == request_id).first()
+    if not req:
+        raise HTTPException(status_code=404, detail="Request not found.")
+
+    if current_user.role != "ADMIN" and req.user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Not authorized to access files for this request.")
+
+    from app.services.downloader_service import get_downloaded_tifs_for_request
+    return get_downloaded_tifs_for_request(db, request_id)
+

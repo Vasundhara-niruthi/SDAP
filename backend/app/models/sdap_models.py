@@ -156,3 +156,43 @@ class TileSceneMetadataModel(Base):
     downloaded_by_user = relationship("UserModel")
 
 
+class Sentinel1SceneMetadataModel(Base):
+    """
+    Model for tracking Sentinel-1 Open Data Registry GRD SAR products and metadata.
+    Path structure: GRD/{year}/{month}/{day}/{mode}/{polarization}/{product_name}/
+    Stores both raw manifest.safe XML (100% fidelity lossless archival) and split structured JSON.
+    Tracks download status, user identity, and local storage archive path for deduplication.
+    """
+    __tablename__ = "sentinel1_scene_metadata"
+
+    id = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    year = Column(Integer, nullable=False, index=True)
+    month = Column(Integer, nullable=False, index=True)
+    day = Column(Integer, nullable=False, index=True)
+    mode = Column(String(20), nullable=False, index=True)            # 'IW', 'EW', 'SM'
+    polarization = Column(String(20), nullable=False, index=True)    # 'DV', 'DH', 'SV', 'SH'
+    product_name = Column(String(255), nullable=False, index=True)   # e.g. 'S1A_IW_GRDH_1SDV_...'
+    scene_path = Column(String(255), unique=True, nullable=False, index=True) # e.g. 'GRD/2024/10/15/IW/DV/S1A_.../'
+    satellite_mission = Column(String(20), nullable=True)            # 'Sentinel-1A' or 'Sentinel-1B'
+    polarization_channels = Column(String(50), nullable=True)        # 'VV, VH' or 'HH, HV'
+    orbit_direction = Column(String(20), nullable=True, index=True)  # 'ASCENDING' or 'DESCENDING'
+    relative_orbit = Column(Integer, nullable=True, index=True)      # Track repeat cycle 1 - 175
+    absolute_orbit = Column(Integer, nullable=True)
+    slice_number = Column(Integer, nullable=True)
+    sensing_date = Column(String(20), nullable=False, index=True)    # 'YYYY-MM-DD'
+    start_time = Column(String(50), nullable=True)
+    stop_time = Column(String(50), nullable=True)
+    footprint_geojson = Column(JSON, nullable=True)                  # GeoJSON boundary polygon coordinates
+    epsg_code = Column(String(50), nullable=True, default="EPSG:4326")
+    download_status = Column(String(50), default="NOT_DOWNLOADED", index=True) # 'NOT_DOWNLOADED', 'DOWNLOADED', 'FAILED'
+    downloaded_at = Column(DateTime, nullable=True)
+    downloaded_by_user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    archive_path = Column(Text, nullable=True)
+    raw_manifest_xml = Column(Text, nullable=True)                   # Complete original manifest.safe XML string
+    parsed_metadata = Column(JSON, nullable=True)                    # Split structured key fields
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    downloaded_by_user = relationship("UserModel")
+
+

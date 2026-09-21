@@ -5,6 +5,9 @@ import { defineConfig } from 'vite'
 export default defineConfig({
   plugins: [react()],
   server: {
+    hmr: {
+      overlay: false
+    },
     proxy: {
       '/api': {
         target: 'http://localhost:8000',

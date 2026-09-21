@@ -126,15 +126,6 @@ def run_district_acquisition_pipeline(
     if indices is None:
         indices = ["NDVI", "LSWI"]
 
-    header_msg = (
-        f"STARTING SDAP PIPELINE FOR '{district_name}' "
-        f"(State: {state_name or 'Auto'}) | "
-        f"Date: {start_date} to {end_date} | "
-        f"Satellite: {satellite} | Indices: {indices}"
-    )
-    logger.info("=" * 72)
-    logger.info(header_msg)
-    logger.info("=" * 72)
     banner_top = "=" * 78
     header_title = f"SDAP PIPELINE EXECUTION | District: {district_name} ({state_name or 'Auto'})"
     header_sub = f"Range: {start_date} to {end_date} | Satellite: {satellite} | Indices: {indices}"
@@ -145,7 +136,6 @@ def run_district_acquisition_pipeline(
 
     db = SessionLocal()
     try:
-        append_request_log(db, request_id, header_msg)
         append_request_log(db, request_id, banner_top)
         append_request_log(db, request_id, f"  {header_title}")
         append_request_log(db, request_id, f"  {header_sub}")
@@ -192,15 +182,49 @@ def run_district_acquisition_pipeline(
         )
         logger.info(res_msg)
         append_request_log(db, request_id, res_msg)
-        append_request_log(db, request_id, f"  • S2 MGRS Tiles identified: {tiles}")
+        append_request_log(db, request_id, f"  • S2 MGRS Tiles identified ({len(tiles)} total): {tiles}")
         append_request_log(db, request_id, f"  • Available on AWS S3:     {avail_count} total scenes")
-        append_request_log(db, request_id, f"  • Already held in archive: {held_count} scenes (skipped)")
+        append_request_log(db, request_id, f"  • Already held in archive: {held_count} scenes (cached)")
+        append_request_log(db, request_id, f"  • Missing from archive:    {len(missing_scenes)} scenes (queued for download)")
+
+        # Detailed individual tile breakdown
+        append_request_log(db, request_id, f"\n[STAGE 1/2] INDIVIDUAL TILE AUDIT & STORAGE STATUS ({len(tiles)} Tiles):")
+        tile_statuses = gap_res.get("tile_statuses", {})
+        for t in tiles:
+            t_info = tile_statuses.get(t, {})
+            t_stat = t_info.get("status", "UNKNOWN")
+            t_tot = t_info.get("total_scenes", 0)
+            t_h = t_info.get("held_scenes", 0)
+            t_m = t_info.get("missing_scenes", 0)
+            arch_p = t_info.get("archive_dir", f"data/archive/{t}")
+
+            if t_stat == "DOWNLOADED":
+                append_request_log(
+                    db, request_id,
+                    f"  • [TILE STATUS: DOWNLOADED] Tile '{t}': 100% CACHED ({t_h}/{t_tot} scenes verified in '{arch_p}'). Skipping re-download."
+                )
+            elif t_stat == "PARTIALLY_DOWNLOADED":
+                append_request_log(
+                    db, request_id,
+                    f"  • [TILE STATUS: PARTIAL] Tile '{t}': PARTIALLY CACHED ({t_h}/{t_tot} scenes cached, {t_m} scenes queued for download)."
+                )
+            elif t_stat == "PENDING_DOWNLOAD":
+                append_request_log(
+                    db, request_id,
+                    f"  • [TILE STATUS: PENDING] Tile '{t}': PENDING DOWNLOAD (0/{t_tot} scenes held, {t_m} scenes queued for download)."
+                )
+            else:
+                append_request_log(
+                    db, request_id,
+                    f"  • [TILE STATUS: NO DATA] Tile '{t}': 0 scenes found on AWS S3 for the requested date window."
+                )
+
         for h_sc in gap_res.get("held_scenes", []):
             dl_time = h_sc.get("downloaded_at", "previously")
             arch_p = h_sc.get("archive_path", "")
             append_request_log(
                 db, request_id,
-                f"  • [ALREADY DOWNLOADED - VERIFIED] Scene '{h_sc['scene_id']}' (Tile {h_sc['tile']}, Date {h_sc['sensing_date']}) "
+                f"  • [CACHE VERIFIED] Scene '{h_sc['scene_id']}' (Tile {h_sc['tile']}, Date {h_sc['sensing_date']}) "
                 f"cached at '{arch_p}' (Downloaded: {dl_time}). Skipping download."
             )
 
@@ -211,26 +235,23 @@ def run_district_acquisition_pipeline(
         # STAGE 2 — Download (SRS M3 + M4)
         # ────────────────────────────────────────────────
         if _is_request_stopped(db, request_id):
-            append_request_log(db, request_id, "Pipeline halted before download stage because request was STOPPED.", level="WARNING")
-            append_request_log(db, request_id, "\n[STOPPED] Pipeline halted before download stage because request was cancelled.", level="WARNING")
+            append_request_log(db, request_id, "[STOPPED] Pipeline halted before download stage because request was cancelled.", level="WARNING")
             return False
 
         dl_job = _get_or_create_job(db, request_id, "DOWNLOAD")
         _update_job(db, dl_job, "RUNNING")
 
-        step2_msg = (
-            f"STEP 2: Downloading {len(missing_scenes)} missing scenes "
-            f"from AWS S3 bucket '{settings.AWS_SENTINEL_BUCKET}'..."
-        )
+        step2_msg = f"STEP 2: Downloading {len(missing_scenes)} missing scenes from AWS Open Data S3..."
         logger.info(step2_msg)
         append_request_log(db, request_id, step2_msg)
-        append_request_log(db, request_id, f"\n[STAGE 2/4] FETCHING & VERIFYING {len(missing_scenes)} MISSING SCENES FROM AWS S3")
-        append_request_log(db, request_id, f"  • Bucket: '{settings.AWS_SENTINEL_BUCKET}' ({settings.AWS_REGION}) | Concurrency: 5 bands in parallel")
+        append_request_log(db, request_id, f"\n[STAGE 2/2] FETCHING & VERIFYING {len(missing_scenes)} MISSING SCENES FROM AWS S3 (GeoTIFF)")
+        append_request_log(db, request_id, f"  • S2 COGs: '{settings.AWS_SENTINEL_COGS_BUCKET}' ({settings.AWS_COGS_REGION}) | S1 GRD: '{settings.AWS_SENTINEL_1_BUCKET}' ({settings.AWS_SENTINEL_1_REGION})")
 
         req_record = db.query(RequestModel).filter(RequestModel.id == request_id).first()
         user_id = req_record.user_id if req_record else None
 
         downloaded_count = 0
+        tile_downloaded_count = {t: 0 for t in tiles}
         held_scenes = []
 
         for idx, sc in enumerate(missing_scenes, start=1):
@@ -269,7 +290,27 @@ def run_district_acquisition_pipeline(
             if ok:
                 downloaded_count += 1
                 held_scenes.append(scene_obj)
+                sc_tile = sc.get("tile", "")
+                tile_downloaded_count[sc_tile] = tile_downloaded_count.get(sc_tile, 0) + 1
                 append_request_log(db, request_id, f"     ✓ {dl_log}")
+
+                # Associate scene with this request in process_jobs for reliable downstream TIF retrieval
+                try:
+                    existing_sc_job = db.query(ProcessJobModel).filter(
+                        ProcessJobModel.request_id == request_id,
+                        ProcessJobModel.scene_id == s_id
+                    ).first()
+                    if not existing_sc_job:
+                        db.add(ProcessJobModel(
+                            request_id=request_id,
+                            scene_id=s_id,
+                            stage="DOWNLOAD",
+                            status="COMPLETED"
+                        ))
+                        db.commit()
+                except Exception as pj_err:
+                    logger.warning(f"Could not record process_job for scene {s_id}: {pj_err}")
+                    db.rollback()
             else:
                 failed_bands = [b['band'] for b in band_details if not b.get('ok')]
                 append_request_log(
@@ -283,140 +324,58 @@ def run_district_acquisition_pipeline(
         append_request_log(db, request_id, dl_summary)
         _update_job(db, dl_job, "COMPLETED" if downloaded_count > 0 else "FAILED")
 
-        # ────────────────────────────────────────────────
-        # Query all HELD scenes for these tiles
-        # ────────────────────────────────────────────────
-        all_held = db.query(SceneModel).filter(
-            SceneModel.tile.in_(tiles),
-            SceneModel.status == "HELD"
-        ).all()
+        # Comprehensive individual tile final audit summary
+        append_request_log(db, request_id, "\n" + "=" * 78)
+        append_request_log(db, request_id, f"  INDIVIDUAL TILE ACQUISITION SUMMARY FOR '{district_name}'")
+        append_request_log(db, request_id, "-" * 78)
+        for t in tiles:
+            t_info = tile_statuses.get(t, {})
+            t_tot = t_info.get("total_scenes", 0)
+            t_init_held = t_info.get("held_scenes", 0)
+            t_new_dl = tile_downloaded_count.get(t, 0)
+            t_final_held = t_init_held + t_new_dl
+            arch_p = os.path.join(settings.RAW_ARCHIVE_DIR, t)
 
-        if not all_held:
-            warn_msg = f"No HELD scenes available for index calculation for tiles {tiles}."
-            logger.warning(warn_msg)
-            append_request_log(db, request_id, f"WARNING: {warn_msg}", level="WARNING")
-            # Return True — gap check + download completed successfully even if nothing to process
-            return downloaded_count > 0
+            if t_tot > 0 and t_final_held >= t_tot:
+                status_label = "DOWNLOADED (100% Complete)"
+                log_tag = "TILE STATUS: DOWNLOADED"
+            elif t_final_held > 0:
+                status_label = f"PARTIAL ({t_final_held}/{t_tot} scenes)"
+                log_tag = "TILE STATUS: PARTIAL"
+            elif t_tot == 0:
+                status_label = "NO DATA ON AWS"
+                log_tag = "TILE STATUS: NO DATA"
+            else:
+                status_label = "FAILED / INCOMPLETE"
+                log_tag = "TILE STATUS: INCOMPLETE"
 
-        # ────────────────────────────────────────────────
-        # STAGE 3 — Cloud Masking & Full-Tile Index (SRS M5)
-        # ────────────────────────────────────────────────
-        if _is_request_stopped(db, request_id):
-            append_request_log(db, request_id, "Pipeline halted before index calculation because request was STOPPED.", level="WARNING")
-            append_request_log(db, request_id, "\n[STOPPED] Pipeline halted before index calculation because request was cancelled.", level="WARNING")
-            return False
+            append_request_log(
+                db, request_id,
+                f"  • [{log_tag}] Tile '{t}': {status_label} | {t_final_held}/{t_tot} scenes stored locally in '{arch_p}'."
+            )
+        append_request_log(db, request_id, "=" * 78)
 
-        idx_job = _get_or_create_job(db, request_id, "TILE_INDEX")
-        _update_job(db, idx_job, "RUNNING")
+        # Retrieve all verified TIF raster file paths for this request for subsequent processing
+        from app.services.downloader_service import get_downloaded_tifs_for_request
+        tif_summary = get_downloaded_tifs_for_request(db, request_id)
+        total_tifs = tif_summary.get("total_tifs", 0)
+        total_mb = tif_summary.get("total_size_mb", 0.0)
 
-        step3_msg = (
-            f"STEP 3: SCL Cloud Masking & Full-Tile Index Calculation "
-            f"({indices}) for {len(all_held)} HELD scenes..."
-        )
-        logger.info(step3_msg)
-        append_request_log(db, request_id, step3_msg)
-        append_request_log(db, request_id, f"\n[STAGE 3/4] SCL CLOUD MASKING & FULL-TILE INDEX CALCULATION ({indices})")
-        append_request_log(db, request_id, f"  • Processing {len(all_held)} HELD scenes across tiles {tiles}...")
-
-        tile_index_outputs = {}
-
-        for scene in all_held:
-            if _is_request_stopped(db, request_id):
-                stop_log = "Pipeline execution STOPPED by user. Halting tile index calculation."
-                stop_log = "\n[STOPPED] Execution cancelled by user during index calculation."
-                logger.warning(stop_log)
-                append_request_log(db, request_id, stop_log, level="WARNING")
-                _update_job(db, idx_job, "STOPPED", error_log="Stopped by user")
-                return False
-
-            band_paths = {
-                os.path.splitext(f.band)[0]: f.path
-                for f in scene.files if f.verified == 1
-            }
-
-            for idx_name in indices:
-                if scene.archive_path:
-                    out_filename = f"{scene.scene_id}_{idx_name}_fulltile.tif"
-                    out_path = os.path.join(scene.archive_path, out_filename)
-                else:
-                    continue
-
-                try:
-                    idx_out, coverage_pct = compute_full_tile_index(band_paths, idx_name, out_path)
-                    tile_index_outputs.setdefault(idx_name, []).append(idx_out)
-                    append_request_log(
-                        db, request_id,
-                        f"  -> {idx_name} computed for '{scene.scene_id}' "
-                        f"(Cloud-Free Coverage: {coverage_pct:.1f}%)"
-                        f"  ✓ {idx_name} computed for scene '{scene.scene_id}' (Cloud-Free: {coverage_pct:.1f}%)"
-                    )
-                except Exception as err:
-                    err_txt = f"Could not compute {idx_name} for scene {scene.scene_id}: {err}"
-                    logger.warning(err_txt)
-                    append_request_log(db, request_id, f"  -> WARNING: {err_txt}", level="WARNING")
-                    append_request_log(db, request_id, f"  ⚠ WARN: {err_txt}", level="WARNING")
-
-        append_request_log(db, request_id, f"  ✓ Stage 3 Complete: All indices calculated.")
-        _update_job(db, idx_job, "COMPLETED" if tile_index_outputs else "FAILED")
-
-        # ────────────────────────────────────────────────
-        # STAGE 4 — Delivery: Reproject, Mosaic, Clip (SRS M5.5)
-        # ────────────────────────────────────────────────
-        if _is_request_stopped(db, request_id):
-            append_request_log(db, request_id, "Pipeline halted before delivery clipping because request was STOPPED.", level="WARNING")
-            append_request_log(db, request_id, "\n[STOPPED] Pipeline halted before delivery clipping because request was cancelled.", level="WARNING")
-            return False
-
-        deliv_job = _get_or_create_job(db, request_id, "DELIVERY_CLIP")
-        _update_job(db, deliv_job, "RUNNING")
-
-        step4_msg = (
-            f"STEP 4: Mosaic, Reprojection & Boundary Clipping "
-            f"for district '{district_name}'..."
-        )
-        logger.info(step4_msg)
-        append_request_log(db, request_id, step4_msg)
-        append_request_log(db, request_id, f"\n[STAGE 4/4] MOSAIC, REPROJECTION & BOUNDARY CLIPPING FOR '{district_name.upper()}'")
-
-        delivery_results = []
-        for idx_name, raster_paths in tile_index_outputs.items():
-            out_name = f"{district_name}_{idx_name}_deliverable.tif"
-            try:
-                deliv_res = produce_district_delivery_output(
-                    db=db,
-                    request_id=request_id,
-                    district_name=district_name,
-                    index_raster_paths=raster_paths,
-                    output_filename=out_name
-                )
-                deliv_res["index_type"] = idx_name
-                delivery_results.append(deliv_res)
-                append_request_log(
-                    db, request_id,
-                    f"  -> Delivered clipped {idx_name}: "
-                    f"Mean={deliv_res['district_average_value']:.4f}, "
-                    f"Coverage={deliv_res['cloud_free_coverage_pct']:.1f}%"
-                    f"  ✓ Output deliverable clipped: {out_name} (Mean {idx_name}: {deliv_res['district_average_value']:.4f}, Coverage: {deliv_res['cloud_free_coverage_pct']:.1f}%)"
-                )
-            except Exception as err:
-                clip_err = f"Failed delivery clip for {idx_name}: {err}"
-                logger.error(clip_err)
-                append_request_log(db, request_id, f"ERROR: {clip_err}", level="ERROR")
-                append_request_log(db, request_id, f"  [ERROR] {clip_err}", level="ERROR")
-
-        _update_job(db, deliv_job, "COMPLETED" if delivery_results else "FAILED")
-
+        # Pipeline completes upon data download and local archive verification
         success_msg = (
-            f"PIPELINE COMPLETED FOR '{district_name}'. "
-            f"Total deliverables: {len(delivery_results)}"
+            f"DATA DOWNLOAD & ACQUISITION COMPLETED FOR '{district_name}' ({satellite}). "
+            f"Total Scenes Held/Downloaded: {downloaded_count + held_count} (New: {downloaded_count}, Cached: {held_count}). "
+            f"Total GeoTIFF (.tif) files ready: {total_tifs} ({total_mb:.1f} MB)."
         )
-        logger.info("=" * 72)
+        logger.info("=" * 78)
         logger.info(success_msg)
-        logger.info("=" * 72)
+        logger.info("=" * 78)
         append_request_log(db, request_id, success_msg)
         append_request_log(db, request_id, "\n" + "=" * 78)
-        append_request_log(db, request_id, f"  PIPELINE FINISHED SUCCESSFULLY FOR '{district_name}'")
-        append_request_log(db, request_id, f"  Total Deliverables: {len(delivery_results)} clipped GeoTIFF files ready in delivery folder.")
+        append_request_log(db, request_id, f"  DATA ACQUISITION FINISHED SUCCESSFULLY FOR '{district_name}'")
+        append_request_log(db, request_id, f"  Archive Location: '{settings.RAW_ARCHIVE_DIR}' (GeoTIFFs only)")
+        append_request_log(db, request_id, f"  Scenes Verified:  {downloaded_count + held_count} total ({downloaded_count} newly downloaded, {held_count} cached).")
+        append_request_log(db, request_id, f"  GeoTIFFs Ready:   {total_tifs} .tif files ({total_mb:.1f} MB) ready for next processing steps.")
         append_request_log(db, request_id, "=" * 78)
         return True
 
@@ -522,6 +481,20 @@ def main():
                 )
         finally:
             db.close()
+
+
+def get_request_tif_paths(request_id: int) -> list[str]:
+    """
+    Helper for subsequent processing stages (Stage 3 Indexing, Stage 4 Delivery Clipping)
+    to retrieve the exact list of downloaded GeoTIFF file paths for a request.
+    """
+    from app.services.downloader_service import get_downloaded_tifs_for_request
+    db = SessionLocal()
+    try:
+        res = get_downloaded_tifs_for_request(db, request_id)
+        return res.get("tif_paths", [])
+    finally:
+        db.close()
 
 
 if __name__ == "__main__":

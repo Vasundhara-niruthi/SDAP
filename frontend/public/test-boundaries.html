@@ -1,0 +1,124 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>SDAP Boundary Test</title>
+  <style>
+    body { font-family: monospace; padding: 20px; background: #1e1e1e; color: #d4d4d4; }
+    .ok { color: #4ec9b0; }
+    .err { color: #f48771; }
+    .info { color: #9cdcfe; }
+    pre { background: #252526; padding: 10px; border-radius: 4px; overflow-x: auto; }
+    button { margin: 5px; padding: 8px 16px; cursor: pointer; background: #0e639c; color: white; border: none; border-radius: 4px; }
+    input { padding: 8px; width: 300px; margin: 4px; background: #3c3c3c; color: white; border: 1px solid #555; border-radius: 4px; }
+  </style>
+</head>
+<body>
+  <h2>🔍 SDAP Boundary Load Test</h2>
+  <div>
+    <input id="email" placeholder="Email" value="admin@sdap.niruthi.in" /><br>
+    <input id="password" type="password" placeholder="Password" value="admin123" /><br>
+    <button onclick="runTest()">▶ Run Full Test</button>
+    <button onclick="testWithStoredToken()">▶ Test with Current Browser Token</button>
+  </div>
+  <div id="output"></div>
+
+  <script>
+    const API = '/api/v1';
+    const out = document.getElementById('output');
+
+    function log(msg, cls = '') {
+      out.innerHTML += `<div class="${cls}">${msg}</div>`;
+    }
+
+    function logJSON(label, data) {
+      out.innerHTML += `<div class="info">${label}:</div><pre>${JSON.stringify(data, null, 2).substring(0, 1000)}</pre>`;
+    }
+
+    async function runTest() {
+      out.innerHTML = '<h3>Running tests...</h3>';
+      const email = document.getElementById('email').value;
+      const password = document.getElementById('password').value;
+
+      // Step 1: Login
+      log('--- Step 1: Login ---', 'info');
+      try {
+        const res = await fetch(`${API}/auth/login/json`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ email, password })
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          log(`❌ Login FAILED: HTTP ${res.status} - ${JSON.stringify(data)}`, 'err');
+          return;
+        }
+        const token = data.access_token;
+        log(`✅ Login OK | Token: ${token.substring(0, 30)}...`, 'ok');
+        localStorage.setItem('sdap_token', token);
+
+        // Step 2: States
+        log('--- Step 2: GET /boundaries/states ---', 'info');
+        const sr = await fetch(`${API}/boundaries/states`, {
+          headers: { 'Authorization': `Bearer ${token}` }
+        });
+        const states = await sr.json();
+        if (!sr.ok) {
+          log(`❌ States FAILED: HTTP ${sr.status} - ${JSON.stringify(states)}`, 'err');
+        } else {
+          log(`✅ States OK | Count: ${states.length}`, 'ok');
+          logJSON('First 5 states', states.slice(0, 5));
+        }
+
+        // Step 3: Districts
+        log('--- Step 3: GET /boundaries/districts ---', 'info');
+        const dr = await fetch(`${API}/boundaries/districts`, {
+          headers: { 'Authorization': `Bearer ${token}` }
+        });
+        const districts = await dr.json();
+        if (!dr.ok) {
+          log(`❌ Districts FAILED: HTTP ${dr.status} - ${JSON.stringify(districts)}`, 'err');
+        } else {
+          log(`✅ Districts OK | Count: ${districts.length}`, 'ok');
+          logJSON('First 5 districts', districts.slice(0, 5));
+        }
+
+        log('--- Step 4: Check localStorage ---', 'info');
+        const stored = localStorage.getItem('sdap_token');
+        log(`Token in localStorage: ${stored ? stored.substring(0, 30) + '...' : 'MISSING'}`, stored ? 'ok' : 'err');
+
+      } catch (e) {
+        log(`❌ Exception: ${e.message}`, 'err');
+      }
+    }
+
+    async function testWithStoredToken() {
+      out.innerHTML = '<h3>Testing with stored browser token...</h3>';
+      const token = localStorage.getItem('sdap_token');
+      if (!token) {
+        log('❌ No token in localStorage! Please login to the main app first.', 'err');
+        return;
+      }
+      log(`Token found: ${token.substring(0, 30)}...`, 'ok');
+
+      try {
+        const sr = await fetch(`${API}/boundaries/states`, {
+          headers: { 'Authorization': `Bearer ${token}` }
+        });
+        const states = await sr.json();
+        log(`States: HTTP ${sr.status} | Count: ${Array.isArray(states) ? states.length : 'N/A'}`, sr.ok ? 'ok' : 'err');
+        if (sr.ok) logJSON('Sample states', states.slice(0, 5));
+        else logJSON('Error', states);
+
+        const dr = await fetch(`${API}/boundaries/districts`, {
+          headers: { 'Authorization': `Bearer ${token}` }
+        });
+        const districts = await dr.json();
+        log(`Districts: HTTP ${dr.status} | Count: ${Array.isArray(districts) ? districts.length : 'N/A'}`, dr.ok ? 'ok' : 'err');
+      } catch(e) {
+        log(`❌ Exception: ${e.message}`, 'err');
+      }
+    }
+  </script>
+</body>
+</html>
+

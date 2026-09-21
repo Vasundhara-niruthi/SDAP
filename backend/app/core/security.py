@@ -11,6 +11,7 @@ from app.core.database import get_db
 from app.models.sdap_models import UserModel
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl=f"{settings.API_V1_STR}/auth/login")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl=f"{settings.API_V1_STR}/auth/login", auto_error=False)
 
 
 def hash_password(password: str) -> str:
@@ -49,15 +50,23 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -
     return encoded_jwt
 
 
-def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)) -> UserModel:
-    """FastAPI Dependency: Validate JWT token and return current active user."""
+def get_current_user(
+    header_token: Optional[str] = Depends(oauth2_scheme),
+    token: Optional[str] = None,
+    db: Session = Depends(get_db)
+) -> UserModel:
+    """FastAPI Dependency: Validate JWT token (from Authorization header or token query param) and return active user."""
+    auth_token = header_token or token
     credentials_exception = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="Could not validate credentials",
+        detail="Not authenticated",
         headers={"WWW-Authenticate": "Bearer"},
     )
+    if not auth_token:
+        raise credentials_exception
+
     try:
-        payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
+        payload = jwt.decode(auth_token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
         email: str = payload.get("sub")
         if email is None:
             raise credentials_exception

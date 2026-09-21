@@ -21,7 +21,7 @@ class RequestCreate(BaseModel):
     season: Optional[str] = Field(None, example="Kharif")  # Kharif, Rabi, Zaid, Annual
     start_date: datetime = Field(..., example="2026-06-01T00:00:00Z")
     end_date: datetime = Field(..., example="2026-10-31T00:00:00Z")
-    satellite: str = Field(..., example="Sentinel-2")  # Sentinel-1, Sentinel-2
+    satellite: str = Field(..., example="Sentinel-2")  # Sentinel-1, Sentinel-2, or "Sentinel-1, Sentinel-2"
     bands: List[str] = Field(default=["B04", "B08", "B08A", "B11", "SCL"], example=["B04", "B08", "B08A", "B11", "SCL"])
     indices: List[str] = Field(default=["NDVI", "LSWI"], example=["NDVI", "LSWI"])
     composite_interval: Optional[str] = Field("none", example="fortnightly")  # none, weekly, fortnightly, monthly
@@ -31,9 +31,10 @@ class RequestCreate(BaseModel):
     @field_validator("satellite")
     @classmethod
     def validate_satellite(cls, v: str) -> str:
-        if v not in VALID_SATELLITES:
-            raise ValueError(f"Satellite must be one of: {', '.join(sorted(VALID_SATELLITES))}. Got: '{v}'")
-        return v
+        parts = [p.strip() for p in v.replace("+", ",").replace("&", ",").split(",") if p.strip()]
+        if not parts or not all(p in VALID_SATELLITES for p in parts):
+            raise ValueError(f"Satellite must be one or both of: {', '.join(sorted(VALID_SATELLITES))}. Got: '{v}'")
+        return ", ".join(sorted(list(set(parts))))
 
     @field_validator("start_date")
     @classmethod
