@@ -49,20 +49,15 @@ def append_request_log(db_session, req_id: int, message: str, level: str = "INFO
     """Appends a log entry persistently to RequestModel.execution_logs in PostgreSQL."""
     if not req_id:
         return
-    session = db_session if db_session else SessionLocal()
-    close_needed = db_session is None
     try:
-        req = session.query(RequestModel).filter(RequestModel.id == req_id).first()
+        req = db_session.query(RequestModel).filter(RequestModel.id == req_id).first()
         if req:
             timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             log_line = f"[{timestamp}] {level}:sdap.universal_pipeline:{message}\n"
             req.execution_logs = (req.execution_logs or "") + log_line
-            session.commit()
+            db_session.commit()
     except Exception as e:
         logger.warning(f"Could not persist execution log: {e}")
-    finally:
-        if close_needed:
-            session.close()
 
 
 def _get_or_create_job(db, request_id: int, stage: str) -> ProcessJobModel:
@@ -291,7 +286,6 @@ def run_district_acquisition_pipeline(
             logger.info(dl_msg)
             append_request_log(db, request_id, dl_msg)
 
-            ok, band_details, dl_log = download_and_verify_scene(db, scene_obj, user_id=user_id)
             ok, band_details, dl_log = download_and_verify_scene(db, scene_obj, user_id=user_id, request_id=request_id)
             if ok:
                 downloaded_count += 1
