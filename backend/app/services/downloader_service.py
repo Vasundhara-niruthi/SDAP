@@ -124,7 +124,6 @@ def safe_move_file(src: str, dst: str, max_retries: int = 5, delay: float = 0.5)
             time.sleep(delay)
     return False
 
-
 def fetch_s3_object(key: str, target_path: str, bucket: str = None, client: boto3.client = None) -> bool:
     """
     Download one object with retries, exponential backoff, and AWS S3 byte-size verification.
@@ -181,10 +180,7 @@ def fetch_s3_object(key: str, target_path: str, bucket: str = None, client: boto
                 return True
             except Exception as error:
                 if os.path.exists(temp_path):
-                    try:
-                        os.remove(temp_path)
-                    except Exception:
-                        pass
+                    os.remove(temp_path)
                 if attempt == MAX_ATTEMPTS:
                     logger.debug(f"Candidate {active_key} on {bucket} failed: {error}")
                     break
@@ -246,20 +242,20 @@ def verify_raster(path: str) -> tuple[bool, int, str]:
 def read_radiometry_metadata(prefix: str, folder: str) -> tuple[bool | None, str | None, str]:
     """
     Fetch scene metadata JSON from S3 and return radiometric parameters.
-    Handles Sentinel-1 SAR (bypasses BOA check) and Sentinel-2 COGs / L2A registry.
+    Handles both AWS Open Data Sentinel-2 L2A registry (tileInfo.json) and Element84 COGs (<folder>.json).
+    Handles Sentinel-1 SAR (bypasses BOA check) and Sentinel-2 COGs (<folder>.json).
     """
+    # 1. Check Sentinel-2 L2A Open Data tileInfo.json
+    if prefix.startswith("tiles/") or "s2-l2a" in BUCKET.lower():
+        key = f"{prefix.rstrip('/')}/tileInfo.json"
     # 1. Sentinel-1 Radar does not utilize optical BOA offset
     if prefix.startswith("GRD/") or "s1" in (prefix + folder).lower():
         return True, "N/A", "ok"
 
-    # 2. Check Sentinel-2 STAC / metadata JSON candidates
-    candidates = [
-        f"{prefix.rstrip('/')}/{folder}.json",
-        f"{prefix.rstrip('/')}/tileinfo_metadata.json",
-        f"{prefix.rstrip('/')}/tileInfo.json"
-    ]
-    for json_key in candidates:
+    # 2. Check Sentinel-2 COG STAC JSON or tileinfo_metadata.json
+    for json_key in [f"{prefix.rstrip('/')}/{folder}.json", f"{prefix.rstrip('/')}/tileinfo_metadata.json"]:
         try:
+            body = s3_client.get_object(Bucket=BUCKET, Key=key)["Body"].read()
             body = s3_s2_client.get_object(Bucket=S2_BUCKET, Key=json_key)["Body"].read()
             item = json.loads(body)
             prod_name = item.get("productName", "")
@@ -268,15 +264,29 @@ def read_radiometry_metadata(prefix: str, folder: str) -> tuple[bool | None, str
                 if part.startswith("N") and len(part) >= 4:
                     baseline = f"{part[1:3]}.{part[3:]}"
                     break
+            applied = True
             properties = item.get("properties", {})
             applied = properties.get("earthsearch:boa_offset_applied", True)
-            if "s2:processing_baseline" in properties:
-                baseline = properties["s2:processing_baseline"]
+            baseline = properties.get("s2:processing_baseline", "05.12")
             return applied, baseline, "ok"
         except Exception as error:
-            logger.debug(f"Radiometry json read skipped for {json_key}: {error}")
+            logger.debug(f"tileInfo.json read skipped: {error}")
+            logger.debug(f"STAC json read skipped for {json_key}: {error}")
 
+    # 2. Check Element84 COG STAC JSON
+    key = f"{prefix.rstrip('/')}/{folder}.json"
+    try:
+        body = s3_client.get_object(Bucket=BUCKET, Key=key)["Body"].read()
+        item = json.loads(body)
+        properties = item.get("properties", {})
+        applied = properties.get("earthsearch:boa_offset_applied", True)
+        baseline = properties.get("s2:processing_baseline", "05.00")
+        return applied, baseline, "ok"
+    except Exception as error:
+        return True, "05.00", "ok"
     return True, "05.12", "ok"
+
+    return applied, baseline, "ok"
 
 
 def parse_s2_metadata_xml(xml_content: str) -> dict:
@@ -452,7 +462,8 @@ def download_and_verify_scene(
     db: Session,
     scene: SceneModel,
     bands: list[str] = None,
-    user_id: int = None
+    user_id: int = None,
+    request_id: int = None
 ) -> tuple[bool, list[dict], str]:
     """
     Fetch required bands for a scene, verify each raster, and record.
@@ -589,6 +600,17 @@ def download_and_verify_scene(
 
             os.makedirs(scene_archive_dir, exist_ok=True)
             safe_move_file(staged_path, target_path)
+
+            if request_id and db:
+                try:
+                    mb = size / (1024 * 1024)
+                    b_msg = f"     ↳ Band '{local_filename}' ({mb:.1f} MB) downloaded & verified on NAS."
+                    logger.info(b_msg)
+                    from scripts.download_district_tiles import append_request_log
+                    append_request_log(db, request_id, b_msg)
+                except Exception:
+                    pass
+
             return local_filename, True, size, "ok"
         except Exception as err:
             logger.error(f"Error processing band {band_name} for {folder}: {err}")

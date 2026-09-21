@@ -286,7 +286,7 @@ def run_district_acquisition_pipeline(
             logger.info(dl_msg)
             append_request_log(db, request_id, dl_msg)
 
-            ok, band_details, dl_log = download_and_verify_scene(db, scene_obj, user_id=user_id)
+            ok, band_details, dl_log = download_and_verify_scene(db, scene_obj, user_id=user_id, request_id=request_id)
             if ok:
                 downloaded_count += 1
                 held_scenes.append(scene_obj)
