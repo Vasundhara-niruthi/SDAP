@@ -141,7 +141,6 @@ def run_pipeline_background(request_id: int):
         req.status = "PROCESSING"
         db.commit()
 
-        district_name = req.district or req.state or "Khammam"
         district_name = req.district or req.state
         if not district_name:
             raise ValueError(f"Request #{request_id} does not specify a valid district or state.")

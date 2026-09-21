@@ -1,3 +1,4 @@
+import shutil
 """
 SDAP Step 4 Downloader & Raster Integrity Service
 Implements failure-safe atomic downloading, rasterio verification, and radiometry check.
@@ -91,6 +92,39 @@ def resolve_s3_band_path(prefix: str, band_name: str) -> tuple[str, str]:
     return s3_key, cog_name
 
 
+def safe_move_file(src: str, dst: str, max_retries: int = 5, delay: float = 0.5) -> bool:
+    """
+    Safely moves a file from src to dst on Windows / Network share.
+    Retries up to max_retries if Windows file lock [WinError 32] or network latency occurs.
+    """
+    if not os.path.exists(src):
+        if os.path.exists(dst):
+            return True  # Already successfully moved to destination
+        logger.warning(f"safe_move_file source file missing: {src}")
+        return False
+
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    for attempt in range(1, max_retries + 1):
+        try:
+            if os.path.exists(dst):
+                try:
+                    os.remove(dst)
+                except Exception:
+                    pass
+            shutil.copy2(src, dst)
+            try:
+                os.remove(src)
+            except Exception:
+                pass
+            return True
+        except Exception as e:
+            if attempt == max_retries:
+                logger.warning(f"Could not move {src} -> {dst} after {max_retries} attempts: {e}")
+                raise e
+            time.sleep(delay)
+    return False
+
+
 def fetch_s3_object(key: str, target_path: str, bucket: str = None, client: boto3.client = None) -> bool:
     """
     Download one object with retries, exponential backoff, and AWS S3 byte-size verification.
@@ -143,11 +177,14 @@ def fetch_s3_object(key: str, target_path: str, bucket: str = None, client: boto
                     raise ValueError(f"Byte mismatch for {active_key}: AWS S3 size = {expected_size}, Local size = {downloaded_size}")
 
                 # 4. Atomic swap upon verified download
-                os.replace(temp_path, target_path)
+                safe_move_file(temp_path, target_path)
                 return True
             except Exception as error:
                 if os.path.exists(temp_path):
-                    os.remove(temp_path)
+                    try:
+                        os.remove(temp_path)
+                    except Exception:
+                        pass
                 if attempt == MAX_ATTEMPTS:
                     logger.debug(f"Candidate {active_key} on {bucket} failed: {error}")
                     break
@@ -199,6 +236,9 @@ def verify_raster(path: str) -> tuple[bool, int, str]:
             source.read(1, window=((0, min(64, source.height)), (0, min(64, source.width))))
     except Exception as error:
         return False, size, f"unreadable: {type(error).__name__}"
+    finally:
+        import gc
+        gc.collect()
 
     return True, size, "ok"
 
@@ -206,20 +246,20 @@ def verify_raster(path: str) -> tuple[bool, int, str]:
 def read_radiometry_metadata(prefix: str, folder: str) -> tuple[bool | None, str | None, str]:
     """
     Fetch scene metadata JSON from S3 and return radiometric parameters.
-    Handles both AWS Open Data Sentinel-2 L2A registry (tileInfo.json) and Element84 COGs (<folder>.json).
-    Handles Sentinel-1 SAR (bypasses BOA check) and Sentinel-2 COGs (<folder>.json).
+    Handles Sentinel-1 SAR (bypasses BOA check) and Sentinel-2 COGs / L2A registry.
     """
-    # 1. Check Sentinel-2 L2A Open Data tileInfo.json
-    if prefix.startswith("tiles/") or "s2-l2a" in BUCKET.lower():
-        key = f"{prefix.rstrip('/')}/tileInfo.json"
     # 1. Sentinel-1 Radar does not utilize optical BOA offset
     if prefix.startswith("GRD/") or "s1" in (prefix + folder).lower():
         return True, "N/A", "ok"
 
-    # 2. Check Sentinel-2 COG STAC JSON or tileinfo_metadata.json
-    for json_key in [f"{prefix.rstrip('/')}/{folder}.json", f"{prefix.rstrip('/')}/tileinfo_metadata.json"]:
+    # 2. Check Sentinel-2 STAC / metadata JSON candidates
+    candidates = [
+        f"{prefix.rstrip('/')}/{folder}.json",
+        f"{prefix.rstrip('/')}/tileinfo_metadata.json",
+        f"{prefix.rstrip('/')}/tileInfo.json"
+    ]
+    for json_key in candidates:
         try:
-            body = s3_client.get_object(Bucket=BUCKET, Key=key)["Body"].read()
             body = s3_s2_client.get_object(Bucket=S2_BUCKET, Key=json_key)["Body"].read()
             item = json.loads(body)
             prod_name = item.get("productName", "")
@@ -228,29 +268,15 @@ def read_radiometry_metadata(prefix: str, folder: str) -> tuple[bool | None, str
                 if part.startswith("N") and len(part) >= 4:
                     baseline = f"{part[1:3]}.{part[3:]}"
                     break
-            applied = True
             properties = item.get("properties", {})
             applied = properties.get("earthsearch:boa_offset_applied", True)
-            baseline = properties.get("s2:processing_baseline", "05.12")
+            if "s2:processing_baseline" in properties:
+                baseline = properties["s2:processing_baseline"]
             return applied, baseline, "ok"
         except Exception as error:
-            logger.debug(f"tileInfo.json read skipped: {error}")
-            logger.debug(f"STAC json read skipped for {json_key}: {error}")
+            logger.debug(f"Radiometry json read skipped for {json_key}: {error}")
 
-    # 2. Check Element84 COG STAC JSON
-    key = f"{prefix.rstrip('/')}/{folder}.json"
-    try:
-        body = s3_client.get_object(Bucket=BUCKET, Key=key)["Body"].read()
-        item = json.loads(body)
-        properties = item.get("properties", {})
-        applied = properties.get("earthsearch:boa_offset_applied", True)
-        baseline = properties.get("s2:processing_baseline", "05.00")
-        return applied, baseline, "ok"
-    except Exception as error:
-        return True, "05.00", "ok"
     return True, "05.12", "ok"
-
-    return applied, baseline, "ok"
 
 
 def parse_s2_metadata_xml(xml_content: str) -> dict:
@@ -539,27 +565,34 @@ def download_and_verify_scene(
     # STEP 3: Download & Verify worker for one band
     # ─────────────────────────────────────────────────────────────
     def process_one_band(band_name: str):
-        s3_key, local_filename = resolve_s3_band_path(prefix, band_name)
-        target_path = os.path.join(scene_archive_dir, local_filename)
+        try:
+            s3_key, local_filename = resolve_s3_band_path(prefix, band_name)
+            target_path = os.path.join(scene_archive_dir, local_filename)
 
-        # Check if already verified in DB or already valid on disk (skip re-download)
-        if (local_filename in already_verified or band_name in already_verified or os.path.exists(target_path)) and verify_raster(target_path)[0]:
-            return local_filename, True, os.path.getsize(target_path), "cached"
+            # Check if already verified in DB or already valid on disk (skip re-download)
+            if (local_filename in already_verified or band_name in already_verified or os.path.exists(target_path)) and verify_raster(target_path)[0]:
+                return local_filename, True, os.path.getsize(target_path), "cached"
 
-        staged_path = os.path.join(staging_dir, folder, local_filename)
+            staged_path = os.path.join(staging_dir, folder, local_filename)
 
-        if not fetch_s3_object(s3_key, staged_path):
-            return local_filename, False, 0, "download failed"
+            if not fetch_s3_object(s3_key, staged_path):
+                return local_filename, False, 0, "download failed"
 
-        ok, size, note = verify_raster(staged_path)
-        if not ok:
-            if os.path.exists(staged_path):
-                os.remove(staged_path)
-            return local_filename, False, size, note
+            ok, size, note = verify_raster(staged_path)
+            if not ok:
+                if os.path.exists(staged_path):
+                    try:
+                        os.remove(staged_path)
+                    except Exception:
+                        pass
+                return local_filename, False, size, note
 
-        os.makedirs(scene_archive_dir, exist_ok=True)
-        os.replace(staged_path, target_path)
-        return local_filename, True, size, "ok"
+            os.makedirs(scene_archive_dir, exist_ok=True)
+            safe_move_file(staged_path, target_path)
+            return local_filename, True, size, "ok"
+        except Exception as err:
+            logger.error(f"Error processing band {band_name} for {folder}: {err}")
+            return band_name, False, 0, str(err)
 
     with ThreadPoolExecutor(max_workers=BAND_WORKERS) as pool:
         results = list(pool.map(process_one_band, bands))
