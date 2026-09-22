@@ -19,6 +19,7 @@ import logging
 from datetime import datetime
 from datetime import datetime, timedelta
 from typing import List, Dict, Any, Optional
+from concurrent.futures import ThreadPoolExecutor
 
 import boto3
 from botocore import UNSIGNED
@@ -343,7 +344,24 @@ def perform_gap_check(
     held_scenes = []
     missing_scenes = []
 
-    for sc in all_aws_scenes:
+    # Bulk pre-fetch database records for ultra-fast O(1) in-memory deduplication lookup
+    s1_downloaded_paths = set(
+        r[0] for r in db.query(Sentinel1SceneMetadataModel.scene_path).filter(
+            Sentinel1SceneMetadataModel.download_status == "DOWNLOADED"
+        ).all() if r[0]
+    )
+    s2_downloaded_paths = set(
+        r[0] for r in db.query(TileSceneMetadataModel.tile_path).filter(
+            TileSceneMetadataModel.download_status == "DOWNLOADED"
+        ).all() if r[0]
+    )
+    held_scene_ids = set(
+        r[0] for r in db.query(SceneModel.scene_id).filter(
+            SceneModel.status == "HELD"
+        ).all() if r[0]
+    )
+
+    def audit_scene_on_nas_and_db(sc: Dict[str, Any]) -> tuple[bool, Dict[str, Any]]:
         s_id = sc["scene_id"]
         folder = sc["folder"]
         tile = sc["tile"]
@@ -352,7 +370,7 @@ def perform_gap_check(
         prefix = sc.get("prefix", "")
         year = s_date[0:4]
         month = str(int(s_date[5:7]))
-        scene_archive_dir = os.path.join(settings.RAW_ARCHIVE_DIR, tile, year, month, folder)
+
         scene_archive_dir_nas = os.path.join(settings.RAW_ARCHIVE_DIR, tile, year, month, folder)
         backend_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
         scene_archive_dir_local = os.path.abspath(os.path.join(backend_root, "data", "archive", tile, year, month, folder))
@@ -361,25 +379,9 @@ def perform_gap_check(
         if not os.path.exists(scene_archive_dir_nas) and os.path.exists(scene_archive_dir_local):
             scene_archive_dir = scene_archive_dir_local
 
-        # Determine required bands for this scene's constellation
-        if sc_sat == "Sentinel-1":
-            bands_to_verify = ["VV", "VH"]
-        else:
-            bands_to_verify = required_bands if required_bands else ["B02", "B03", "B04", "B08", "TCI", "B8A", "B11", "SCL"]
+        bands_to_verify = ["VV", "VH"] if sc_sat == "Sentinel-1" else (required_bands if required_bands else ["B02", "B03", "B04", "B08", "TCI", "B8A", "B11", "SCL"])
 
-        # 1. Check metadata tables for previous download
-        if sc_sat == "Sentinel-1":
-            tile_meta = db.query(Sentinel1SceneMetadataModel).filter(
-                Sentinel1SceneMetadataModel.scene_path == prefix
-            ).first()
-        else:
-            tile_meta = db.query(TileSceneMetadataModel).filter(
-                TileSceneMetadataModel.tile_path == prefix
-            ).first()
-
-        existing_scene = db.query(SceneModel).filter(SceneModel.scene_id == s_id).first()
-
-        # Check if files exist on disk (strictly GeoTIFFs: .tif, .tiff)
+        # Check if band rasters exist on disk (strictly GeoTIFFs: .tif, .tiff with >0 bytes)
         has_disk_bands = False
         if os.path.exists(scene_archive_dir):
             disk_bands_present = [
@@ -388,42 +390,27 @@ def perform_gap_check(
             ]
             has_disk_bands = (len(disk_bands_present) >= len(bands_to_verify))
 
-        # Check DB status
-        is_held_in_db = False
-        if tile_meta and tile_meta.download_status == "DOWNLOADED":
-            is_held_in_db = True
-        elif existing_scene and existing_scene.status == "HELD":
-            verified_count = db.query(BandFileModel).filter(
-                BandFileModel.scene_id == s_id,
-                BandFileModel.verified == 1
-            ).count()
-            if verified_count >= len(bands_to_verify):
-                is_held_in_db = True
+        # Check in-memory DB sets
+        is_held_in_db = (prefix in s1_downloaded_paths or prefix in s2_downloaded_paths or s_id in held_scene_ids)
 
         if (is_held_in_db and os.path.exists(scene_archive_dir)) or has_disk_bands:
-            # Re-sync DB if needed
-            if not existing_scene:
-                existing_scene = SceneModel(
-                    scene_id=s_id,
-                    tile=tile,
-                    sensing_date=s_date,
-                    satellite=sc_sat,
-                    folder=folder,
-                    prefix=prefix,
-                    status="HELD",
-                    archive_path=scene_archive_dir
-                )
-                db.add(existing_scene)
-                db.commit()
-
             held_info = dict(sc)
             held_info["archive_path"] = scene_archive_dir
-            held_info["downloaded_at"] = str(tile_meta.downloaded_at) if (tile_meta and tile_meta.downloaded_at) else (str(existing_scene.held_at) if hasattr(existing_scene, 'held_at') and existing_scene.held_at else "previously")
-            held_info["downloaded_by_user_id"] = tile_meta.downloaded_by_user_id if tile_meta else None
-            held_scenes.append(held_info)
-            continue
+            held_info["downloaded_at"] = "previously"
+            return True, held_info
+        else:
+            return False, sc
 
-        missing_scenes.append(sc)
+    # Parallel multi-threaded audit across NAS and PostgreSQL (up to 32 concurrent workers)
+    max_audit_workers = min(32, max(4, len(all_aws_scenes))) if all_aws_scenes else 1
+    with ThreadPoolExecutor(max_workers=max_audit_workers) as executor:
+        audit_results = list(executor.map(audit_scene_on_nas_and_db, all_aws_scenes))
+
+    for is_held, sc_info in audit_results:
+        if is_held:
+            held_scenes.append(sc_info)
+        else:
+            missing_scenes.append(sc_info)
 
     tile_statuses = {}
     for t in tiles:
