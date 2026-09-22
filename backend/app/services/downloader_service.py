@@ -143,6 +143,7 @@ def ensure_nas_connection(path: str) -> bool:
 def safe_move_file(src: str, dst: str, max_retries: int = 5, delay: float = 0.5) -> bool:
     """
     Safely moves a file from src to dst on Windows / Network share.
+    Retries up to max_retries if Windows file lock [WinError 32] or network latency occurs.
     Auto-reconnects NAS UNC share if WinError 53/67/64 occurs and retries.
     Falls back to local archive directory if NAS network share is completely unreachable.
     """
@@ -152,6 +153,7 @@ def safe_move_file(src: str, dst: str, max_retries: int = 5, delay: float = 0.5)
         logger.warning(f"safe_move_file source file missing: {src}")
         return False
 
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
     if dst.startswith("\\\\"):
         ensure_nas_connection(dst)
 
@@ -187,6 +189,7 @@ def safe_move_file(src: str, dst: str, max_retries: int = 5, delay: float = 0.5)
                     pass
 
             if attempt == max_retries:
+                logger.warning(f"Could not move {src} -> {dst} after {max_retries} attempts: {e}")
                 # Failure-Safe Local Fallback: if NAS UNC network share is down, save to local fallback archive
                 if dst.startswith("\\\\"):
                     local_fallback_root = os.path.abspath("data/archive")
@@ -570,6 +573,7 @@ def download_and_verify_scene(
     archive_dir = settings.RAW_ARCHIVE_DIR
 
     scene_archive_dir = os.path.join(archive_dir, tile, year, month, folder)
+    os.makedirs(scene_archive_dir, exist_ok=True)
     if scene_archive_dir.startswith("\\\\"):
         ensure_nas_connection(scene_archive_dir)
     try:
@@ -978,7 +982,8 @@ def download_and_verify_scene(
 def resolve_tif_path(raw_path: str) -> tuple:
     """
     Checks if a stored DB raster path exists on disk, resolving relative paths
-    against current execution dir and backend root. Returns (resolved_path, exists_bool).
+    against current execution dir, backend root, and local fallback archive (data/archive).
+    Returns (resolved_path, exists_bool).
     """
     if not raw_path:
         return raw_path, False
@@ -991,6 +996,18 @@ def resolve_tif_path(raw_path: str) -> tuple:
     norm_p = os.path.normpath(raw_path)
     if os.path.exists(norm_p):
         return os.path.abspath(norm_p), True
+
+    # Fallback to local data/archive directory if NAS path is unreachable
+    if "SDAP_DATA_STORAGE" in raw_path or "archive" in raw_path:
+        rel_p = raw_path.split("SDAP_DATA_STORAGE\\")[-1] if "SDAP_DATA_STORAGE\\" in raw_path else (
+            raw_path.split("SDAP_DATA_STORAGE/")[-1] if "SDAP_DATA_STORAGE/" in raw_path else (
+                raw_path.split("archive\\")[-1] if "archive\\" in raw_path else raw_path.split("archive/")[-1]
+            )
+        )
+        local_archive_alt = os.path.abspath(os.path.join(backend_root, "data", "archive", rel_p))
+        if os.path.exists(local_archive_alt):
+            return local_archive_alt, True
+
     return os.path.abspath(raw_path) if not os.path.isabs(raw_path) else raw_path, False
 
 

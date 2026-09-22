@@ -28,6 +28,7 @@ from sqlalchemy import text
 
 from app.core.config import settings
 from app.models.sdap_models import SceneModel, BandFileModel, TileSceneMetadataModel, Sentinel1SceneMetadataModel
+from app.services.downloader_service import ensure_nas_connection
 
 logger = logging.getLogger("sdap.gap_check")
 
@@ -336,6 +337,9 @@ def perform_gap_check(
 
     logger.info(f"AWS Gap Check found {len(all_aws_scenes)} total scenes available across tiles {tiles} (Satellite: {satellite}).")
 
+    # Ensure NAS connection before checking local/network raw archive storage
+    ensure_nas_connection(settings.RAW_ARCHIVE_DIR)
+
     held_scenes = []
     missing_scenes = []
 
@@ -348,7 +352,13 @@ def perform_gap_check(
         prefix = sc.get("prefix", "")
         year = s_date[0:4]
         month = str(int(s_date[5:7]))
-        scene_archive_dir = os.path.join(settings.RAW_ARCHIVE_DIR, tile, year, month, folder)
+        scene_archive_dir_nas = os.path.join(settings.RAW_ARCHIVE_DIR, tile, year, month, folder)
+        backend_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+        scene_archive_dir_local = os.path.abspath(os.path.join(backend_root, "data", "archive", tile, year, month, folder))
+
+        scene_archive_dir = scene_archive_dir_nas
+        if not os.path.exists(scene_archive_dir_nas) and os.path.exists(scene_archive_dir_local):
+            scene_archive_dir = scene_archive_dir_local
 
         # Determine required bands for this scene's constellation
         if sc_sat == "Sentinel-1":
