@@ -94,50 +94,66 @@ def resolve_s3_band_path(prefix: str, band_name: str) -> tuple[str, str]:
 
 def ensure_nas_connection(path: str) -> bool:
     """
-    Ensures Windows SMB connection to UNC network share (e.g. \\172.16.16.52\Remote-sensing) is active.
-    If disconnected or throwing WinError 53/67/64, runs `net use` to re-establish the connection.
-    Supports optional NAS_USER and NAS_PASSWORD credentials from settings/.env.
+    Ensures Windows SMB connection to NAS network share or mapped drive (e.g. Y: or \\172.16.16.52\Remote-sensing) is active.
+    If disconnected or throwing WinError 53/67/64, runs `cmdkey` and `net use` to permanently re-establish the connection.
+    Supports NAS_USER, NAS_PASSWORD, NAS_DRIVE_LETTER from settings/.env.
     """
-    if not path or not path.startswith("\\\\"):
+    if not path:
         return True
 
-    parts = [p for p in path.split("\\") if p]
-    if len(parts) < 2:
+    # 1. Check if path already exists and is accessible
+    if os.path.exists(path):
         return True
 
-    unc_share = f"\\\\{parts[0]}\\{parts[1]}"
+    nas_user = getattr(settings, "NAS_USER", None) or os.getenv("NAS_USER")
+    nas_pass = getattr(settings, "NAS_PASSWORD", None) or os.getenv("NAS_PASSWORD")
+    nas_ip = getattr(settings, "NAS_SERVER_IP", "172.16.16.52")
+    nas_share_name = getattr(settings, "NAS_SHARE_NAME", "Remote-sensing")
+    unc_share = f"\\\\{nas_ip}\\{nas_share_name}"
+
+    if path.startswith("\\\\"):
+        parts = [p for p in path.split("\\") if p]
+        if len(parts) >= 2:
+            unc_share = f"\\\\{parts[0]}\\{parts[1]}"
+
     if os.path.exists(unc_share):
         return True
 
-    logger.warning(f"NAS network share '{unc_share}' is disconnected or unreachable. Attempting auto-reconnect...")
+    logger.warning(f"NAS storage path '{path}' (Share: '{unc_share}') is disconnected or unreachable. Re-establishing persistent connection...")
+
+    import subprocess
+    # Step A: Register credentials with Windows Credential Manager if provided
+    if nas_user and nas_pass:
+        try:
+            cmdkey_cmd = ["cmdkey", f"/add:{nas_ip}", f"/user:{nas_user}", f"/pass:{nas_pass}"]
+            subprocess.run(cmdkey_cmd, capture_output=True, text=True, timeout=5)
+        except Exception as ck_err:
+            logger.debug(f"cmdkey registration note: {ck_err}")
+
+    # Step B: Attempt persistent net use re-connect
     try:
-        import subprocess
-        nas_user = getattr(settings, "NAS_USER", None) or os.getenv("NAS_USER")
-        nas_pass = getattr(settings, "NAS_PASSWORD", None) or os.getenv("NAS_PASSWORD")
+        drive_letter = getattr(settings, "NAS_DRIVE_LETTER", "Y:").rstrip(":") + ":"
+        if path.upper().startswith(drive_letter.upper()):
+            net_cmd = ["net", "use", drive_letter, unc_share, "/persistent:yes"]
+            if nas_user and nas_pass:
+                net_cmd = ["net", "use", drive_letter, unc_share, f"/user:{nas_user}", nas_pass, "/persistent:yes"]
+            proc = subprocess.run(net_cmd, capture_output=True, text=True, timeout=10)
+            if os.path.exists(path) or os.path.exists(drive_letter):
+                logger.info(f"Successfully mapped persistent NAS drive {drive_letter} -> {unc_share}")
+                return True
 
+        net_cmd = ["net", "use", unc_share, "/persistent:yes"]
         if nas_user and nas_pass:
-            cmd = ["net", "use", unc_share, f"/user:{nas_user}", nas_pass, "/persistent:yes"]
-        else:
-            cmd = ["net", "use", unc_share, "/persistent:yes"]
-
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+            net_cmd = ["net", "use", unc_share, f"/user:{nas_user}", nas_pass, "/persistent:yes"]
+        proc = subprocess.run(net_cmd, capture_output=True, text=True, timeout=10)
         out = (proc.stdout or "") + (proc.stderr or "")
         if proc.returncode == 0 or "already" in out.lower() or "multiple" in out.lower():
             logger.info(f"Successfully re-established NAS connection to '{unc_share}'.")
             return True
-        else:
-            cmd_simple = ["net", "use", unc_share]
-            if nas_user and nas_pass:
-                cmd_simple = ["net", "use", unc_share, f"/user:{nas_user}", nas_pass]
-            proc_s = subprocess.run(cmd_simple, capture_output=True, text=True, timeout=10)
-            s_out = (proc_s.stdout or "") + (proc_s.stderr or "")
-            if proc_s.returncode == 0 or "already" in s_out.lower() or "multiple" in s_out.lower():
-                logger.info(f"Successfully connected to NAS '{unc_share}'.")
-                return True
     except Exception as err:
         logger.warning(f"Failed executing net use reconnect for '{unc_share}': {err}")
 
-    return os.path.exists(unc_share)
+    return os.path.exists(path) or os.path.exists(unc_share)
 
 
 def safe_move_file(src: str, dst: str, max_retries: int = 5, delay: float = 0.5) -> bool:
@@ -982,8 +998,7 @@ def download_and_verify_scene(
 def resolve_tif_path(raw_path: str) -> tuple:
     """
     Checks if a stored DB raster path exists on disk, resolving relative paths
-    against current execution dir, backend root, and local fallback archive (data/archive).
-    Returns (resolved_path, exists_bool).
+    against current execution dir and backend root. Returns (resolved_path, exists_bool).
     """
     if not raw_path:
         return raw_path, False
@@ -996,18 +1011,6 @@ def resolve_tif_path(raw_path: str) -> tuple:
     norm_p = os.path.normpath(raw_path)
     if os.path.exists(norm_p):
         return os.path.abspath(norm_p), True
-
-    # Fallback to local data/archive directory if NAS path is unreachable
-    if "SDAP_DATA_STORAGE" in raw_path or "archive" in raw_path:
-        rel_p = raw_path.split("SDAP_DATA_STORAGE\\")[-1] if "SDAP_DATA_STORAGE\\" in raw_path else (
-            raw_path.split("SDAP_DATA_STORAGE/")[-1] if "SDAP_DATA_STORAGE/" in raw_path else (
-                raw_path.split("archive\\")[-1] if "archive\\" in raw_path else raw_path.split("archive/")[-1]
-            )
-        )
-        local_archive_alt = os.path.abspath(os.path.join(backend_root, "data", "archive", rel_p))
-        if os.path.exists(local_archive_alt):
-            return local_archive_alt, True
-
     return os.path.abspath(raw_path) if not os.path.isabs(raw_path) else raw_path, False
 
 

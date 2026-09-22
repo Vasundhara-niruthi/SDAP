@@ -39,6 +39,13 @@ class Settings(BaseSettings):
     OUTPUT_INDEX_DIR: str = "data/output"
     DELIVERY_DIR: str = "data/delivery"
 
+    # NAS Network Credentials & Persistent Storage Settings
+    NAS_SERVER_IP: str = "172.16.16.52"
+    NAS_SHARE_NAME: str = "Remote-sensing"
+    NAS_DRIVE_LETTER: str = "Y:"
+    NAS_USER: Optional[str] = None
+    NAS_PASSWORD: Optional[str] = None
+
     # AWS Open Data Registry - Sentinel-2 COGs (https://registry.opendata.aws/sentinel-2-l2a-cogs/)
     AWS_SENTINEL_BUCKET: str = "sentinel-cogs"
     AWS_REGION: str = "us-west-2"
