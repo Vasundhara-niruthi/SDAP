@@ -94,23 +94,18 @@ def resolve_s3_band_path(prefix: str, band_name: str) -> tuple[str, str]:
 
 def ensure_nas_connection(path: str) -> bool:
     """
-    Ensures Windows SMB connection to NAS network share or mapped drive (e.g. Y: or \\172.16.16.52\Remote-sensing) is active.
-    If disconnected or throwing WinError 53/67/64, runs `cmdkey` and `net use` to permanently re-establish the connection.
-    Supports NAS_USER, NAS_PASSWORD, NAS_DRIVE_LETTER from settings/.env.
+    Ensures Windows SMB connection to UNC network share (e.g. \\172.16.16.52\Remote-sensing) or mapped drive is active.
+    If disconnected or throwing WinError 53/67/64/85, automatically re-establishes the connection using
+    NAS_USER and NAS_PASSWORD credentials from settings/.env.
     """
     if not path:
         return True
 
-    # 1. Check if path already exists and is accessible
+    # Check if target path or root UNC share already exists
     if os.path.exists(path):
         return True
 
-    nas_user = getattr(settings, "NAS_USER", None) or os.getenv("NAS_USER")
-    nas_pass = getattr(settings, "NAS_PASSWORD", None) or os.getenv("NAS_PASSWORD")
-    nas_ip = getattr(settings, "NAS_SERVER_IP", "172.16.16.52")
-    nas_share_name = getattr(settings, "NAS_SHARE_NAME", "Remote-sensing")
-    unc_share = f"\\\\{nas_ip}\\{nas_share_name}"
-
+    unc_share = "\\\\172.16.16.52\\Remote-sensing"
     if path.startswith("\\\\"):
         parts = [p for p in path.split("\\") if p]
         if len(parts) >= 2:
@@ -119,41 +114,44 @@ def ensure_nas_connection(path: str) -> bool:
     if os.path.exists(unc_share):
         return True
 
-    logger.warning(f"NAS storage path '{path}' (Share: '{unc_share}') is disconnected or unreachable. Re-establishing persistent connection...")
-
-    import subprocess
-    # Step A: Register credentials with Windows Credential Manager if provided
-    if nas_user and nas_pass:
-        try:
-            cmdkey_cmd = ["cmdkey", f"/add:{nas_ip}", f"/user:{nas_user}", f"/pass:{nas_pass}"]
-            subprocess.run(cmdkey_cmd, capture_output=True, text=True, timeout=5)
-        except Exception as ck_err:
-            logger.debug(f"cmdkey registration note: {ck_err}")
-
-    # Step B: Attempt persistent net use re-connect
+    logger.warning(f"NAS network share '{unc_share}' is disconnected or unreachable. Re-establishing connection...")
     try:
-        drive_letter = getattr(settings, "NAS_DRIVE_LETTER", "Y:").rstrip(":") + ":"
-        if path.upper().startswith(drive_letter.upper()):
-            net_cmd = ["net", "use", drive_letter, unc_share, "/persistent:yes"]
-            if nas_user and nas_pass:
-                net_cmd = ["net", "use", drive_letter, unc_share, f"/user:{nas_user}", nas_pass, "/persistent:yes"]
-            proc = subprocess.run(net_cmd, capture_output=True, text=True, timeout=10)
-            if os.path.exists(path) or os.path.exists(drive_letter):
-                logger.info(f"Successfully mapped persistent NAS drive {drive_letter} -> {unc_share}")
-                return True
+        import subprocess
+        nas_user = getattr(settings, "NAS_USER", None) or os.getenv("NAS_USER")
+        nas_pass = getattr(settings, "NAS_PASSWORD", None) or os.getenv("NAS_PASSWORD")
+        nas_ip = getattr(settings, "NAS_SERVER_IP", "172.16.16.52")
 
-        net_cmd = ["net", "use", unc_share, "/persistent:yes"]
+        # Step 1: Register credentials in Windows Credential Manager if provided
         if nas_user and nas_pass:
-            net_cmd = ["net", "use", unc_share, f"/user:{nas_user}", nas_pass, "/persistent:yes"]
-        proc = subprocess.run(net_cmd, capture_output=True, text=True, timeout=10)
+            try:
+                subprocess.run(["cmdkey", f"/add:{nas_ip}", f"/user:{nas_user}", f"/pass:{nas_pass}"], capture_output=True, text=True, timeout=5)
+            except Exception:
+                pass
+
+        # Step 2: Clear any stale/disconnected SMB session (handles error 85 / stale connections)
+        try:
+            subprocess.run(["net", "use", unc_share, "/delete", "/yes"], capture_output=True, text=True, timeout=5)
+        except Exception:
+            pass
+
+        # Step 3: Run net use with credentials & persistence
+        if nas_user and nas_pass:
+            cmd = ["net", "use", unc_share, f"/user:{nas_user}", nas_pass, "/persistent:yes"]
+        else:
+            cmd = ["net", "use", unc_share, "/persistent:yes"]
+
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
         out = (proc.stdout or "") + (proc.stderr or "")
-        if proc.returncode == 0 or "already" in out.lower() or "multiple" in out.lower():
+
+        if proc.returncode == 0 or "already" in out.lower() or "multiple" in out.lower() or "successfully" in out.lower():
             logger.info(f"Successfully re-established NAS connection to '{unc_share}'.")
             return True
+        else:
+            logger.warning(f"Net use reconnect returned: {out.strip()}")
     except Exception as err:
         logger.warning(f"Failed executing net use reconnect for '{unc_share}': {err}")
 
-    return os.path.exists(path) or os.path.exists(unc_share)
+    return os.path.exists(unc_share) or os.path.exists(path)
 
 
 def safe_move_file(src: str, dst: str, max_retries: int = 5, delay: float = 0.5) -> bool:
@@ -589,18 +587,20 @@ def download_and_verify_scene(
     archive_dir = settings.RAW_ARCHIVE_DIR
 
     scene_archive_dir = os.path.join(archive_dir, tile, year, month, folder)
-    os.makedirs(scene_archive_dir, exist_ok=True)
-    if scene_archive_dir.startswith("\\\\"):
+    if scene_archive_dir.startswith("\\\\") or ":" in scene_archive_dir:
         ensure_nas_connection(scene_archive_dir)
+
     try:
         os.makedirs(scene_archive_dir, exist_ok=True)
-    except Exception:
+    except Exception as _mk_err:
         if scene_archive_dir.startswith("\\\\"):
             ensure_nas_connection(scene_archive_dir)
             try:
                 os.makedirs(scene_archive_dir, exist_ok=True)
             except Exception:
-                pass
+                # Fallback to local archive dir if NAS network path is unreachable
+                scene_archive_dir = os.path.abspath(os.path.join("data/archive", tile, year, month, folder))
+                os.makedirs(scene_archive_dir, exist_ok=True)
 
     # ─────────────────────────────────────────────────────────────
     # STEP 0: DB Deduplication Check before downloading

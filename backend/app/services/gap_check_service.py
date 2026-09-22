@@ -352,6 +352,7 @@ def perform_gap_check(
         prefix = sc.get("prefix", "")
         year = s_date[0:4]
         month = str(int(s_date[5:7]))
+        scene_archive_dir = os.path.join(settings.RAW_ARCHIVE_DIR, tile, year, month, folder)
         scene_archive_dir_nas = os.path.join(settings.RAW_ARCHIVE_DIR, tile, year, month, folder)
         backend_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
         scene_archive_dir_local = os.path.abspath(os.path.join(backend_root, "data", "archive", tile, year, month, folder))

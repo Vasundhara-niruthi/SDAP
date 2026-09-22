@@ -518,7 +518,7 @@ export default function App() {
     }
   }, [token, currentUser, activeTab, fetchAdminData]);
 
-  // Smart polling: poll requests & active log modal continuously every 3s
+  // Smart polling: poll requests & active log modal continuously every 2s
   useEffect(() => {
     if (!token) return;
 
@@ -540,7 +540,7 @@ export default function App() {
           // ignore polling failure
         }
       }
-    }, 3000);
+    }, 2000);
 
     return () => clearInterval(interval);
   }, [token, isLogsModalOpen, activeTab, currentUser?.role, expandedUserId]);
