@@ -59,7 +59,14 @@ settings = Settings()
 
 # Ensure local storage directories exist on startup
 import os
+import logging
+_cfg_logger = logging.getLogger("sdap.config")
+
 for _path in [settings.STAGING_DIR, settings.RAW_ARCHIVE_DIR, settings.OUTPUT_INDEX_DIR, settings.DELIVERY_DIR]:
-    os.makedirs(_path, exist_ok=True)
+    if _path:
+        try:
+            os.makedirs(_path, exist_ok=True)
+        except Exception as _err:
+            _cfg_logger.warning(f"Could not pre-create storage directory '{_path}': {_err}")
 
 

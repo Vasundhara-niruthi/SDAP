@@ -518,15 +518,9 @@ export default function App() {
     }
   }, [token, currentUser, activeTab, fetchAdminData]);
 
-  // Smart polling: poll requests every 3s only when a job is active or logs modal is open
   // Smart polling: poll requests & active log modal continuously every 3s
   useEffect(() => {
     if (!token) return;
-
-    const hasActiveTask = requests.some(r => r.status === 'PROCESSING' || r.status === 'SUBMITTED' || r.status === 'VALIDATED');
-    const shouldPoll = hasActiveTask || isLogsModalOpen || (activeTab === 'admin' && currentUser?.role === 'ADMIN');
-
-    if (!shouldPoll) return;
 
     const interval = setInterval(async () => {
       fetchRequests();
@@ -549,7 +543,7 @@ export default function App() {
     }, 3000);
 
     return () => clearInterval(interval);
-  }, [token, requests, isLogsModalOpen, activeTab, currentUser?.role, expandedUserId, fetchRequests, fetchAdminData, fetchUserRequests]);
+  }, [token, isLogsModalOpen, activeTab, currentUser?.role, expandedUserId]);
 
   // Auto scroll terminal log view when logs update
   useEffect(() => {
@@ -2146,7 +2140,7 @@ export default function App() {
               padding: '2rem',
               boxShadow: '0 4px 6px -1px rgba(0,0,0,0.03)'
             }}>
-              <div style={{ marginBottom: '1.5rem', borderBottom: '1px solid #f1f5f9', paddingBottom: '1rem' }}>
+              <div style={{ marginBottom: '1.5rem', borderBottom: '1px solid #f1f5f9', pb: '1rem' }}>
                 <h2 style={{ fontSize: '1.25rem', fontWeight: 700, color: '#0f172a', margin: '0 0 0.25rem 0' }}>
                   Submit Satellite Acquisition & Pipeline Request
                 </h2>
@@ -3276,6 +3270,7 @@ export default function App() {
                       }}
                     >
                       <FileText size={14} /> Copy All File Paths
+                      <FileText size={14} /> Copy All Paths
                     </button>
 
                     <button
@@ -3296,6 +3291,7 @@ export default function App() {
                       }}
                     >
                       <Download size={14} /> Export CSV Manifest
+                      <Download size={14} /> Export CSV
                     </button>
                   </div>
 
