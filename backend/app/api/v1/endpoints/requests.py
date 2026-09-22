@@ -12,6 +12,11 @@ from app.core.security import get_current_user, get_current_admin
 from app.models.sdap_models import RequestModel, UserModel, ProcessJobModel
 from app.schemas.request_schema import RequestCreate, RequestResponse, RequestEstimateResponse
 
+import threading
+
+logger = logging.getLogger("sdap.requests")
+router = APIRouter()
+
 active_request_threads = set()
 active_threads_lock = threading.Lock()
 

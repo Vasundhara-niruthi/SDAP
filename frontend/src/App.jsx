@@ -549,7 +549,7 @@ export default function App() {
     }, 3000);
 
     return () => clearInterval(interval);
-  }, [token, isLogsModalOpen, activeTab, currentUser?.role, expandedUserId]);
+  }, [token, requests, isLogsModalOpen, activeTab, currentUser?.role, expandedUserId, fetchRequests, fetchAdminData, fetchUserRequests]);
 
   // Auto scroll terminal log view when logs update
   useEffect(() => {
@@ -2146,7 +2146,7 @@ export default function App() {
               padding: '2rem',
               boxShadow: '0 4px 6px -1px rgba(0,0,0,0.03)'
             }}>
-              <div style={{ marginBottom: '1.5rem', borderBottom: '1px solid #f1f5f9', pb: '1rem' }}>
+              <div style={{ marginBottom: '1.5rem', borderBottom: '1px solid #f1f5f9', paddingBottom: '1rem' }}>
                 <h2 style={{ fontSize: '1.25rem', fontWeight: 700, color: '#0f172a', margin: '0 0 0.25rem 0' }}>
                   Submit Satellite Acquisition & Pipeline Request
                 </h2>
@@ -3276,7 +3276,6 @@ export default function App() {
                       }}
                     >
                       <FileText size={14} /> Copy All File Paths
-                      <FileText size={14} /> Copy All Paths
                     </button>
 
                     <button
@@ -3297,7 +3296,6 @@ export default function App() {
                       }}
                     >
                       <Download size={14} /> Export CSV Manifest
-                      <Download size={14} /> Export CSV
                     </button>
                   </div>
 
