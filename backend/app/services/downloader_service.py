@@ -92,10 +92,59 @@ def resolve_s3_band_path(prefix: str, band_name: str) -> tuple[str, str]:
     return s3_key, cog_name
 
 
+def ensure_nas_connection(path: str) -> bool:
+    """
+    Ensures Windows SMB connection to UNC network share (e.g. \\172.16.16.52\Remote-sensing) is active.
+    If disconnected or throwing WinError 53/67/64, runs `net use` to re-establish the connection.
+    Supports optional NAS_USER and NAS_PASSWORD credentials from settings/.env.
+    """
+    if not path or not path.startswith("\\\\"):
+        return True
+
+    parts = [p for p in path.split("\\") if p]
+    if len(parts) < 2:
+        return True
+
+    unc_share = f"\\\\{parts[0]}\\{parts[1]}"
+    if os.path.exists(unc_share):
+        return True
+
+    logger.warning(f"NAS network share '{unc_share}' is disconnected or unreachable. Attempting auto-reconnect...")
+    try:
+        import subprocess
+        nas_user = getattr(settings, "NAS_USER", None) or os.getenv("NAS_USER")
+        nas_pass = getattr(settings, "NAS_PASSWORD", None) or os.getenv("NAS_PASSWORD")
+
+        if nas_user and nas_pass:
+            cmd = ["net", "use", unc_share, f"/user:{nas_user}", nas_pass, "/persistent:yes"]
+        else:
+            cmd = ["net", "use", unc_share, "/persistent:yes"]
+
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        out = (proc.stdout or "") + (proc.stderr or "")
+        if proc.returncode == 0 or "already" in out.lower() or "multiple" in out.lower():
+            logger.info(f"Successfully re-established NAS connection to '{unc_share}'.")
+            return True
+        else:
+            cmd_simple = ["net", "use", unc_share]
+            if nas_user and nas_pass:
+                cmd_simple = ["net", "use", unc_share, f"/user:{nas_user}", nas_pass]
+            proc_s = subprocess.run(cmd_simple, capture_output=True, text=True, timeout=10)
+            s_out = (proc_s.stdout or "") + (proc_s.stderr or "")
+            if proc_s.returncode == 0 or "already" in s_out.lower() or "multiple" in s_out.lower():
+                logger.info(f"Successfully connected to NAS '{unc_share}'.")
+                return True
+    except Exception as err:
+        logger.warning(f"Failed executing net use reconnect for '{unc_share}': {err}")
+
+    return os.path.exists(unc_share)
+
+
 def safe_move_file(src: str, dst: str, max_retries: int = 5, delay: float = 0.5) -> bool:
     """
     Safely moves a file from src to dst on Windows / Network share.
-    Retries up to max_retries if Windows file lock [WinError 32] or network latency occurs.
+    Auto-reconnects NAS UNC share if WinError 53/67/64 occurs and retries.
+    Falls back to local archive directory if NAS network share is completely unreachable.
     """
     if not os.path.exists(src):
         if os.path.exists(dst):
@@ -103,7 +152,19 @@ def safe_move_file(src: str, dst: str, max_retries: int = 5, delay: float = 0.5)
         logger.warning(f"safe_move_file source file missing: {src}")
         return False
 
-    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    if dst.startswith("\\\\"):
+        ensure_nas_connection(dst)
+
+    try:
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+    except Exception:
+        if dst.startswith("\\\\"):
+            ensure_nas_connection(dst)
+            try:
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+            except Exception:
+                pass
+
     for attempt in range(1, max_retries + 1):
         try:
             if os.path.exists(dst):
@@ -118,8 +179,30 @@ def safe_move_file(src: str, dst: str, max_retries: int = 5, delay: float = 0.5)
                 pass
             return True
         except Exception as e:
+            if dst.startswith("\\\\"):
+                ensure_nas_connection(dst)
+                try:
+                    os.makedirs(os.path.dirname(dst), exist_ok=True)
+                except Exception:
+                    pass
+
             if attempt == max_retries:
-                logger.warning(f"Could not move {src} -> {dst} after {max_retries} attempts: {e}")
+                # Failure-Safe Local Fallback: if NAS UNC network share is down, save to local fallback archive
+                if dst.startswith("\\\\"):
+                    local_fallback_root = os.path.abspath("data/archive")
+                    rel_p = dst.split("SDAP_DATA_STORAGE\\")[-1] if "SDAP_DATA_STORAGE\\" in dst else os.path.basename(dst)
+                    fallback_dst = os.path.join(local_fallback_root, rel_p)
+                    logger.warning(f"NAS network share unreachable ({e}). Saving scene raster to local fallback: {fallback_dst}")
+                    try:
+                        os.makedirs(os.path.dirname(fallback_dst), exist_ok=True)
+                        shutil.copy2(src, fallback_dst)
+                        try:
+                            os.remove(src)
+                        except Exception:
+                            pass
+                        return True
+                    except Exception as fb_err:
+                        logger.error(f"Fallback save failed: {fb_err}")
                 raise e
             time.sleep(delay)
     return False
@@ -487,7 +570,17 @@ def download_and_verify_scene(
     archive_dir = settings.RAW_ARCHIVE_DIR
 
     scene_archive_dir = os.path.join(archive_dir, tile, year, month, folder)
-    os.makedirs(scene_archive_dir, exist_ok=True)
+    if scene_archive_dir.startswith("\\\\"):
+        ensure_nas_connection(scene_archive_dir)
+    try:
+        os.makedirs(scene_archive_dir, exist_ok=True)
+    except Exception:
+        if scene_archive_dir.startswith("\\\\"):
+            ensure_nas_connection(scene_archive_dir)
+            try:
+                os.makedirs(scene_archive_dir, exist_ok=True)
+            except Exception:
+                pass
 
     # ─────────────────────────────────────────────────────────────
     # STEP 0: DB Deduplication Check before downloading
