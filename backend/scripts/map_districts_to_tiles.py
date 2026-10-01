@@ -69,9 +69,9 @@ def ensure_mapping_table_exists(engine):
                 district_uid VARCHAR(50),
                 district_name VARCHAR(100),
                 tile_id VARCHAR(50) NOT NULL,
-                created_at TIMESTAMP WITHOUT TIME ZONE DEFAULT NOW(),
-                CONSTRAINT uq_district_tile UNIQUE (district_id, tile_id)
+                created_at TIMESTAMP WITHOUT TIME ZONE DEFAULT NOW()
             );
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_district_tile ON district_tiles_mapping(district_id, tile_id);
             CREATE INDEX IF NOT EXISTS idx_dtm_district_id ON district_tiles_mapping(district_id);
             CREATE INDEX IF NOT EXISTS idx_dtm_tile_id ON district_tiles_mapping(tile_id);
             CREATE INDEX IF NOT EXISTS idx_dtm_district_uid ON district_tiles_mapping(district_uid);

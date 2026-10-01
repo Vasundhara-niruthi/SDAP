@@ -45,6 +45,8 @@ class RequestModel(Base):
     bands = Column(JSON, nullable=True)             # List of requested bands
     indices = Column(JSON, nullable=True)           # List of requested indices ['NDVI', 'LSWI', 'VV/VH']
     composite_interval = Column(String(50), nullable=True, default="none") # 'none', 'weekly', 'fortnightly', 'monthly'
+    max_cloud_cover = Column(Float, nullable=True, default=100.0) # Allowed cloud cover 0-100%
+    max_cloud_cover = Column(Integer, nullable=True, default=100) # Allowed cloud cover 0-100%
     priority = Column(String(20), default="normal") # 'high', 'normal', 'low'
     status = Column(String(50), default="SUBMITTED") # 'SUBMITTED', 'ACCEPTED', 'HOLD_FOR_APPROVAL', 'REJECTED', 'PROCESSING', 'COMPLETED'
     storage_estimated_gb = Column(Float, nullable=True)

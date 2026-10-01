@@ -57,14 +57,9 @@ def generate_dilated_cloud_mask(scl_path: str, dilation_pixels: int = 2) -> Tupl
     # Create initial boolean mask of invalid classes
     invalid_mask = np.isin(scl_data, list(INVALID_SCL_CLASSES))
 
-    # Dilate invalid mask by 2 pixels
+    # Dilate invalid mask by 2 pixels using pure NumPy dilation
     if dilation_pixels > 0:
-        try:
-            from scipy.ndimage import binary_dilation
-            struct = np.ones((2 * dilation_pixels + 1, 2 * dilation_pixels + 1), dtype=bool)
-            dilated_mask = binary_dilation(invalid_mask, structure=struct)
-        except ImportError:
-            dilated_mask = dilate_mask_numpy(invalid_mask, dilation_pixels)
+        dilated_mask = dilate_mask_numpy(invalid_mask, dilation_pixels)
     else:
         dilated_mask = invalid_mask
 

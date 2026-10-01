@@ -92,6 +92,7 @@ export default function App() {
   const [selectedIndices, setSelectedIndices] = useState(['NDVI', 'LSWI']);
   const [compositeInterval, setCompositeInterval] = useState('none');
   const [priority, setPriority] = useState('normal');
+  const [maxCloudCover, setMaxCloudCover] = useState(100);
   const [submittingReq, setSubmittingReq] = useState(false);
   const [reqFormMessage, setReqFormMessage] = useState(null);
 
@@ -656,6 +657,7 @@ export default function App() {
       indices: selectedIndices,
       composite_interval: compositeInterval,
       priority: priority,
+      max_cloud_cover: parseFloat(maxCloudCover) || 100.0,
       delivery_outputs: ['clipped_images']
     };
     setConfirmPayload(payload);
@@ -822,404 +824,274 @@ export default function App() {
     });
   };
 
-  // Parse raw console log stream into structured table rows with only essential pipeline fields
-  const parseLogLinesToTable = (rawLogs) => {
-    if (!rawLogs || rawLogs.trim().length === 0) return [];
+  // Dynamically parse acquisition scenes from raw execution logs
+  const parseAcquisitionScenes = (rawLogs, selectedReq) => {
+    const scenesMap = {};
+    const tilesSet = new Set();
 
-    const lines = rawLogs.split(/\r?\n/).map(l => l.trim()).filter(l => l.length > 0);
-    const rows = [];
-    let currentStage = 'Initialization';
-    let lastTime = '—';
-    let stepNum = 1;
+    const S1_BANDS = ['VV', 'VH'];
+    const DEFAULT_S2_BANDS = ['B04', 'B08', 'B11', 'SCL'];
+    const requestSatellite = selectedReq?.satellite || '';
+    const hasS1 = requestSatellite.includes('Sentinel-1');
+    const hasS2 = requestSatellite.includes('Sentinel-2');
 
-    for (let line of lines) {
-      if (/^={4,}/.test(line)) continue; // skip decorative divider lines
+    let reqBands;
+    if (Array.isArray(selectedReq?.bands) && selectedReq.bands.length > 0) {
+      reqBands = selectedReq.bands;
+    } else if (hasS1 && !hasS2) {
+      reqBands = S1_BANDS;
+    } else {
+      reqBands = DEFAULT_S2_BANDS;
+    }
 
-      // 1. Extract timestamp if present: e.g. [2026-09-16 15:48:24] or [15:48:24]
-      let createdTime = lastTime;
-      const timeMatch = line.match(/\[(?:[0-9]{4}-[0-9]{2}-[0-9]{2}\s+)?([0-9]{2}:[0-9]{2}:[0-9]{2})\]/);
-      if (timeMatch) {
-        createdTime = timeMatch[1];
-        lastTime = createdTime;
-      }
+    if (rawLogs && rawLogs.trim().length > 0) {
+      const lines = rawLogs.split(/\r?\n/).map(l => l.trim());
 
-      // Clean line without timestamp prefix
-      const cleanLine = line.replace(/^\[[0-9:\s-]+\]\s*/, '').replace(/^[A-Z]+:[a-z0-9_.]+:\s*/, '').trim();
-
-      // Track Stage
-      if (cleanLine.includes('[STAGE 1') || cleanLine.includes('GAP CHECK') || cleanLine.includes('SCENE DISCOVERY')) {
-        currentStage = 'Stage 1: Gap Check';
-      } else if (cleanLine.includes('[STAGE 2') || cleanLine.includes('FETCHING & VERIFYING') || cleanLine.includes('DOWNLOADING')) {
-        currentStage = 'Stage 2: Download';
-      } else if (cleanLine.includes('DATA DOWNLOAD & ACQUISITION COMPLETED') || cleanLine.includes('DATA ACQUISITION FINISHED')) {
-        currentStage = 'Completed';
-      }
-
-      // 2. Extract Tile / Scene
-      let sceneOrTile = '—';
-      const tileMatch = cleanLine.match(/Tile\s+'?([A-Za-z0-9_]+)'?/i);
-      const sceneMatch = cleanLine.match(/Scene\s+'?([A-Za-z0-9_-]+)'?/i);
-      if (tileMatch) {
-        sceneOrTile = tileMatch[1];
-      } else if (sceneMatch) {
-        sceneOrTile = sceneMatch[1];
-      } else if (cleanLine.includes('S1_SAR')) {
-        sceneOrTile = 'S1_SAR';
-      } else if (cleanLine.includes('Tiles identified:')) {
-        const idMatch = cleanLine.match(/Tiles identified:\s*(\[[^\]]+\]|[A-Za-z0-9_,\s]+)/i);
-        if (idMatch) sceneOrTile = idMatch[1].replace(/[[\]']/g, '');
-      }
-
-      // 3. Extract Storage Took / Archive path
-      let storage = '—';
-      const mbMatch = cleanLine.match(/([0-9.]+\s*MB|[0-9.]+\s*GB)/i);
-      const pathMatch = cleanLine.match(/['"](data\/[^'"]+)['"]/i) || cleanLine.match(/(data\/[A-Za-z0-9_/.-]+)/i);
-      const scenesCountMatch = cleanLine.match(/([0-9]+\/[0-9]+\s*scenes?)/i);
-
-      if (mbMatch && pathMatch) {
-        storage = `${mbMatch[1]} (${pathMatch[1]})`;
-      } else if (mbMatch) {
-        storage = mbMatch[1];
-      } else if (pathMatch) {
-        storage = pathMatch[1];
-      } else if (scenesCountMatch) {
-        storage = scenesCountMatch[1];
-      }
-
-      // 4. Extract Action & Status
-      let action = 'Pipeline Operation';
-      let status = 'INFO';
-
-      if (cleanLine.includes('[TILE STATUS:')) {
-        action = 'Tile Cache Audit';
-        if (cleanLine.includes('DOWNLOADED')) {
-          status = 'DOWNLOADED';
-        } else if (cleanLine.includes('PARTIAL')) {
-          status = 'PARTIAL';
-        } else if (cleanLine.includes('PENDING')) {
-          status = 'PENDING';
-        } else {
-          status = 'PENDING';
+      for (const line of lines) {
+        const tilesMatch = line.match(/Tiles:\s*\[([^\]]+)\]/i) || line.match(/Tiles identified:\s*\[([^\]]+)\]/i);
+        if (tilesMatch) {
+          tilesMatch[1].replace(/['"]/g, '').split(',').forEach(t => {
+            const cleanT = t.trim();
+            if (cleanT && cleanT !== 'S1_SAR') tilesSet.add(cleanT);
+          });
         }
-      } else if (cleanLine.includes('[TILE SUMMARY]')) {
-        action = 'Tile Acquisition Verified';
-        status = cleanLine.includes('DOWNLOADED') ? 'DOWNLOADED' : 'COMPLETED';
-      } else if (cleanLine.includes('[CACHE VERIFIED]') || cleanLine.includes('[ALREADY DOWNLOADED') || cleanLine.includes('cached at')) {
-        action = 'Local Cache Hit (Skip)';
-        status = 'CACHED';
-      } else if (cleanLine.includes('[NEW DOWNLOAD COMPLETED]')) {
-        action = 'Downloaded from AWS S3';
-        status = 'DOWNLOADED';
-      } else if (cleanLine.includes('✓ Downloaded')) {
-        action = 'Band GeoTIFF Verified';
-        status = 'DOWNLOADED';
-        const bandM = cleanLine.match(/\[([A-Za-z0-9_]+)\]/);
-        if (bandM && sceneOrTile !== '—') sceneOrTile = `${sceneOrTile} (${bandM[1]})`;
-      } else if (cleanLine.includes('Processing \'') || cleanLine.includes('Processing "') || cleanLine.includes('Downloading')) {
-        action = 'Downloading Scene from S3';
-        status = 'DOWNLOADING';
-      } else if (cleanLine.includes('ERROR') || cleanLine.includes('FATAL') || cleanLine.includes('Failed')) {
-        action = 'Pipeline Execution Error';
-        status = 'ERROR';
-      } else if (cleanLine.includes('STOPPED')) {
-        action = 'Execution Cancelled';
-        status = 'PENDING';
-      } else if (cleanLine.includes('Gap Check complete') || cleanLine.includes('Available on S3')) {
-        action = 'S3 Inventory Discovery';
-        status = 'COMPLETED';
-        if (storage === '—' && cleanLine.includes('Available')) {
-          const scAvail = cleanLine.match(/Available on S3:\s*([0-9]+)/i);
-          if (scAvail) storage = `${scAvail[1]} Scenes on AWS`;
-        }
-      } else if (cleanLine.includes('DATA DOWNLOAD & ACQUISITION COMPLETED') || cleanLine.includes('COMPLETED')) {
-        action = 'Acquisition Completed';
-        status = 'COMPLETED';
-        if (storage === '—') storage = 'Local Archive Synced';
-      } else if (cleanLine.includes('Querying database') || cleanLine.includes('SCENE DISCOVERY')) {
-        action = 'Querying Boundary Overlap';
-        status = 'PENDING';
-      } else if (cleanLine.includes('Range:') || cleanLine.includes('PIPELINE EXECUTION')) {
-        action = 'Pipeline Initialized';
-        status = 'INFO';
-      }
 
-      rows.push({
-        id: stepNum++,
-        createdTime,
-        stage: currentStage,
-        sceneOrTile,
-        action,
-        status,
-        storage
+        const tileDirectMatch = line.match(/Tile\s+'?([A-Za-z0-9_]+)'?/i) || line.match(/\[TILE STATUS:\s*([A-Za-z0-9_]+)\]/i);
+        if (tileDirectMatch && tileDirectMatch[1] !== 'S1_SAR') {
+          tilesSet.add(tileDirectMatch[1]);
+        }
+
+        const sceneMatch = line.match(/\b(S[12][A-C]_[0-9A-Za-z_]+)/i);
+        if (sceneMatch) {
+          const folderName = sceneMatch[1];
+          const parts = folderName.split('_');
+
+          if (parts.length >= 3) {
+            const sat = parts[0];
+            const isS1 = sat.startsWith('S1');
+            let tile = '—';
+            let formattedDate = '—';
+
+            if (isS1) {
+              tile = 'S1_SAR';
+              for (const part of parts) {
+                const dtM = part.match(/^(\d{8})T\d+$/);
+                if (dtM) {
+                  const d8 = dtM[1];
+                  formattedDate = `${d8.slice(0, 4)}-${d8.slice(4, 6)}-${d8.slice(6, 8)}`;
+                  break;
+                }
+              }
+            } else {
+              tile = parts[1] || '—';
+              const datePart = parts[2] || '';
+              formattedDate = (datePart.length === 8 && /^\d+$/.test(datePart))
+                ? `${datePart.slice(0, 4)}-${datePart.slice(4, 6)}-${datePart.slice(6, 8)}`
+                : (datePart || '—');
+              if (tile.length >= 4 && tile !== '—') tilesSet.add(tile);
+            }
+
+            const isFailed = /FAILED|ERROR/.test(line);
+            const sceneBands = isS1
+              ? reqBands.filter(b => S1_BANDS.includes(b))
+              : reqBands.filter(b => !S1_BANDS.includes(b));
+
+            if (!scenesMap[folderName]) {
+              scenesMap[folderName] = {
+                folder: folderName,
+                tile: tile,
+                date: formattedDate !== '—' ? formattedDate : (selectedReq?.start_date || '—'),
+                satellite: sat,
+                status: isFailed ? 'FAILED' : 'COMPLETE',
+                bands: sceneBands.length > 0 ? sceneBands : reqBands
+              };
+            } else if (isFailed) {
+              scenesMap[folderName].status = 'FAILED';
+            }
+          }
+        }
+      }
+    }
+
+    const sceneList = Object.values(scenesMap);
+
+    if (sceneList.length === 0) {
+      Array.from(tilesSet).forEach(t => {
+        sceneList.push({
+          folder: `Pending Scene Acquisition (${t})`,
+          tile: t,
+          date: selectedReq?.start_date || '—',
+          satellite: selectedReq?.satellite || 'Sentinel-2',
+          status: 'PENDING',
+          bands: [...reqBands]
+        });
       });
     }
 
-    return rows;
+    const totalScenes = sceneList.length;
+    const completeScenes = sceneList.filter(s => s.status === 'COMPLETE').length;
+    const tilesCoveredCount = Math.max(tilesSet.size, new Set(sceneList.map(s => s.tile)).size);
+    const bandsNeededCount = reqBands.length;
+    const progressPct = totalScenes > 0
+      ? Math.round((completeScenes / totalScenes) * 100)
+      : (selectedReq?.status === 'COMPLETED' ? 100 : 0);
+
+    return {
+      scenes: sceneList,
+      totalScenes,
+      completeScenes,
+      tilesCoveredCount,
+      bandsNeededCount,
+      progressPct
+    };
   };
 
-  const renderLogStatusBadge = (status) => {
-    switch (status) {
-      case 'DOWNLOADED':
-        return <span style={{ padding: '0.2rem 0.55rem', borderRadius: '9999px', fontSize: '0.72rem', fontWeight: 700, backgroundColor: '#dcfce7', color: '#166534', display: 'inline-flex', alignItems: 'center', gap: '0.25rem' }}><CheckCircle size={11} /> DOWNLOADED</span>;
-      case 'CACHED':
-        return <span style={{ padding: '0.2rem 0.55rem', borderRadius: '9999px', fontSize: '0.72rem', fontWeight: 700, backgroundColor: '#e0f2fe', color: '#0369a1', display: 'inline-flex', alignItems: 'center', gap: '0.25rem' }}><Database size={11} /> CACHED</span>;
-      case 'DOWNLOADING':
-        return <span style={{ padding: '0.2rem 0.55rem', borderRadius: '9999px', fontSize: '0.72rem', fontWeight: 700, backgroundColor: '#eff6ff', color: '#2563eb', display: 'inline-flex', alignItems: 'center', gap: '0.25rem' }}><RefreshCw size={11} className="animate-spin" /> DOWNLOADING</span>;
-      case 'COMPLETED':
-        return <span style={{ padding: '0.2rem 0.55rem', borderRadius: '9999px', fontSize: '0.72rem', fontWeight: 700, backgroundColor: '#ecfdf5', color: '#047857', display: 'inline-flex', alignItems: 'center', gap: '0.25rem' }}><CheckCircle size={11} /> COMPLETED</span>;
-      case 'PARTIAL':
-        return <span style={{ padding: '0.2rem 0.55rem', borderRadius: '9999px', fontSize: '0.72rem', fontWeight: 700, backgroundColor: '#fef3c7', color: '#92400e', display: 'inline-flex', alignItems: 'center', gap: '0.25rem' }}><AlertTriangle size={11} /> PARTIAL</span>;
-      case 'PENDING':
-        return <span style={{ padding: '0.2rem 0.55rem', borderRadius: '9999px', fontSize: '0.72rem', fontWeight: 600, backgroundColor: '#f1f5f9', color: '#475569', display: 'inline-flex', alignItems: 'center', gap: '0.25rem' }}>⏳ PENDING</span>;
-      case 'ERROR':
-        return <span style={{ padding: '0.2rem 0.55rem', borderRadius: '9999px', fontSize: '0.72rem', fontWeight: 700, backgroundColor: '#fee2e2', color: '#991b1b', display: 'inline-flex', alignItems: 'center', gap: '0.25rem' }}><XCircle size={11} /> ERROR</span>;
-      default:
-        return <span style={{ padding: '0.2rem 0.5rem', borderRadius: '9999px', fontSize: '0.7rem', fontWeight: 600, backgroundColor: '#f8fafc', color: '#64748b' }}>{status || 'INFO'}</span>;
-    }
+  const kpiCardStyle = {
+    backgroundColor: '#ffffff',
+    border: '1px solid #e2e8f0',
+    borderRadius: '0.65rem',
+    padding: '1.1rem 1rem',
+    textAlign: 'center',
+    boxShadow: '0 1px 3px rgba(0,0,0,0.04)'
   };
+  const kpiLabelStyle = { fontSize: '0.78rem', fontWeight: 600, color: '#64748b', marginBottom: '0.35rem' };
 
-  const extractTileSummaries = (rawLogs) => {
-    if (!rawLogs) return [];
-    const tilesMap = {};
-    const lines = rawLogs.split(/\r?\n/).map(l => l.trim());
-    for (let l of lines) {
-      if (l.includes('[TILE STATUS:') || l.includes('[TILE SUMMARY]')) {
-        const tileMatch = l.match(/Tile '([^']+)'/i) || l.match(/Tile\s+([A-Za-z0-9_]+)/i);
-        if (tileMatch) {
-          const tileName = tileMatch[1];
-          let status = 'PENDING';
-          if (l.includes('DOWNLOADED') || l.includes('100% Complete') || l.includes('100% CACHED')) {
-            status = 'DOWNLOADED';
-          } else if (l.includes('PARTIAL')) {
-            status = 'PARTIAL';
-          } else if (l.includes('NO DATA') || l.includes('NO SCENES')) {
-            status = 'NO_DATA';
-          }
-          tilesMap[tileName] = { tile: tileName, status, raw: l };
-        }
-      }
-    }
-    return Object.values(tilesMap);
-  };
+  const renderLogTableView = (rawLogs, selectedReq) => {
+    const {
+      scenes,
+      totalScenes,
+      completeScenes,
+      tilesCoveredCount,
+      bandsNeededCount,
+      progressPct
+    } = parseAcquisitionScenes(rawLogs, selectedReq);
 
-  const renderLogTableView = (rawLogs) => {
-    const allRows = parseLogLinesToTable(rawLogs);
-    const tileSummaries = extractTileSummaries(rawLogs);
-    if (allRows.length === 0) {
-      return (
-        <div style={{ padding: '2.5rem 1rem', textAlign: 'center', color: '#64748b' }}>
-          <RefreshCw size={24} className="animate-spin" style={{ margin: '0 auto 0.75rem auto', color: '#94a3b8' }} />
-          <div style={{ fontWeight: 600 }}>Initializing pipeline log recorder...</div>
-          <div style={{ fontSize: '0.8rem', marginTop: '0.25rem' }}>Awaiting first execution events from backend worker...</div>
-        </div>
-      );
-    }
-
-    const filteredRows = allRows.filter(row => {
-      if (logFilter === 'downloads') {
-        if (!['DOWNLOADED', 'CACHED', 'COMPLETED'].includes(row.status) && !row.action.includes('Download') && !row.action.includes('Acquisition') && !row.action.includes('Tile')) return false;
-      } else if (logFilter === 'errors') {
-        if (!['WARNING', 'ERROR'].includes(row.status)) return false;
-      }
+    const filteredScenes = scenes.filter(s => {
+      if (logFilter === 'downloads' && s.status !== 'COMPLETE') return false;
+      if (logFilter === 'errors' && s.status !== 'FAILED') return false;
       if (logSearchQuery.trim()) {
         const q = logSearchQuery.toLowerCase();
-        return row.stage.toLowerCase().includes(q) ||
-          row.action.toLowerCase().includes(q) ||
-          row.sceneOrTile.toLowerCase().includes(q) ||
-          row.status.toLowerCase().includes(q) ||
-          row.storage.toLowerCase().includes(q) ||
-          row.createdTime.toLowerCase().includes(q);
+        return (
+          s.tile.toLowerCase().includes(q) ||
+          s.date.toLowerCase().includes(q) ||
+          s.folder.toLowerCase().includes(q) ||
+          s.satellite.toLowerCase().includes(q) ||
+          s.status.toLowerCase().includes(q)
+        );
       }
       return true;
     });
 
     return (
-      <div style={{ flex: 1, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
-        {tileSummaries.length > 0 && (
-          <div style={{
-            padding: '0.65rem 0.85rem',
-            backgroundColor: '#ffffff',
-            borderRadius: '0.375rem',
-            border: '1px solid #e2e8f0',
-            display: 'flex',
-            flexDirection: 'column',
-            gap: '0.45rem',
-            boxShadow: '0 1px 2px rgba(0,0,0,0.03)'
-          }}>
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-              <span style={{ fontSize: '0.76rem', fontWeight: 700, color: '#334155', display: 'flex', alignItems: 'center', gap: '0.35rem' }}>
-                <Database size={13} color="#2563eb" /> Individual Tile Status Breakdown ({tileSummaries.length} Tiles)
-              </span>
-              <span style={{ fontSize: '0.72rem', color: '#64748b' }}>
-                Click any tile pill to filter logs
-              </span>
-            </div>
-            <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.4rem' }}>
-              {tileSummaries.map((item, idx) => {
-                const isSelected = logSearchQuery === item.tile;
-                const isDownloaded = item.status === 'DOWNLOADED';
-                const isPartial = item.status === 'PARTIAL';
-                return (
-                  <button
-                    key={idx}
-                    onClick={() => setLogSearchQuery(isSelected ? '' : item.tile)}
-                    title={item.raw}
-                    style={{
-                      display: 'inline-flex',
-                      alignItems: 'center',
-                      gap: '0.4rem',
-                      padding: '0.25rem 0.6rem',
-                      borderRadius: '0.375rem',
-                      fontSize: '0.75rem',
-                      fontWeight: 600,
-                      cursor: 'pointer',
-                      border: isSelected ? '2px solid #2563eb' : '1px solid #cbd5e1',
-                      backgroundColor: isSelected ? '#eff6ff' : (isDownloaded ? '#f0fdf4' : isPartial ? '#fffbeb' : '#f8fafc'),
-                      color: isDownloaded ? '#166534' : isPartial ? '#92400e' : '#475569',
-                      transition: 'all 0.15s ease'
-                    }}
-                  >
-                    <span style={{ fontFamily: 'monospace', fontWeight: 700 }}>{item.tile}</span>
-                    <span style={{
-                      fontSize: '0.68rem',
-                      padding: '0.1rem 0.4rem',
-                      borderRadius: '9999px',
-                      fontWeight: 700,
-                      backgroundColor: isDownloaded ? '#dcfce7' : isPartial ? '#fef3c7' : '#e2e8f0',
-                      color: isDownloaded ? '#15803d' : isPartial ? '#b45309' : '#64748b'
-                    }}>
-                      {isDownloaded ? '✓ DOWNLOADED' : isPartial ? '◐ PARTIAL' : '⏳ PENDING'}
-                    </span>
-                  </button>
-                );
-              })}
-              {logSearchQuery && (
-                <button
-                  onClick={() => setLogSearchQuery('')}
-                  style={{
-                    display: 'inline-flex',
-                    alignItems: 'center',
-                    gap: '0.25rem',
-                    padding: '0.25rem 0.5rem',
-                    borderRadius: '0.375rem',
-                    fontSize: '0.72rem',
-                    fontWeight: 600,
-                    color: '#2563eb',
-                    backgroundColor: '#ffffff',
-                    border: '1px dashed #2563eb',
-                    cursor: 'pointer'
-                  }}
-                >
-                  <X size={11} /> Clear Filter ({logSearchQuery})
-                </button>
-              )}
-            </div>
+      <div style={{ flex: 1, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: '1.25rem', padding: '0.5rem 0' }}>
+
+        {/* KPI Cards */}
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: '1rem' }}>
+          <div style={kpiCardStyle}>
+            <div style={kpiLabelStyle}>Total Scenes</div>
+            <div style={{ fontSize: '1.75rem', fontWeight: 800, color: '#0f172a' }}>{totalScenes}</div>
           </div>
-        )}
+          <div style={kpiCardStyle}>
+            <div style={kpiLabelStyle}>Complete</div>
+            <div style={{ fontSize: '1.75rem', fontWeight: 800, color: '#2563eb' }}>{completeScenes}</div>
+          </div>
+          <div style={kpiCardStyle}>
+            <div style={kpiLabelStyle}>Tiles Covered</div>
+            <div style={{ fontSize: '1.75rem', fontWeight: 800, color: '#2563eb' }}>{tilesCoveredCount}</div>
+          </div>
+          <div style={kpiCardStyle}>
+            <div style={kpiLabelStyle}>Bands Needed</div>
+            <div style={{ fontSize: '1.75rem', fontWeight: 800, color: '#7c3aed' }}>{bandsNeededCount}</div>
+          </div>
+        </div>
 
-        <div style={{ flex: 1, overflowY: 'auto', backgroundColor: '#ffffff', border: '1px solid #e2e8f0', borderRadius: '0.375rem' }}>
+        {/* Progress Bar */}
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '0.45rem', backgroundColor: '#ffffff', border: '1px solid #e2e8f0', borderRadius: '0.5rem', padding: '0.85rem 1rem' }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+            <span style={{ fontSize: '0.82rem', fontWeight: 600, color: '#334155' }}>Acquisition Progress</span>
+            <span style={{ fontSize: '0.85rem', fontWeight: 700, color: '#2563eb' }}>{progressPct}%</span>
+          </div>
+          <div style={{ height: '8px', width: '100%', backgroundColor: '#e2e8f0', borderRadius: '9999px', overflow: 'hidden' }}>
+            <div style={{ height: '100%', width: `${progressPct}%`, backgroundColor: '#2563eb', borderRadius: '9999px', transition: 'width 0.3s ease' }} />
+          </div>
+        </div>
+
+        {/* Section Header */}
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '0 0.25rem' }}>
+          <span style={{ fontSize: '0.95rem', fontWeight: 700, color: '#0f172a' }}>Acquisition Scenes Breakdown</span>
+          <span style={{ fontSize: '0.75rem', color: '#64748b' }}>Showing {filteredScenes.length} of {totalScenes} scenes</span>
+        </div>
+
+        {/* Scenes Table */}
+        <div style={{ backgroundColor: '#ffffff', border: '1px solid #e2e8f0', borderRadius: '0.5rem', overflow: 'hidden', boxShadow: '0 1px 3px rgba(0,0,0,0.03)' }}>
           <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.8rem', textAlign: 'left' }}>
-          <thead>
-            <tr style={{ backgroundColor: '#f8fafc', borderBottom: '1px solid #e2e8f0', position: 'sticky', top: 0, zIndex: 10 }}>
-              <th style={{ padding: '0.65rem 0.75rem', width: '120px', fontWeight: 700, color: '#475569' }}>Created Time</th>
-              <th style={{ padding: '0.65rem 0.75rem', width: '165px', fontWeight: 700, color: '#475569' }}>Pipeline Stage</th>
-              <th style={{ padding: '0.65rem 0.75rem', width: '150px', fontWeight: 700, color: '#475569' }}>Tile / Scene</th>
-              <th style={{ padding: '0.65rem 0.75rem', width: '210px', fontWeight: 700, color: '#475569' }}>Action</th>
-              <th style={{ padding: '0.65rem 0.75rem', width: '140px', fontWeight: 700, color: '#475569' }}>Status</th>
-              <th style={{ padding: '0.65rem 0.75rem', fontWeight: 700, color: '#475569' }}>Storage Took / Archive</th>
-            </tr>
-          </thead>
-          <tbody>
-            {filteredRows.length === 0 ? (
-              <tr>
-                <td colSpan={6} style={{ padding: '2rem', textAlign: 'center', color: '#94a3b8' }}>
-                  No log records match the current filter "{logFilter}" {logSearchQuery ? `with search "${logSearchQuery}"` : ''}.
-                </td>
+            <thead>
+              <tr style={{ backgroundColor: '#f8fafc', borderBottom: '1px solid #e2e8f0' }}>
+                <th style={{ padding: '0.75rem 1rem', width: '130px', fontWeight: 700, color: '#475569' }}>Date</th>
+                <th style={{ padding: '0.75rem 1rem', width: '110px', fontWeight: 700, color: '#475569' }}>Tile</th>
+                <th style={{ padding: '0.75rem 1rem', width: '110px', fontWeight: 700, color: '#475569' }}>Satellite</th>
+                <th style={{ padding: '0.75rem 1rem', fontWeight: 700, color: '#475569' }}>Folder</th>
+                <th style={{ padding: '0.75rem 1rem', width: '130px', fontWeight: 700, color: '#475569' }}>Status</th>
+                <th style={{ padding: '0.75rem 1rem', width: '220px', fontWeight: 700, color: '#475569' }}>Bands Verified</th>
               </tr>
-            ) : (
-              filteredRows.map((row, idx) => (
-                <tr key={idx} style={{
-                  borderBottom: '1px solid #f1f5f9',
-                  backgroundColor: row.status === 'ERROR' ? '#fef2f2' : row.status === 'PARTIAL' ? '#fffbeb' : row.status === 'DOWNLOADING' ? '#f0fdf4' : idx % 2 === 0 ? '#ffffff' : '#fcfcfd'
-                }}>
-                  {/* Created Time */}
-                  <td style={{ padding: '0.55rem 0.75rem', color: '#64748b', fontFamily: 'monospace', fontSize: '0.76rem', whiteSpace: 'nowrap' }}>
-                    <span style={{ display: 'inline-flex', alignItems: 'center', gap: '0.3rem' }}>
-                      <Clock size={11} color="#94a3b8" /> {row.createdTime}
-                    </span>
-                  </td>
-
-                  {/* Pipeline Stage */}
-                  <td style={{ padding: '0.55rem 0.75rem', fontWeight: 600, color: '#334155', fontSize: '0.78rem' }}>
-                    <span style={{
-                      padding: '0.15rem 0.45rem',
-                      borderRadius: '0.25rem',
-                      backgroundColor: row.stage.includes('Stage 1') ? '#f1f5f9' : row.stage.includes('Stage 2') ? '#eff6ff' : '#ecfdf5',
-                      color: row.stage.includes('Stage 1') ? '#475569' : row.stage.includes('Stage 2') ? '#1d4ed8' : '#047857',
-                      fontWeight: 600,
-                      fontSize: '0.73rem'
-                    }}>
-                      {row.stage}
-                    </span>
-                  </td>
-
-                  {/* Tile / Scene */}
-                  <td style={{ padding: '0.55rem 0.75rem' }}>
-                    {row.sceneOrTile !== '—' ? (
-                      <span style={{
-                        fontFamily: 'monospace',
-                        fontWeight: 700,
-                        fontSize: '0.74rem',
-                        backgroundColor: '#f8fafc',
-                        border: '1px solid #cbd5e1',
-                        borderRadius: '0.25rem',
-                        padding: '0.15rem 0.45rem',
-                        color: '#0f172a'
-                      }}>
-                        {row.sceneOrTile}
-                      </span>
-                    ) : (
-                      <span style={{ color: '#cbd5e1' }}>—</span>
-                    )}
-                  </td>
-
-                  {/* Action */}
-                  <td style={{ padding: '0.55rem 0.75rem', fontWeight: 600, color: '#0f172a', fontSize: '0.8rem' }}>
-                    {row.action}
-                  </td>
-
-                  {/* Status */}
-                  <td style={{ padding: '0.55rem 0.75rem' }}>
-                    {renderLogStatusBadge(row.status)}
-                  </td>
-
-                  {/* Storage Took / Archive */}
-                  <td style={{ padding: '0.55rem 0.75rem' }}>
-                    {row.storage !== '—' ? (
-                      <span style={{
-                        fontFamily: 'monospace',
-                        fontSize: '0.74rem',
-                        backgroundColor: '#f1f5f9',
-                        border: '1px solid #e2e8f0',
-                        borderRadius: '0.25rem',
-                        padding: '0.15rem 0.45rem',
-                        color: '#334155'
-                      }}>
-                        {row.storage}
-                      </span>
-                    ) : (
-                      <span style={{ color: '#cbd5e1' }}>—</span>
-                    )}
+            </thead>
+            <tbody>
+              {filteredScenes.length === 0 ? (
+                <tr>
+                  <td colSpan={6} style={{ padding: '2.5rem 1rem', textAlign: 'center', color: '#94a3b8' }}>
+                    <RefreshCw size={20} className="animate-spin" style={{ margin: '0 auto 0.5rem auto', color: '#94a3b8' }} />
+                    <div>No scenes recorded yet in current execution stream.</div>
                   </td>
                 </tr>
-              ))
-            )}
-          </tbody>
-        </table>
+              ) : (
+                filteredScenes.map((sc, idx) => (
+                  <tr key={sc.folder + idx} style={{ borderBottom: '1px solid #f1f5f9', backgroundColor: idx % 2 === 0 ? '#ffffff' : '#fcfcfd' }}>
+                    <td style={{ padding: '0.7rem 1rem', color: '#334155', fontFamily: 'monospace', fontWeight: 600 }}>{sc.date}</td>
+                    <td style={{ padding: '0.7rem 1rem', color: '#2563eb', fontWeight: 700, fontFamily: 'monospace' }}>{sc.tile}</td>
+                    <td style={{ padding: '0.7rem 1rem', color: '#475569', fontWeight: 600 }}>{sc.satellite}</td>
+                    <td style={{ padding: '0.7rem 1rem', color: '#64748b', fontFamily: 'monospace', fontSize: '0.75rem' }}>{sc.folder}</td>
+                    <td style={{ padding: '0.7rem 1rem' }}>
+                      <span style={{
+                        padding: '0.15rem 0.45rem',
+                        borderRadius: '0.25rem',
+                        fontSize: '0.72rem',
+                        fontWeight: 700,
+                        backgroundColor: sc.status === 'COMPLETE' ? '#eff6ff' : sc.status === 'FAILED' ? '#fee2e2' : '#f8fafc',
+                        color: sc.status === 'COMPLETE' ? '#1d4ed8' : sc.status === 'FAILED' ? '#dc2626' : '#64748b',
+                        border: sc.status === 'COMPLETE' ? '1px solid #bfdbfe' : sc.status === 'FAILED' ? '1px solid #fca5a5' : '1px solid #e2e8f0'
+                      }}>
+                        {sc.status}
+                      </span>
+                    </td>
+                    <td style={{ padding: '0.7rem 1rem' }}>
+                      <div style={{ display: 'flex', gap: '0.35rem', flexWrap: 'wrap' }}>
+                        {sc.bands && sc.bands.map((b, bIdx) => (
+                          <span key={bIdx} style={{
+                            padding: '0.15rem 0.45rem',
+                            borderRadius: '0.25rem',
+                            fontSize: '0.7rem',
+                            fontWeight: 700,
+                            fontFamily: 'monospace',
+                            backgroundColor: '#f8fafc',
+                            border: '1px solid #cbd5e1',
+                            color: '#1e293b'
+                          }}>
+                            {b}
+                          </span>
+                        ))}
+                      </div>
+                    </td>
+                  </tr>
+                ))
+              )}
+            </tbody>
+          </table>
+        </div>
+
       </div>
-    </div>
-  );
-};
+    );
+  };
+
 
   // ===========================================================================
   // RENDER: Unauthenticated View (Login / Register / Forgot Password)
@@ -2450,6 +2322,19 @@ export default function App() {
                     </select>
                     <span style={{ fontSize: '0.72rem', color: '#94a3b8' }}>High-priority requests are downloaded first</span>
                   </div>
+
+                  <div>
+                    <label style={{ display: 'block', fontSize: '0.8rem', fontWeight: 600, color: '#334155', marginBottom: '0.35rem' }}>Max Cloud Cover (%)</label>
+                    <input
+                      type="number"
+                      min="0"
+                      max="100"
+                      value={maxCloudCover}
+                      onChange={(e) => setMaxCloudCover(e.target.value)}
+                      style={{ width: '100%', padding: '0.6rem 0.75rem', borderRadius: '0.375rem', border: '1px solid #cbd5e1', fontSize: '0.875rem', backgroundColor: '#ffffff', outline: 'none' }}
+                    />
+                    <span style={{ fontSize: '0.72rem', color: '#94a3b8' }}>Skip Sentinel-2 scenes above threshold (0-100%)</span>
+                  </div>
                 </div>
 
                 {/* Delivery Outputs */}
@@ -3270,7 +3155,6 @@ export default function App() {
                       }}
                     >
                       <FileText size={14} /> Copy All File Paths
-                      <FileText size={14} /> Copy All Paths
                     </button>
 
                     <button
@@ -3291,7 +3175,6 @@ export default function App() {
                       }}
                     >
                       <Download size={14} /> Export CSV Manifest
-                      <Download size={14} /> Export CSV
                     </button>
                   </div>
 
@@ -3558,15 +3441,15 @@ export default function App() {
 
             {/* Modal Body: Switch between Table View and Raw Terminal View */}
             <div style={{
-              padding: logViewMode === 'table' ? '1rem' : '1.25rem',
-              backgroundColor: logViewMode === 'table' ? '#f8fafc' : '#0f172a',
+              padding: '1.25rem',
+              backgroundColor: '#ffffff',
               flex: 1,
               overflow: 'hidden',
               display: 'flex',
               flexDirection: 'column'
             }}>
               {logViewMode === 'table' ? (
-                renderLogTableView(selectedReqForLogs.execution_logs)
+                renderLogTableView(selectedReqForLogs.execution_logs, selectedReqForLogs)
               ) : (
                 <div className="log-terminal">
                   {renderLogContent(selectedReqForLogs.execution_logs)}

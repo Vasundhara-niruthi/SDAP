@@ -42,7 +42,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger("sdap.shapefile_processor")
 
 
-SHP_PATH = r"C:\Users\vasundharak\Desktop\SDAP\All_India_Distwise_UID.shp"
+SHP_PATH = os.getenv("SHP_PATH", os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "All_India_Distwise_UID.shp"))
 OUTPUT_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "boundaries")
 
 

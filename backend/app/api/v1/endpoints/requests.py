@@ -11,6 +11,7 @@ from app.core.database import get_db, SessionLocal
 from app.core.security import get_current_user, get_current_admin
 from app.models.sdap_models import RequestModel, UserModel, ProcessJobModel
 from app.schemas.request_schema import RequestCreate, RequestResponse, RequestEstimateResponse
+from app.core.config import settings
 
 import threading
 
@@ -164,6 +165,8 @@ def run_pipeline_background(request_id: int):
         end_str = req.end_date.strftime("%Y-%m-%d")
         indices = req.indices if isinstance(req.indices, list) and req.indices else ["NDVI", "LSWI"]
 
+        max_cloud_cover = float(getattr(req, "max_cloud_cover", 100.0) or 100.0)
+
         from scripts.download_district_tiles import run_district_acquisition_pipeline
         ok = run_district_acquisition_pipeline(
             district_name=district_name,
@@ -171,7 +174,9 @@ def run_pipeline_background(request_id: int):
             end_date=end_str,
             satellite=req.satellite,
             indices=indices,
-            request_id=req.id
+            request_id=req.id,
+            max_cloud_cover=max_cloud_cover,
+            composite_interval=req.composite_interval or "none"
         )
         db.refresh(req)
         # Only overwrite status if user didn't stop it during execution
@@ -214,6 +219,7 @@ def build_request_response(req: RequestModel) -> RequestResponse:
         bands=req.bands,
         indices=req.indices,
         composite_interval=req.composite_interval,
+        max_cloud_cover=getattr(req, "max_cloud_cover", 100.0) or 100.0,
         priority=req.priority,
         status=req.status,
         storage_estimated_gb=req.storage_estimated_gb,
@@ -315,6 +321,7 @@ def create_request(
         bands=req_in.bands,
         indices=req_in.indices,
         composite_interval=req_in.composite_interval,
+        max_cloud_cover=getattr(req_in, "max_cloud_cover", 100.0) or 100.0,
         priority=req_in.priority,
         status=req_status,
         storage_estimated_gb=est["estimated_total_gb"]
@@ -641,4 +648,118 @@ def get_request_tifs(
 
     from app.services.downloader_service import get_downloaded_tifs_for_request
     return get_downloaded_tifs_for_request(db, request_id)
+
+
+@router.get("/{request_id}/composites", summary="List all generated composite GeoTIFFs for a request")
+def get_request_composites(
+    request_id: int,
+    db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_user)
+):
+    """
+    Returns all temporal composite GeoTIFF deliverables (weekly, fortnightly, monthly)
+    generated for a specific request.
+    """
+    req = db.query(RequestModel).filter(RequestModel.id == request_id).first()
+    if not req:
+        raise HTTPException(status_code=404, detail="Request not found.")
+
+    if current_user.role != "ADMIN" and req.user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Not authorized to access composites for this request.")
+
+    district_name = req.district or req.state or "Region"
+    interval = req.composite_interval or "none"
+    year_str = req.start_date.strftime("%Y") if req.start_date else "2026"
+
+    # Search in NAS composites directory and delivery folder
+    search_dirs = [
+        os.path.join(settings.RAW_ARCHIVE_DIR, "Composites", district_name, year_str, interval.lower()),
+        os.path.join(settings.RAW_ARCHIVE_DIR, "Composites", district_name),
+        os.path.join(settings.DELIVERY_DIR, f"request_{request_id}")
+    ]
+
+    composites = []
+    seen = set()
+
+    for s_dir in search_dirs:
+        if os.path.exists(s_dir):
+            for root, _, files in os.walk(s_dir):
+                for f in files:
+                    if f.endswith(".tif") or f.endswith(".tiff"):
+                        full_p = os.path.join(root, f)
+                        if full_p not in seen:
+                            seen.add(full_p)
+                            size_mb = os.path.getsize(full_p) / (1024 * 1024)
+                            composites.append({
+                                "filename": f,
+                                "path": full_p,
+                                "size_mb": round(size_mb, 2),
+                                "composite_interval": interval,
+                                "district": district_name,
+                                "download_url": f"/api/v1/requests/{request_id}/composites/download?filename={f}"
+                            })
+
+    return {
+        "request_id": request_id,
+        "district": district_name,
+        "composite_interval": interval,
+        "total_composites": len(composites),
+        "composites": composites
+    }
+
+
+@router.get("/{request_id}/composites/download", summary="Download a single composite GeoTIFF file directly")
+def download_request_composite(
+    request_id: int,
+    filename: Optional[str] = Query(None, description="Filename of specific composite to download"),
+    token: Optional[str] = Query(None, description="Optional JWT authentication token"),
+    db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_user)
+):
+    """
+    Downloads a single composite GeoTIFF raster directly (e.g. Composite_NDVI_weekly_Ganjam_20260901_20260905.tif).
+    """
+    req = db.query(RequestModel).filter(RequestModel.id == request_id).first()
+    if not req:
+        raise HTTPException(status_code=404, detail="Request not found.")
+
+    if current_user.role != "ADMIN" and req.user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Not authorized to download files for this request.")
+
+    district_name = req.district or req.state or "Region"
+    interval = req.composite_interval or "none"
+    year_str = req.start_date.strftime("%Y") if req.start_date else "2026"
+
+    search_dirs = [
+        os.path.join(settings.DELIVERY_DIR, f"request_{request_id}"),
+        os.path.join(settings.RAW_ARCHIVE_DIR, "Composites", district_name, year_str, interval.lower()),
+        os.path.join(settings.RAW_ARCHIVE_DIR, "Composites", district_name)
+    ]
+
+    target_file = None
+    for s_dir in search_dirs:
+        if os.path.exists(s_dir):
+            if filename:
+                cand = os.path.join(s_dir, filename)
+                if os.path.exists(cand):
+                    target_file = cand
+                    break
+            else:
+                # Find first TIFF in directory
+                for f in os.listdir(s_dir):
+                    if f.endswith(".tif") or f.endswith(".tiff"):
+                        target_file = os.path.join(s_dir, f)
+                        break
+            if target_file:
+                break
+
+    if not target_file or not os.path.exists(target_file):
+        raise HTTPException(status_code=404, detail=f"Composite raster file not found for request #{request_id}.")
+
+    return FileResponse(
+        path=target_file,
+        filename=os.path.basename(target_file),
+        media_type="image/tiff"
+    )
+
 

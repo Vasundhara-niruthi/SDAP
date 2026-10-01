@@ -25,6 +25,8 @@ class RequestCreate(BaseModel):
     bands: List[str] = Field(default=["B04", "B08", "B08A", "B11", "SCL"], example=["B04", "B08", "B08A", "B11", "SCL"])
     indices: List[str] = Field(default=["NDVI", "LSWI"], example=["NDVI", "LSWI"])
     composite_interval: Optional[str] = Field("none", example="fortnightly")  # none, weekly, fortnightly, monthly
+    max_cloud_cover: Optional[float] = Field(100.0, ge=0.0, le=100.0, example=100.0)
+    max_cloud_cover: Optional[int] = Field(100, ge=0, le=100, example=100)
     priority: Optional[str] = Field("normal", example="high")  # high, normal, low
     delivery_outputs: Optional[List[str]] = Field(default=["clipped_images"], example=["clipped_images"])
 
@@ -107,6 +109,8 @@ class RequestResponse(BaseModel):
     bands: Optional[List[str]]
     indices: Optional[List[str]]
     composite_interval: Optional[str]
+    max_cloud_cover: Optional[float] = 100.0
+    max_cloud_cover: Optional[int] = 100
     priority: Optional[str]
     status: str
     storage_estimated_gb: Optional[float]

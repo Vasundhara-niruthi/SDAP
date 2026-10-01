@@ -30,9 +30,11 @@ from shapely.geometry import shape, mapping
 from sqlalchemy.orm import Session
 from sqlalchemy import text
 
+from app.core.config import settings
+
 logger = logging.getLogger("sdap.delivery")
 
-DELIVERIES_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "deliveries")
+DELIVERIES_DIR = settings.DELIVERY_DIR
 
 
 def get_district_geometry_from_db(db: Session, district_name: str) -> Tuple[Optional[dict], Optional[str]]:

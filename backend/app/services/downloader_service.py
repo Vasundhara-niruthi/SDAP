@@ -105,13 +105,15 @@ def ensure_nas_connection(path: str) -> bool:
     if os.path.exists(path):
         return True
 
-    unc_share = "\\\\172.16.16.52\\Remote-sensing"
+    nas_ip = getattr(settings, "NAS_SERVER_IP", None) or os.getenv("NAS_SERVER_IP", "")
+    nas_share = getattr(settings, "NAS_SHARE_NAME", None) or os.getenv("NAS_SHARE_NAME", "")
+    unc_share = f"\\\\{nas_ip}\\{nas_share}" if nas_ip and nas_share else ""
     if path.startswith("\\\\"):
         parts = [p for p in path.split("\\") if p]
         if len(parts) >= 2:
             unc_share = f"\\\\{parts[0]}\\{parts[1]}"
 
-    if os.path.exists(unc_share):
+    if unc_share and os.path.exists(unc_share):
         return True
 
     logger.warning(f"NAS network share '{unc_share}' is disconnected or unreachable. Re-establishing connection...")
@@ -119,7 +121,6 @@ def ensure_nas_connection(path: str) -> bool:
         import subprocess
         nas_user = getattr(settings, "NAS_USER", None) or os.getenv("NAS_USER")
         nas_pass = getattr(settings, "NAS_PASSWORD", None) or os.getenv("NAS_PASSWORD")
-        nas_ip = getattr(settings, "NAS_SERVER_IP", "172.16.16.52")
 
         # Step 1: Register credentials in Windows Credential Manager if provided
         if nas_user and nas_pass:
@@ -345,9 +346,6 @@ def read_radiometry_metadata(prefix: str, folder: str) -> tuple[bool | None, str
     Handles both AWS Open Data Sentinel-2 L2A registry (tileInfo.json) and Element84 COGs (<folder>.json).
     Handles Sentinel-1 SAR (bypasses BOA check) and Sentinel-2 COGs (<folder>.json).
     """
-    # 1. Check Sentinel-2 L2A Open Data tileInfo.json
-    if prefix.startswith("tiles/") or "s2-l2a" in BUCKET.lower():
-        key = f"{prefix.rstrip('/')}/tileInfo.json"
     # 1. Sentinel-1 Radar does not utilize optical BOA offset
     if prefix.startswith("GRD/") or "s1" in (prefix + folder).lower():
         return True, "N/A", "ok"
@@ -355,38 +353,16 @@ def read_radiometry_metadata(prefix: str, folder: str) -> tuple[bool | None, str
     # 2. Check Sentinel-2 COG STAC JSON or tileinfo_metadata.json
     for json_key in [f"{prefix.rstrip('/')}/{folder}.json", f"{prefix.rstrip('/')}/tileinfo_metadata.json"]:
         try:
-            body = s3_client.get_object(Bucket=BUCKET, Key=key)["Body"].read()
             body = s3_s2_client.get_object(Bucket=S2_BUCKET, Key=json_key)["Body"].read()
             item = json.loads(body)
-            prod_name = item.get("productName", "")
-            baseline = "05.11"
-            for part in prod_name.split("_"):
-                if part.startswith("N") and len(part) >= 4:
-                    baseline = f"{part[1:3]}.{part[3:]}"
-                    break
-            applied = True
             properties = item.get("properties", {})
             applied = properties.get("earthsearch:boa_offset_applied", True)
             baseline = properties.get("s2:processing_baseline", "05.12")
             return applied, baseline, "ok"
         except Exception as error:
-            logger.debug(f"tileInfo.json read skipped: {error}")
             logger.debug(f"STAC json read skipped for {json_key}: {error}")
 
-    # 2. Check Element84 COG STAC JSON
-    key = f"{prefix.rstrip('/')}/{folder}.json"
-    try:
-        body = s3_client.get_object(Bucket=BUCKET, Key=key)["Body"].read()
-        item = json.loads(body)
-        properties = item.get("properties", {})
-        applied = properties.get("earthsearch:boa_offset_applied", True)
-        baseline = properties.get("s2:processing_baseline", "05.00")
-        return applied, baseline, "ok"
-    except Exception as error:
-        return True, "05.00", "ok"
     return True, "05.12", "ok"
-
-    return applied, baseline, "ok"
 
 
 def parse_s2_metadata_xml(xml_content: str) -> dict:
@@ -978,6 +954,12 @@ def download_and_verify_scene(
     scene.boa_offset_applied = str(applied)
     scene.processing_baseline = baseline
     scene.archive_path = scene_archive_dir
+    cld_val = getattr(scene, "cloud_cover", None) or (meta_record.cloud_coverage_percentage if 'meta_record' in locals() and hasattr(meta_record, 'cloud_coverage_percentage') else None)
+    if cld_val is not None:
+        try:
+            scene.cloud_cover_percentage = int(round(float(cld_val)))
+        except Exception:
+            pass
     db.commit()
 
     downloaded_new = sum(1 for b in band_details if b.get("status") == "ok")

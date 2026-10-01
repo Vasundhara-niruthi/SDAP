@@ -33,7 +33,7 @@ from app.core.config import settings
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("sdap.shp_768_processor")
 
-SHP_PATH = r"C:\Users\vasundharak\Desktop\SDAP\All_India_Distwise_UID.shp"
+SHP_PATH = os.getenv("SHP_PATH", os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "All_India_Distwise_UID.shp"))
 BOUNDARIES_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "boundaries")
 CACHE_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "shp_768_geocode_cache.json")
 

@@ -1,6 +1,7 @@
 """
 Database Initialization & User Seeding Helper Script for SDAP
 """
+import os
 import sys
 import psycopg2
 from psycopg2.extensions import ISOLATION_LEVEL_AUTOCOMMIT
@@ -10,6 +11,7 @@ from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.core.database import engine, Base, SessionLocal
 from app.db.migrations.user_data import run_user_data_migrations
+from app.core.security import hash_password
 from app.models.sdap_models import UserModel, RequestModel, SceneModel, BandFileModel, ProcessJobModel
 
 
@@ -41,21 +43,25 @@ def migrate_schema():
 
 def seed_admin_user(db: Session):
     """Seed initial System Administrator account into local PostgreSQL."""
-    print("Checking system administrator account...")
-    
-    admin = db.query(UserModel).filter(UserModel.email == "admin@sdap.niruthi.in").first()
+    admin_email = os.getenv("DEFAULT_ADMIN_EMAIL", "admin@sdap.niruthi.in")
+    admin_pass = os.getenv("DEFAULT_ADMIN_PASSWORD", "admin123")
+    admin_name = os.getenv("DEFAULT_ADMIN_NAME", "SDAP System Administrator")
+
+    print(f"Checking system administrator account ({admin_email})...")
+    admin = db.query(UserModel).filter(UserModel.email == admin_email).first()
     if not admin:
         admin_user = UserModel(
-            email="admin@sdap.niruthi.in",
-            full_name="SDAP System Administrator",
-            hashed_password=hash_password("Admin@123456"),
+            email=admin_email,
+            full_name=admin_name,
+            hashed_password=hash_password(admin_pass),
             role="ADMIN",
             is_active=True
         )
         db.add(admin_user)
-        print("  [+] Seeded Admin User: admin@sdap.niruthi.in")
+        print(f"  [+] Seeded Admin User: {admin_email}")
     else:
-        print("  [*] Admin User already exists: admin@sdap.niruthi.in")
+        admin.hashed_password = hash_password(admin_pass)
+        print(f"  [*] Admin User password updated: {admin_email}")
 
     db.commit()
 
