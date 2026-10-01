@@ -1244,72 +1244,121 @@ def search_downloaded_tifs_by_region(
     matched_scenes = scene_query.all()
     scene_ids = [s.scene_id for s in matched_scenes]
 
-    if not scene_ids:
-        return {
-            "query_state": state,
-            "query_district": district,
-            "query_satellite": satellite,
-            "query_band": band,
-            "query_start_date": start_date,
-            "query_end_date": end_date,
-            "matched_tiles": tiles,
-            "matched_districts": resolved_districts,
-            "total_scenes": 0,
-            "total_tifs": 0,
-            "total_size_bytes": 0,
-            "total_size_mb": 0.0,
-            "tif_paths": [],
-            "tifs": []
-        }
-
-    # 3. Query Band Files from DB using path column
-    bf_query = db.query(BandFileModel).filter(
-        BandFileModel.scene_id.in_(scene_ids),
-        BandFileModel.verified == 1
-    )
-
-    if band and band.strip() and band.upper() != "ALL":
-        clean_b = band.replace(".tif", "").replace(".tiff", "").strip()
-        if clean_b.upper() in ("VV_VH", "VV/VH", "SAR_RATIO"):
-            from sqlalchemy import or_
-            bf_query = bf_query.filter(or_(
-                BandFileModel.band.ilike("%VV_VH%"),
-                BandFileModel.band.ilike("%VV/VH%")
-            ))
-        elif clean_b.upper() in ("COMPOSITE", "COMPOSITES"):
-            from sqlalchemy import or_
-            bf_query = bf_query.filter(or_(
-                BandFileModel.band.ilike("%Composite%"),
-                BandFileModel.band.ilike("%clipped%")
-            ))
-        else:
-            bf_query = bf_query.filter(BandFileModel.band.ilike(f"%{clean_b}%"))
-
-    band_records = bf_query.order_by(BandFileModel.tile, BandFileModel.sensing_date, BandFileModel.band).all()
-
     tif_files = []
     tif_paths = []
     total_size = 0
 
-    for bf in band_records:
-        raw_p = bf.path
-        if not (raw_p.lower().endswith(".tif") or raw_p.lower().endswith(".tiff")):
-            continue
-        path, exists = resolve_tif_path(raw_p)
-        actual_size = os.path.getsize(path) if exists else bf.size_bytes
-        total_size += actual_size
+    if scene_ids:
+        # 3. Query Band Files from DB using path column
+        bf_query = db.query(BandFileModel).filter(
+            BandFileModel.scene_id.in_(scene_ids),
+            BandFileModel.verified == 1
+        )
 
-        tif_paths.append(path)
-        tif_files.append({
-            "scene_id": bf.scene_id,
-            "tile": bf.tile,
-            "sensing_date": bf.sensing_date,
-            "satellite": bf.satellite,
-            "band": bf.band,
-            "path": path,
-            "size_bytes": actual_size,
-            "exists_on_disk": exists
-        })
+        if band and band.strip() and band.upper() != "ALL":
+            clean_b = band.replace(".tif", "").replace(".tiff", "").strip()
+            if clean_b.upper() in ("VV_VH", "VV/VH", "SAR_RATIO"):
+                from sqlalchemy import or_
+                bf_query = bf_query.filter(or_(
+                    BandFileModel.band.ilike("%VV_VH%"),
+                    BandFileModel.band.ilike("%VV/VH%")
+                ))
+            elif clean_b.upper() in ("COMPOSITE", "COMPOSITES"):
+                from sqlalchemy import or_
+                bf_query = bf_query.filter(or_(
+                    BandFileModel.band.ilike("%Composite%"),
+                    BandFileModel.band.ilike("%clipped%")
+                ))
+            else:
+                bf_query = bf_query.filter(BandFileModel.band.ilike(f"%{clean_b}%"))
+
+        band_records = bf_query.order_by(BandFileModel.tile, BandFileModel.sensing_date, BandFileModel.band).all()
+
+        for bf in band_records:
+            raw_p = bf.path
+            if not (raw_p.lower().endswith(".tif") or raw_p.lower().endswith(".tiff")):
+                continue
+            path, exists = resolve_tif_path(raw_p)
+            actual_size = os.path.getsize(path) if exists else bf.size_bytes
+            total_size += actual_size
+
+            tif_paths.append(path)
+            tif_files.append({
+                "scene_id": bf.scene_id,
+                "tile": bf.tile,
+                "sensing_date": bf.sensing_date,
+                "satellite": bf.satellite,
+                "band": bf.band,
+                "path": path,
+                "size_bytes": actual_size,
+                "exists_on_disk": exists
+            })
+
+    # 4. Search NAS Composites directory and local delivery folder for composite / clipped rasters
+    clean_b = (band or "").upper().strip()
+    if clean_b in ("COMPOSITE", "COMPOSITES", "ALL", "NDVI", "LSWI", "VV_VH", "VV/VH"):
+        import re
+        search_dirs = []
+        if district and district.strip():
+            search_dirs.append(os.path.join(settings.RAW_ARCHIVE_DIR, "Composites", district.strip()))
+        search_dirs.append(os.path.join(settings.RAW_ARCHIVE_DIR, "Composites"))
+        search_dirs.append(settings.DELIVERY_DIR)
+
+        dist_clean = (district or "").strip().lower()
+        seen_paths = set(tif_paths)
+
+        for s_dir in search_dirs:
+            if not s_dir or not os.path.exists(s_dir):
+                continue
+            for root, _, files in os.walk(s_dir):
+                for f in files:
+                    if not (f.lower().endswith(".tif") or f.lower().endswith(".tiff")):
+                        continue
+                    full_p = os.path.normpath(os.path.join(root, f))
+                    if full_p in seen_paths:
+                        continue
+
+                    full_p_lower = full_p.lower()
+                    if dist_clean and dist_clean not in full_p_lower:
+                        continue
+
+                    f_upper = f.upper()
+                    if clean_b in ("COMPOSITE", "COMPOSITES"):
+                        if "COMPOSITE" not in f_upper and "CLIPPED" not in f_upper:
+                            continue
+                    elif clean_b in ("VV_VH", "VV/VH", "SAR_RATIO"):
+                        if "VV_VH" not in f_upper and "VV/VH" not in f_upper:
+                            continue
+                    elif clean_b and clean_b != "ALL":
+                        if clean_b not in f_upper:
+                            continue
+
+                    date_match = re.search(r'(\d{8})_(\d{8})', f)
+                    if date_match and (start_date or end_date):
+                        f_start = f"{date_match.group(1)[:4]}-{date_match.group(1)[4:6]}-{date_match.group(1)[6:8]}"
+                        f_end = f"{date_match.group(2)[:4]}-{date_match.group(2)[4:6]}-{date_match.group(2)[6:8]}"
+                        
+                        q_start = (start_date or "1970-01-01").split("T")[0]
+                        q_end = (end_date or "2099-12-31").split("T")[0]
+
+                        if f_start > q_end or f_end < q_start:
+                            continue
+
+                    seen_paths.add(full_p)
+                    actual_size = os.path.getsize(full_p) if os.path.exists(full_p) else 0
+                    total_size += actual_size
+
+                    tif_paths.append(full_p)
+                    tif_files.append({
+                        "scene_id": f"Composite_{district or 'Region'}",
+                        "tile": district or "Composite",
+                        "sensing_date": date_match.group(1) if date_match else (start_date or "2026-01-01"),
+                        "satellite": "Composite Deliverable",
+                        "band": f,
+                        "path": full_p,
+                        "size_bytes": actual_size,
+                        "exists_on_disk": True
+                    })
 
     return {
         "query_state": state,

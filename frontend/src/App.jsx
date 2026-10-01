@@ -149,6 +149,13 @@ export default function App() {
   const [retDownloadedDistricts, setRetDownloadedDistricts] = useState([]);
   const [loadingRetRegions, setLoadingRetRegions] = useState(false);
 
+  // ---------------------------------------------------------------------------
+  // 8. Downloaded Requests Info Overview State
+  // ---------------------------------------------------------------------------
+  const [dlSearchQuery, setDlSearchQuery] = useState('');
+  const [dlStatusFilter, setDlStatusFilter] = useState('ALL');
+  const [dlSatFilter, setDlSatFilter] = useState('ALL');
+
   const handleExecuteRetrieval = async () => {
     setLoadingRet(true);
     setRetCopyNotice(null);
@@ -824,10 +831,20 @@ export default function App() {
     });
   };
 
-  // Dynamically parse acquisition scenes from raw execution logs
+  // Dynamically parse acquisition scenes, execution configs & tile scene insights from raw execution logs
   const parseAcquisitionScenes = (rawLogs, selectedReq) => {
     const scenesMap = {};
     const tilesSet = new Set();
+    const tileAuditMap = {};
+
+    const configInfo = {
+      district: selectedReq?.district || selectedReq?.state || 'Auto',
+      range: selectedReq ? `${selectedReq.start_date} to ${selectedReq.end_date}` : '—',
+      satellite: selectedReq?.satellite || 'Sentinel-1, Sentinel-2',
+      indices: selectedReq?.indices ? selectedReq.indices.join(', ') : 'NDVI, LSWI, VV/VH',
+      maxCloud: selectedReq?.max_cloud_cover ? `${selectedReq.max_cloud_cover}%` : '70.0%',
+      composite: selectedReq?.composite_interval || 'WEEKLY'
+    };
 
     const S1_BANDS = ['VV', 'VH', 'VV_VH', 'VV/VH'];
     const DEFAULT_S2_BANDS = ['B04', 'B08', 'B11', 'SCL'];
@@ -848,6 +865,47 @@ export default function App() {
       const lines = rawLogs.split(/\r?\n/).map(l => l.trim());
 
       for (const line of lines) {
+        // 1. Extract Config Info from header lines
+        const distM = line.match(/District:\s*([^\s|]+(?:\s+[^\s|]+)*)/i);
+        if (distM) configInfo.district = distM[1].trim();
+
+        const rangeM = line.match(/Range:\s*(\d{4}-\d{2}-\d{2}\s+to\s+\d{4}-\d{2}-\d{2})/i);
+        if (rangeM) configInfo.range = rangeM[1].trim();
+
+        const satM = line.match(/Satellite:\s*([^|]+)/i);
+        if (satM) configInfo.satellite = satM[1].trim();
+
+        const indM = line.match(/Indices:\s*(\[[^\]]+\]|[^|]+)/i);
+        if (indM) configInfo.indices = indM[1].replace(/[\[\]']/g, '').trim();
+
+        const cloudM = line.match(/Max Cloud:\s*([^|]+)/i);
+        if (cloudM) configInfo.maxCloud = cloudM[1].trim();
+
+        const compM = line.match(/Composite:\s*([^\s|]+)/i);
+        if (compM) configInfo.composite = compM[1].trim();
+
+        // 2. Parse Tile Audit & Storage Status lines (e.g. • [TILE STATUS: DOWNLOADED] Tile '43QHV': 100% CACHED (3/3 scenes held...))
+        const tileAuditM = line.match(/\[TILE STATUS:\s*([^\]]+)\]\s*Tile\s+'?([A-Za-z0-9_]+)'?:\s*(.*)/i);
+        if (tileAuditM) {
+          const statusTag = tileAuditM[1].trim();
+          const tileName = tileAuditM[2].trim();
+          const detailsStr = tileAuditM[3].trim();
+
+          const countsM = detailsStr.match(/(\d+)\/(\d+)\s+scenes/i);
+          const heldCount = countsM ? parseInt(countsM[1]) : 0;
+          const totalCount = countsM ? parseInt(countsM[2]) : 0;
+
+          tileAuditMap[tileName] = {
+            tile: tileName,
+            status: statusTag,
+            details: detailsStr,
+            held: heldCount,
+            total: totalCount
+          };
+          if (tileName !== 'S1_SAR') tilesSet.add(tileName);
+        }
+
+        // 3. Extract MGRS / S1 Tiles identified
         const tilesMatch = line.match(/Tiles:\s*\[([^\]]+)\]/i) || line.match(/Tiles identified:\s*\[([^\]]+)\]/i);
         if (tilesMatch) {
           tilesMatch[1].replace(/['"]/g, '').split(',').forEach(t => {
@@ -856,11 +914,12 @@ export default function App() {
           });
         }
 
-        const tileDirectMatch = line.match(/Tile\s+'?([A-Za-z0-9_]+)'?/i) || line.match(/\[TILE STATUS:\s*([A-Za-z0-9_]+)\]/i);
+        const tileDirectMatch = line.match(/Tile\s+'?([A-Za-z0-9_]+)'?/i);
         if (tileDirectMatch && tileDirectMatch[1] !== 'S1_SAR') {
           tilesSet.add(tileDirectMatch[1]);
         }
 
+        // 4. Parse Individual Scene Downloads & Processing lines
         const sceneMatch = line.match(/\b(S[12][A-C]_[0-9A-Za-z_]+)/i);
         if (sceneMatch) {
           const folderName = sceneMatch[1];
@@ -949,7 +1008,9 @@ export default function App() {
       completeScenes,
       tilesCoveredCount,
       bandsNeededCount,
-      progressPct
+      progressPct,
+      configInfo,
+      tileAuditList: Object.values(tileAuditMap)
     };
   };
 
@@ -970,7 +1031,9 @@ export default function App() {
       completeScenes,
       tilesCoveredCount,
       bandsNeededCount,
-      progressPct
+      progressPct,
+      configInfo,
+      tileAuditList
     } = parseAcquisitionScenes(rawLogs, selectedReq);
 
     const filteredScenes = scenes.filter(s => {
@@ -991,6 +1054,70 @@ export default function App() {
 
     return (
       <div style={{ flex: 1, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: '1.25rem', padding: '0.5rem 0' }}>
+
+        {/* Pipeline Configurations Header Banner */}
+        <div style={{ backgroundColor: '#0f172a', color: '#f8fafc', borderRadius: '0.65rem', padding: '1rem 1.25rem', boxShadow: '0 2px 4px rgba(0,0,0,0.1)' }}>
+          <div style={{ fontSize: '0.78rem', fontWeight: 700, textTransform: 'uppercase', tracking: '0.05em', color: '#38bdf8', marginBottom: '0.65rem' }}>
+            Pipeline Execution Configurations
+          </div>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: '0.75rem', fontSize: '0.8rem' }}>
+            <div>
+              <span style={{ color: '#94a3b8' }}>District: </span>
+              <span style={{ fontWeight: 700, color: '#ffffff' }}>{configInfo.district}</span>
+            </div>
+            <div>
+              <span style={{ color: '#94a3b8' }}>Date Range: </span>
+              <span style={{ fontWeight: 700, color: '#ffffff' }}>{configInfo.range}</span>
+            </div>
+            <div>
+              <span style={{ color: '#94a3b8' }}>Satellites: </span>
+              <span style={{ fontWeight: 700, color: '#ffffff' }}>{configInfo.satellite}</span>
+            </div>
+            <div>
+              <span style={{ color: '#94a3b8' }}>Target Indices: </span>
+              <span style={{ fontWeight: 700, color: '#ffffff' }}>{configInfo.indices}</span>
+            </div>
+            <div>
+              <span style={{ color: '#94a3b8' }}>Max Cloud: </span>
+              <span style={{ fontWeight: 700, color: '#ffffff' }}>{configInfo.maxCloud}</span>
+            </div>
+            <div>
+              <span style={{ color: '#94a3b8' }}>Composite: </span>
+              <span style={{ fontWeight: 700, color: '#ffffff' }}>{configInfo.composite}</span>
+            </div>
+          </div>
+        </div>
+
+        {/* Tile Scenes Audit Summary Insights */}
+        {tileAuditList && tileAuditList.length > 0 && (
+          <div style={{ backgroundColor: '#f8fafc', border: '1px solid #e2e8f0', borderRadius: '0.65rem', padding: '0.85rem 1rem' }}>
+            <div style={{ fontSize: '0.82rem', fontWeight: 700, color: '#334155', marginBottom: '0.65rem' }}>
+              Individual Tile Audit & Scenes Insights ({tileAuditList.length} Tiles)
+            </div>
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(240px, 1fr))', gap: '0.75rem' }}>
+              {tileAuditList.map((t, idx) => (
+                <div key={idx} style={{ backgroundColor: '#ffffff', border: '1px solid #cbd5e1', borderRadius: '0.5rem', padding: '0.65rem 0.85rem', fontSize: '0.78rem' }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.35rem' }}>
+                    <span style={{ fontWeight: 800, color: '#2563eb', fontFamily: 'monospace' }}>Tile: {t.tile}</span>
+                    <span style={{
+                      fontSize: '0.68rem',
+                      fontWeight: 700,
+                      padding: '0.1rem 0.4rem',
+                      borderRadius: '0.2rem',
+                      backgroundColor: t.status === 'DOWNLOADED' ? '#dcfce7' : t.status === 'PARTIAL' ? '#fef3c7' : '#f1f5f9',
+                      color: t.status === 'DOWNLOADED' ? '#15803d' : t.status === 'PARTIAL' ? '#b45309' : '#475569'
+                    }}>
+                      {t.status}
+                    </span>
+                  </div>
+                  <div style={{ color: '#475569', fontSize: '0.74rem' }}>
+                    <span style={{ fontWeight: 700 }}>{t.held} / {t.total || '?'}</span> scenes held ({t.total > 0 ? Math.round((t.held/t.total)*100) : 0}% complete)
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
 
         {/* KPI Cards */}
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: '1rem' }}>
@@ -1034,62 +1161,75 @@ export default function App() {
           <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.8rem', textAlign: 'left' }}>
             <thead>
               <tr style={{ backgroundColor: '#f8fafc', borderBottom: '1px solid #e2e8f0' }}>
-                <th style={{ padding: '0.75rem 1rem', width: '130px', fontWeight: 700, color: '#475569' }}>Date</th>
-                <th style={{ padding: '0.75rem 1rem', width: '110px', fontWeight: 700, color: '#475569' }}>Tile</th>
-                <th style={{ padding: '0.75rem 1rem', width: '110px', fontWeight: 700, color: '#475569' }}>Satellite</th>
-                <th style={{ padding: '0.75rem 1rem', fontWeight: 700, color: '#475569' }}>Folder</th>
-                <th style={{ padding: '0.75rem 1rem', width: '130px', fontWeight: 700, color: '#475569' }}>Status</th>
+                <th style={{ padding: '0.75rem 1rem', width: '120px', fontWeight: 700, color: '#475569' }}>Date</th>
+                <th style={{ padding: '0.75rem 1rem', width: '100px', fontWeight: 700, color: '#475569' }}>Tile</th>
+                <th style={{ padding: '0.75rem 1rem', width: '100px', fontWeight: 700, color: '#475569' }}>Satellite</th>
+                <th style={{ padding: '0.75rem 1rem', fontWeight: 700, color: '#475569' }}>Folder / Scene ID</th>
+                <th style={{ padding: '0.75rem 1rem', width: '130px', fontWeight: 700, color: '#475569' }}>Tile Scenes Info</th>
+                <th style={{ padding: '0.75rem 1rem', width: '110px', fontWeight: 700, color: '#475569' }}>Status</th>
                 <th style={{ padding: '0.75rem 1rem', width: '220px', fontWeight: 700, color: '#475569' }}>Bands Verified</th>
               </tr>
             </thead>
             <tbody>
               {filteredScenes.length === 0 ? (
                 <tr>
-                  <td colSpan={6} style={{ padding: '2.5rem 1rem', textAlign: 'center', color: '#94a3b8' }}>
+                  <td colSpan={7} style={{ padding: '2.5rem 1rem', textAlign: 'center', color: '#94a3b8' }}>
                     <RefreshCw size={20} className="animate-spin" style={{ margin: '0 auto 0.5rem auto', color: '#94a3b8' }} />
                     <div>No scenes recorded yet in current execution stream.</div>
                   </td>
                 </tr>
               ) : (
-                filteredScenes.map((sc, idx) => (
-                  <tr key={sc.folder + idx} style={{ borderBottom: '1px solid #f1f5f9', backgroundColor: idx % 2 === 0 ? '#ffffff' : '#fcfcfd' }}>
-                    <td style={{ padding: '0.7rem 1rem', color: '#334155', fontFamily: 'monospace', fontWeight: 600 }}>{sc.date}</td>
-                    <td style={{ padding: '0.7rem 1rem', color: '#2563eb', fontWeight: 700, fontFamily: 'monospace' }}>{sc.tile}</td>
-                    <td style={{ padding: '0.7rem 1rem', color: '#475569', fontWeight: 600 }}>{sc.satellite}</td>
-                    <td style={{ padding: '0.7rem 1rem', color: '#64748b', fontFamily: 'monospace', fontSize: '0.75rem' }}>{sc.folder}</td>
-                    <td style={{ padding: '0.7rem 1rem' }}>
-                      <span style={{
-                        padding: '0.15rem 0.45rem',
-                        borderRadius: '0.25rem',
-                        fontSize: '0.72rem',
-                        fontWeight: 700,
-                        backgroundColor: sc.status === 'COMPLETE' ? '#eff6ff' : sc.status === 'FAILED' ? '#fee2e2' : '#f8fafc',
-                        color: sc.status === 'COMPLETE' ? '#1d4ed8' : sc.status === 'FAILED' ? '#dc2626' : '#64748b',
-                        border: sc.status === 'COMPLETE' ? '1px solid #bfdbfe' : sc.status === 'FAILED' ? '1px solid #fca5a5' : '1px solid #e2e8f0'
-                      }}>
-                        {sc.status}
-                      </span>
-                    </td>
-                    <td style={{ padding: '0.7rem 1rem' }}>
-                      <div style={{ display: 'flex', gap: '0.35rem', flexWrap: 'wrap' }}>
-                        {sc.bands && sc.bands.map((b, bIdx) => (
-                          <span key={bIdx} style={{
-                            padding: '0.15rem 0.45rem',
-                            borderRadius: '0.25rem',
-                            fontSize: '0.7rem',
-                            fontWeight: 700,
-                            fontFamily: 'monospace',
-                            backgroundColor: '#f8fafc',
-                            border: '1px solid #cbd5e1',
-                            color: '#1e293b'
-                          }}>
-                            {b}
-                          </span>
-                        ))}
-                      </div>
-                    </td>
-                  </tr>
-                ))
+                filteredScenes.map((sc, idx) => {
+                  const auditInfo = tileAuditList.find(a => a.tile === sc.tile);
+                  const tileSceneInsight = auditInfo
+                    ? `${auditInfo.held}/${auditInfo.total || '?'} scenes`
+                    : '1 Scene';
+
+                  return (
+                    <tr key={sc.folder + idx} style={{ borderBottom: '1px solid #f1f5f9', backgroundColor: idx % 2 === 0 ? '#ffffff' : '#fcfcfd' }}>
+                      <td style={{ padding: '0.7rem 1rem', color: '#334155', fontFamily: 'monospace', fontWeight: 600 }}>{sc.date}</td>
+                      <td style={{ padding: '0.7rem 1rem', color: '#2563eb', fontWeight: 700, fontFamily: 'monospace' }}>{sc.tile}</td>
+                      <td style={{ padding: '0.7rem 1rem', color: '#475569', fontWeight: 600 }}>{sc.satellite}</td>
+                      <td style={{ padding: '0.7rem 1rem', color: '#64748b', fontFamily: 'monospace', fontSize: '0.75rem' }}>{sc.folder}</td>
+                      <td style={{ padding: '0.7rem 1rem', color: '#475569', fontSize: '0.74rem', fontWeight: 600 }}>
+                        <span style={{ backgroundColor: '#f1f5f9', padding: '0.15rem 0.4rem', borderRadius: '0.2rem', color: '#334155' }}>
+                          {tileSceneInsight}
+                        </span>
+                      </td>
+                      <td style={{ padding: '0.7rem 1rem' }}>
+                        <span style={{
+                          padding: '0.15rem 0.45rem',
+                          borderRadius: '0.25rem',
+                          fontSize: '0.72rem',
+                          fontWeight: 700,
+                          backgroundColor: sc.status === 'COMPLETE' ? '#eff6ff' : sc.status === 'FAILED' ? '#fee2e2' : '#f8fafc',
+                          color: sc.status === 'COMPLETE' ? '#1d4ed8' : sc.status === 'FAILED' ? '#dc2626' : '#64748b',
+                          border: sc.status === 'COMPLETE' ? '1px solid #bfdbfe' : sc.status === 'FAILED' ? '1px solid #fca5a5' : '1px solid #e2e8f0'
+                        }}>
+                          {sc.status}
+                        </span>
+                      </td>
+                      <td style={{ padding: '0.7rem 1rem' }}>
+                        <div style={{ display: 'flex', gap: '0.35rem', flexWrap: 'wrap' }}>
+                          {sc.bands && sc.bands.map((b, bIdx) => (
+                            <span key={bIdx} style={{
+                              padding: '0.15rem 0.45rem',
+                              borderRadius: '0.25rem',
+                              fontSize: '0.7rem',
+                              fontWeight: 700,
+                              fontFamily: 'monospace',
+                              backgroundColor: '#f8fafc',
+                              border: '1px solid #cbd5e1',
+                              color: '#1e293b'
+                            }}>
+                              {b}
+                            </span>
+                          ))}
+                        </div>
+                      </td>
+                    </tr>
+                  );
+                })
               )}
             </tbody>
           </table>
@@ -1773,6 +1913,25 @@ export default function App() {
               <Shield size={16} /> Admin Control & Live Feed
             </button>
           )}
+
+          <button
+            onClick={() => setActiveTab('downloaded_info')}
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              gap: '0.5rem',
+              padding: '0.65rem 1.25rem',
+              fontSize: '0.9rem',
+              fontWeight: 600,
+              border: 'none',
+              borderBottom: activeTab === 'downloaded_info' ? '2px solid #2563eb' : '2px solid transparent',
+              color: activeTab === 'downloaded_info' ? '#2563eb' : '#64748b',
+              backgroundColor: 'transparent',
+              cursor: 'pointer'
+            }}
+          >
+            <Database size={16} /> Downloaded Info & Requests
+          </button>
         </div>
 
         {/* ========================================================================= */}
@@ -3290,6 +3449,252 @@ export default function App() {
                 </div>
               </div>
             )}
+          </div>
+        )}
+
+        {/* ========================================================================= */}
+        {/* TAB 5: Downloaded Requests Information & Spatial Archive Overview */}
+        {/* ========================================================================= */}
+        {activeTab === 'downloaded_info' && (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '1.25rem' }}>
+            
+            {/* Page Title & Context Header */}
+            <div style={{
+              backgroundColor: '#ffffff',
+              borderRadius: '0.75rem',
+              border: '1px solid #e2e8f0',
+              padding: '1.25rem 1.5rem',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'space-between',
+              flexWrap: 'wrap',
+              gap: '1rem',
+              boxShadow: '0 1px 3px rgba(0,0,0,0.03)'
+            }}>
+              <div>
+                <h2 style={{ fontSize: '1.2rem', fontWeight: 700, color: '#0f172a', margin: '0 0 0.35rem 0', display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                  <Database size={22} color="#2563eb" /> Downloaded Info & Acquisition Requests Overview
+                </h2>
+                <p style={{ fontSize: '0.85rem', color: '#64748b', margin: 0 }}>
+                  Real-time acquisition database retrieved from the PostgreSQL <code style={{ backgroundColor: '#f1f5f9', padding: '0.1rem 0.35rem', borderRadius: '0.25rem', color: '#0f172a', fontWeight: 600 }}>acquisition_requests</code> table.
+                </p>
+              </div>
+
+              <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', fontSize: '0.78rem', color: '#2563eb', backgroundColor: '#eff6ff', padding: '0.4rem 0.75rem', borderRadius: '0.375rem', border: '1px solid #bfdbfe', fontWeight: 600 }}>
+                <RefreshCw size={14} className="animate-spin" /> Live Auto-Updating (2s)
+              </div>
+            </div>
+
+            {/* Filter & Search Bar */}
+            <div style={{
+              backgroundColor: '#ffffff',
+              padding: '1rem 1.25rem',
+              borderRadius: '0.5rem',
+              border: '1px solid #e2e8f0',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'space-between',
+              gap: '1rem',
+              flexWrap: 'wrap'
+            }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem', flex: 1, minWidth: '280px' }}>
+                <div style={{ position: 'relative', width: '100%' }}>
+                  <Search size={16} style={{ position: 'absolute', left: '0.75rem', top: '50%', transform: 'translateY(-50%)', color: '#94a3b8' }} />
+                  <input
+                    type="text"
+                    value={dlSearchQuery}
+                    onChange={(e) => setDlSearchQuery(e.target.value)}
+                    placeholder="Search by State, District, Season, Satellite, Bands, or Title..."
+                    style={{
+                      width: '100%',
+                      padding: '0.55rem 0.75rem 0.55rem 2.25rem',
+                      borderRadius: '0.375rem',
+                      border: '1px solid #cbd5e1',
+                      fontSize: '0.85rem',
+                      outline: 'none'
+                    }}
+                  />
+                </div>
+              </div>
+
+              <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem', flexWrap: 'wrap' }}>
+                {/* Status Filter */}
+                <select
+                  value={dlStatusFilter}
+                  onChange={(e) => setDlStatusFilter(e.target.value)}
+                  style={{ padding: '0.55rem 0.75rem', borderRadius: '0.375rem', border: '1px solid #cbd5e1', fontSize: '0.85rem', backgroundColor: '#ffffff' }}
+                >
+                  <option value="ALL">All Statuses</option>
+                  <option value="COMPLETED">COMPLETED</option>
+                  <option value="PROCESSING">PROCESSING</option>
+                  <option value="ACCEPTED">ACCEPTED</option>
+                  <option value="HOLD_FOR_APPROVAL">HOLD FOR APPROVAL</option>
+                  <option value="FAILED">FAILED</option>
+                </select>
+
+                {/* Satellite Filter */}
+                <select
+                  value={dlSatFilter}
+                  onChange={(e) => setDlSatFilter(e.target.value)}
+                  style={{ padding: '0.55rem 0.75rem', borderRadius: '0.375rem', border: '1px solid #cbd5e1', fontSize: '0.85rem', backgroundColor: '#ffffff' }}
+                >
+                  <option value="ALL">All Satellites</option>
+                  <option value="Sentinel-1">Sentinel-1 (SAR)</option>
+                  <option value="Sentinel-2">Sentinel-2 (MSI)</option>
+                </select>
+              </div>
+            </div>
+
+            {/* Structured Downloaded Info Table */}
+            <div style={{ backgroundColor: '#ffffff', borderRadius: '0.5rem', border: '1px solid #e2e8f0', overflow: 'hidden', boxShadow: '0 1px 3px rgba(0,0,0,0.03)' }}>
+              <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.82rem', textAlign: 'left' }}>
+                <thead>
+                  <tr style={{ backgroundColor: '#f8fafc', borderBottom: '1px solid #e2e8f0', color: '#475569', fontWeight: 700 }}>
+                    <th style={{ padding: '0.75rem 1rem', width: '70px' }}>ID</th>
+                    <th style={{ padding: '0.75rem 1rem', minWidth: '150px' }}>Request Title</th>
+                    <th style={{ padding: '0.75rem 1rem', width: '130px' }}>State</th>
+                    <th style={{ padding: '0.75rem 1rem', width: '130px' }}>District</th>
+                    <th style={{ padding: '0.75rem 1rem', width: '110px' }}>Season</th>
+                    <th style={{ padding: '0.75rem 1rem', width: '180px' }}>Sensing Date Range</th>
+                    <th style={{ padding: '0.75rem 1rem', width: '130px' }}>Satellite Sensor</th>
+                    <th style={{ padding: '0.75rem 1rem', minWidth: '180px' }}>Bands</th>
+                    <th style={{ padding: '0.75rem 1rem', minWidth: '140px' }}>Indices</th>
+                    <th style={{ padding: '0.75rem 1rem', width: '130px' }}>Composite Interval</th>
+                    <th style={{ padding: '0.75rem 1rem', width: '110px' }}>Status</th>
+                    <th style={{ padding: '0.75rem 1rem', width: '130px', textAlign: 'center' }}>Actions</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {(() => {
+                    const filtered = requests.filter(r => {
+                      if (dlStatusFilter !== 'ALL' && r.status !== dlStatusFilter) return false;
+                      if (dlSatFilter !== 'ALL' && !r.satellite.includes(dlSatFilter)) return false;
+                      if (dlSearchQuery.trim()) {
+                        const q = dlSearchQuery.toLowerCase();
+                        const titleStr = (r.request_title || '').toLowerCase();
+                        const stateStr = (r.state || '').toLowerCase();
+                        const distStr = (r.district || '').toLowerCase();
+                        const seasonStr = (r.season || '').toLowerCase();
+                        const satStr = (r.satellite || '').toLowerCase();
+                        const bandsStr = Array.isArray(r.bands) ? r.bands.join(' ').toLowerCase() : '';
+                        const indicesStr = Array.isArray(r.indices) ? r.indices.join(' ').toLowerCase() : '';
+                        return (
+                          titleStr.includes(q) ||
+                          stateStr.includes(q) ||
+                          distStr.includes(q) ||
+                          seasonStr.includes(q) ||
+                          satStr.includes(q) ||
+                          bandsStr.includes(q) ||
+                          indicesStr.includes(q) ||
+                          String(r.id).includes(q)
+                        );
+                      }
+                      return true;
+                    });
+
+                    if (filtered.length === 0) {
+                      return (
+                        <tr>
+                          <td colSpan={12} style={{ padding: '3rem 1rem', textAlign: 'center', color: '#94a3b8' }}>
+                            <Database size={24} style={{ margin: '0 auto 0.5rem auto', color: '#94a3b8' }} />
+                            <div>No request entries matched the specified criteria.</div>
+                          </td>
+                        </tr>
+                      );
+                    }
+
+                    return filtered.map((req) => (
+                      <tr key={req.id} style={{ borderBottom: '1px solid #f1f5f9' }}>
+                        <td style={{ padding: '0.75rem 1rem', fontWeight: 700, color: '#0f172a', fontFamily: 'monospace' }}>
+                          #{req.id}
+                        </td>
+                        <td style={{ padding: '0.75rem 1rem', fontWeight: 600, color: '#0f172a' }}>
+                          {req.request_title}
+                          {currentUser?.role === 'ADMIN' && req.user_email && (
+                            <div style={{ fontSize: '0.72rem', color: '#64748b', fontWeight: 400 }}>{req.user_email}</div>
+                          )}
+                        </td>
+                        <td style={{ padding: '0.75rem 1rem', color: '#334155', fontWeight: 600 }}>
+                          {req.state || '—'}
+                        </td>
+                        <td style={{ padding: '0.75rem 1rem', color: '#2563eb', fontWeight: 700, fontFamily: 'monospace' }}>
+                          {req.district || '—'}
+                        </td>
+                        <td style={{ padding: '0.75rem 1rem', color: '#475569' }}>
+                          {req.season || '—'}
+                        </td>
+                        <td style={{ padding: '0.75rem 1rem', fontFamily: 'monospace', color: '#334155', fontSize: '0.78rem' }}>
+                          {req.start_date} → {req.end_date}
+                        </td>
+                        <td style={{ padding: '0.75rem 1rem', fontWeight: 600, color: '#0f172a' }}>
+                          <span style={{ backgroundColor: '#eff6ff', border: '1px solid #bfdbfe', color: '#1d4ed8', padding: '0.15rem 0.45rem', borderRadius: '0.25rem', fontSize: '0.75rem' }}>
+                            {req.satellite}
+                          </span>
+                        </td>
+                        <td style={{ padding: '0.75rem 1rem' }}>
+                          <div style={{ display: 'flex', gap: '0.25rem', flexWrap: 'wrap' }}>
+                            {Array.isArray(req.bands) && req.bands.length > 0 ? (
+                              req.bands.map((b, bIdx) => (
+                                <span key={bIdx} style={{ padding: '0.1rem 0.35rem', borderRadius: '0.2rem', fontSize: '0.7rem', fontWeight: 700, fontFamily: 'monospace', backgroundColor: '#f0fdf4', border: '1px solid #a7f3d0', color: '#047857' }}>
+                                  {b}
+                                </span>
+                              ))
+                            ) : (
+                              <span style={{ color: '#94a3b8' }}>All Bands</span>
+                            )}
+                          </div>
+                        </td>
+                        <td style={{ padding: '0.75rem 1rem' }}>
+                          <div style={{ display: 'flex', gap: '0.25rem', flexWrap: 'wrap' }}>
+                            {Array.isArray(req.indices) && req.indices.length > 0 ? (
+                              req.indices.map((idx, iIdx) => (
+                                <span key={iIdx} style={{ padding: '0.1rem 0.35rem', borderRadius: '0.2rem', fontSize: '0.7rem', fontWeight: 700, fontFamily: 'monospace', backgroundColor: '#eff6ff', border: '1px solid #bfdbfe', color: '#1d4ed8' }}>
+                                  {idx}
+                                </span>
+                              ))
+                            ) : (
+                              <span style={{ color: '#94a3b8' }}>—</span>
+                            )}
+                          </div>
+                        </td>
+                        <td style={{ padding: '0.75rem 1rem', textTransform: 'uppercase', fontFamily: 'monospace', fontSize: '0.75rem', fontWeight: 700, color: '#475569' }}>
+                          {req.composite_interval || 'NONE'}
+                        </td>
+                        <td style={{ padding: '0.75rem 1rem' }}>
+                          {renderStatusBadge(req.status)}
+                        </td>
+                        <td style={{ padding: '0.75rem 1rem', textAlign: 'center' }}>
+                          <div style={{ display: 'flex', gap: '0.35rem', justifyContent: 'center' }}>
+                            <button
+                              onClick={() => openLogsModal(req)}
+                              title="View Execution Logs"
+                              style={{ padding: '0.3rem 0.55rem', border: '1px solid #cbd5e1', borderRadius: '0.375rem', backgroundColor: '#ffffff', color: '#334155', cursor: 'pointer', display: 'inline-flex', alignItems: 'center', gap: '0.25rem', fontSize: '0.75rem', fontWeight: 600 }}
+                            >
+                              <Terminal size={12} color="#2563eb" /> Logs
+                            </button>
+                            <button
+                              onClick={() => {
+                                if (req.state) setRetState(req.state);
+                                if (req.district) setRetDistrict(req.district);
+                                if (req.satellite) setRetSatellite(req.satellite.includes('Sentinel-1') && !req.satellite.includes('Sentinel-2') ? 'Sentinel-1' : req.satellite.includes('Sentinel-2') && !req.satellite.includes('Sentinel-1') ? 'Sentinel-2' : 'ALL');
+                                if (req.start_date) setRetStartDate(req.start_date);
+                                if (req.end_date) setRetEndDate(req.end_date);
+                                setActiveTab('retrieve_data');
+                              }}
+                              title="Export GeoTIFF Files"
+                              style={{ padding: '0.3rem 0.55rem', border: 'none', borderRadius: '0.375rem', backgroundColor: '#166534', color: '#ffffff', cursor: 'pointer', display: 'inline-flex', alignItems: 'center', gap: '0.25rem', fontSize: '0.75rem', fontWeight: 600 }}
+                            >
+                              <Download size={12} /> Retrieve
+                            </button>
+                          </div>
+                        </td>
+                      </tr>
+                    ));
+                  })()}
+                </tbody>
+              </table>
+            </div>
+
           </div>
         )}
 
