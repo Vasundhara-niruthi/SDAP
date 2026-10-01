@@ -1270,7 +1270,20 @@ def search_downloaded_tifs_by_region(
 
     if band and band.strip() and band.upper() != "ALL":
         clean_b = band.replace(".tif", "").replace(".tiff", "").strip()
-        bf_query = bf_query.filter(BandFileModel.band.ilike(f"%{clean_b}%"))
+        if clean_b.upper() in ("VV_VH", "VV/VH", "SAR_RATIO"):
+            from sqlalchemy import or_
+            bf_query = bf_query.filter(or_(
+                BandFileModel.band.ilike("%VV_VH%"),
+                BandFileModel.band.ilike("%VV/VH%")
+            ))
+        elif clean_b.upper() in ("COMPOSITE", "COMPOSITES"):
+            from sqlalchemy import or_
+            bf_query = bf_query.filter(or_(
+                BandFileModel.band.ilike("%Composite%"),
+                BandFileModel.band.ilike("%clipped%")
+            ))
+        else:
+            bf_query = bf_query.filter(BandFileModel.band.ilike(f"%{clean_b}%"))
 
     band_records = bf_query.order_by(BandFileModel.tile, BandFileModel.sensing_date, BandFileModel.band).all()
 

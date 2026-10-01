@@ -829,7 +829,7 @@ export default function App() {
     const scenesMap = {};
     const tilesSet = new Set();
 
-    const S1_BANDS = ['VV', 'VH'];
+    const S1_BANDS = ['VV', 'VH', 'VV_VH', 'VV/VH'];
     const DEFAULT_S2_BANDS = ['B04', 'B08', 'B11', 'SCL'];
     const requestSatellite = selectedReq?.satellite || '';
     const hasS1 = requestSatellite.includes('Sentinel-1');
@@ -839,7 +839,7 @@ export default function App() {
     if (Array.isArray(selectedReq?.bands) && selectedReq.bands.length > 0) {
       reqBands = selectedReq.bands;
     } else if (hasS1 && !hasS2) {
-      reqBands = S1_BANDS;
+      reqBands = ['VV', 'VH', 'VV_VH'];
     } else {
       reqBands = DEFAULT_S2_BANDS;
     }
@@ -892,8 +892,8 @@ export default function App() {
             }
 
             const isFailed = /FAILED|ERROR/.test(line);
-            const sceneBands = isS1
-              ? reqBands.filter(b => S1_BANDS.includes(b))
+            const initialBands = isS1
+              ? ['VV', 'VH', 'VV_VH']
               : reqBands.filter(b => !S1_BANDS.includes(b));
 
             if (!scenesMap[folderName]) {
@@ -903,10 +903,17 @@ export default function App() {
                 date: formattedDate !== '—' ? formattedDate : (selectedReq?.start_date || '—'),
                 satellite: sat,
                 status: isFailed ? 'FAILED' : 'COMPLETE',
-                bands: sceneBands.length > 0 ? sceneBands : reqBands
+                bands: initialBands
               };
             } else if (isFailed) {
               scenesMap[folderName].status = 'FAILED';
+            }
+
+            // Dynamically check for VV_VH or specific index bands in the log line
+            if (/VV_VH|VV\/VH|SAR VV\/VH RATIO/.test(line) && isS1) {
+              if (!scenesMap[folderName].bands.includes('VV_VH')) {
+                scenesMap[folderName].bands.push('VV_VH');
+              }
             }
           }
         }
@@ -2958,6 +2965,10 @@ export default function App() {
                     <option value="TCI">TCI (True Color RGB Image)</option>
                     <option value="VV">VV (Sentinel-1 C-band Co-pol)</option>
                     <option value="VH">VH (Sentinel-1 C-band Cross-pol)</option>
+                    <option value="VV_VH">VV_VH (Sentinel-1 SAR Ratio 10m)</option>
+                    <option value="NDVI">NDVI (Normalized Difference Veg Index)</option>
+                    <option value="LSWI">LSWI (Land Surface Water Index)</option>
+                    <option value="Composite">Composite / Clipped Rasters (.tif)</option>
                   </select>
                 </div>
 
