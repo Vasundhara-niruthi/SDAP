@@ -4,7 +4,8 @@ import {
   Satellite, Activity, HardDrive, User, LogOut, RefreshCw, FileText,
   CheckCircle, Clock, AlertTriangle, XCircle, Plus, Search, Database,
   Calendar, MapPin, Sliders, Shield, Users, Check, ChevronRight, ChevronDown, Info,
-  HelpCircle, X, Download, Play, Terminal, Eye, EyeOff, KeyRound, ArrowLeft, Square, Table
+  HelpCircle, X, Download, Play, Terminal, Eye, EyeOff, KeyRound, ArrowLeft, Square, Table,
+  Layers, ArrowUp, ArrowDown
 } from 'lucide-react';
 
 const API_BASE = '/api/v1';
@@ -139,11 +140,14 @@ export default function App() {
   const [retDistrict, setRetDistrict] = useState('');
   const [retSatellite, setRetSatellite] = useState('ALL');
   const [retBand, setRetBand] = useState('ALL');
+  const [retCompositeInterval, setRetCompositeInterval] = useState('ALL');
   const [retStartDate, setRetStartDate] = useState('');
   const [retEndDate, setRetEndDate] = useState('');
   const [retSelectedReqId, setRetSelectedReqId] = useState('');
   const [retResults, setRetResults] = useState(null);
   const [loadingRet, setLoadingRet] = useState(false);
+  const [verifyingNAS, setVerifyingNAS] = useState(false);
+  const [showDownloadPromptModal, setShowDownloadPromptModal] = useState(false);
   const [retCopyNotice, setRetCopyNotice] = useState(null);
   const [retDownloadedStates, setRetDownloadedStates] = useState([]);
   const [retDownloadedDistricts, setRetDownloadedDistricts] = useState([]);
@@ -156,141 +160,297 @@ export default function App() {
   const [dlStatusFilter, setDlStatusFilter] = useState('ALL');
   const [dlSatFilter, setDlSatFilter] = useState('ALL');
 
-  const handleExecuteRetrieval = async () => {
+  const handleVerifyNASData = async () => {
+    setVerifyingNAS(true);
     setLoadingRet(true);
     setRetCopyNotice(null);
+    setRetNotice(null);
     try {
       const params = {};
       if (retState) params.state = retState;
       if (retDistrict) params.district = retDistrict;
       if (retSatellite && retSatellite !== 'ALL') params.satellite = retSatellite;
       if (retBand && retBand !== 'ALL') params.band = retBand;
+      if (retCompositeInterval && retCompositeInterval !== 'ALL') params.composite_interval = retCompositeInterval;
       if (retStartDate) params.start_date = retStartDate;
       if (retEndDate) params.end_date = retEndDate;
 
       const res = await axios.get(`${API_BASE}/requests/tifs/retrieve`, { params, headers: getAuthHeader() });
       setRetResults(res.data);
+
+      if (res.data && res.data.total_tifs > 0) {
+        setShowDownloadPromptModal(true);
+        setRetNotice({
+          type: 'success',
+          text: `✓ Verified ${res.data.total_tifs} raster files (${res.data.total_size_mb} MB) available on NAS storage!`
+        });
+      } else {
+        setShowDownloadPromptModal(false);
+        setRetNotice({
+          type: 'warning',
+          text: '⚠️ No matching raster files found on NAS storage for the selected criteria. Please adjust your criteria or submit an acquisition request.'
+        });
+      }
     } catch (err) {
-      alert(formatApiError(err, 'Error retrieving downloaded data.'));
+      setShowDownloadPromptModal(false);
+      setRetNotice({
+        type: 'error',
+        text: `⚠️ NAS verification error: ${formatApiError(err, 'Error querying NAS storage.')}`
+      });
     } finally {
+      setVerifyingNAS(false);
       setLoadingRet(false);
     }
   };
 
-  const handleCopyPaths = () => {
-    if (!retResults || !retResults.tif_paths || retResults.tif_paths.length === 0) return;
-    const textToCopy = retResults.tif_paths.join('\n');
-    navigator.clipboard.writeText(textToCopy);
-    setRetCopyNotice(`✓ ${retResults.tif_paths.length} file paths copied to clipboard!`);
-    setTimeout(() => setRetCopyNotice(null), 3000);
-  };
-
-  const handleExportCsv = () => {
-    if (!retResults || !retResults.tifs || retResults.tifs.length === 0) return;
-    const headers = ['Scene ID', 'Tile', 'Sensing Date', 'Satellite', 'Band', 'Size (MB)', 'Path'];
-    const rows = retResults.tifs.map(t => [
-      t.scene_id,
-      t.tile,
-      t.sensing_date,
-      t.satellite,
-      t.band,
-      (t.size_bytes / (1024 * 1024)).toFixed(2),
-      `"${t.path.replace(/"/g, '""')}"`
-    ]);
-    const csvContent = 'data:text/csv;charset=utf-8,' + [headers.join(','), ...rows.map(e => e.join(','))].join('\n');
-    const encodedUri = encodeURI(csvContent);
-    const link = document.createElement('a');
-    link.setAttribute('href', encodedUri);
-    link.setAttribute('download', `SDAP_GeoTIFF_Manifest_${retDistrict || retState || 'Export'}.csv`);
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
-  };
+  const handleExecuteRetrieval = handleVerifyNASData;
 
   const [downloadingZip, setDownloadingZip] = useState(false);
   const [retNotice, setRetNotice] = useState(null);
 
-  const handleDownloadFile = async (filePath) => {
-    if (!filePath) return;
+  const handleDownloadZip = () => {
     setRetNotice(null);
-    try {
-      const currentToken = token || localStorage.getItem('sdap_token');
-      const encodedPath = encodeURIComponent(filePath);
-      const downloadUrl = `${API_BASE}/requests/tifs/download-file?file_path=${encodedPath}${currentToken ? `&token=${encodeURIComponent(currentToken)}` : ''}`;
-      const res = await axios.get(downloadUrl, {
-        headers: getAuthHeader(),
-        responseType: 'blob'
+    const currentToken = token || localStorage.getItem('sdap_token');
+    const params = new URLSearchParams();
+    if (retState) params.append('state', retState);
+    if (retDistrict) params.append('district', retDistrict);
+    if (retSatellite && retSatellite !== 'ALL') params.append('satellite', retSatellite);
+    if (retBand && retBand !== 'ALL') params.append('band', retBand);
+    if (retCompositeInterval && retCompositeInterval !== 'ALL') params.append('composite_interval', retCompositeInterval);
+    if (retStartDate) params.append('start_date', retStartDate);
+    if (retEndDate) params.append('end_date', retEndDate);
+    if (currentToken) params.append('token', currentToken);
+
+    const downloadUrl = `${API_BASE}/requests/tifs/download-zip?${params.toString()}`;
+    const fileName = `SDAP_GeoTIFF_${retDistrict || retState || 'Export'}.zip`;
+
+    // Native browser background download:
+    // Triggers download via detached anchor with target="_blank" so the browser's native
+    // download manager takes full control of the stream.
+    const link = document.createElement('a');
+    link.href = downloadUrl;
+    link.setAttribute('download', fileName);
+    link.setAttribute('target', '_blank');
+    link.rel = 'noopener noreferrer';
+    link.style.display = 'none';
+    document.body.appendChild(link);
+    link.click();
+    setTimeout(() => {
+      try { document.body.removeChild(link); } catch (e) {}
+    }, 1500);
+
+    // Close prompt modal and remove verified results card from the UI
+    setShowDownloadPromptModal(false);
+    setRetResults(null);
+
+    // Display download initiated status notice
+    setRetNotice({
+      type: 'info',
+      status: 'initiated',
+      fileName: fileName,
+      text: `✓ Download initiated! Your browser is downloading "${fileName}" in the background.`
+    });
+
+    // Automatically transition to download completed status
+    setTimeout(() => {
+      setRetNotice({
+        type: 'success',
+        status: 'completed',
+        fileName: fileName,
+        text: `✓ Download completed! "${fileName}" has been downloaded successfully.`
       });
-      const fileName = filePath.split(/[/\\]/).pop() || 'raster.tif';
-      const blob = new Blob([res.data], { type: res.headers['content-type'] || 'image/tiff' });
-      const blobUrl = window.URL.createObjectURL(blob);
-      const link = document.createElement('a');
-      link.href = blobUrl;
-      link.download = fileName;
-      document.body.appendChild(link);
-      link.click();
-      document.body.removeChild(link);
-      window.URL.revokeObjectURL(blobUrl);
-    } catch (err) {
-      let msg = 'Failed to download file.';
-      if (err.response && err.response.data instanceof Blob) {
-        try {
-          const rawText = await err.response.data.text();
-          const parsed = JSON.parse(rawText);
-          if (parsed.detail) msg = parsed.detail;
-        } catch (e) {}
-      } else {
-        msg = formatApiError(err, msg);
-      }
-      setRetNotice({ type: 'error', text: `⚠️ ${msg}` });
+    }, 4500);
+  };
+
+  // ---------------------------------------------------------------------------
+  // 9. Layer Stacking Studio State & Handlers
+  // ---------------------------------------------------------------------------
+  const [stackState, setStackState] = useState('');
+  const [stackDistrict, setStackDistrict] = useState('');
+  const [stackSeason, setStackSeason] = useState('Kharif');
+  const [stackStartDate, setStackStartDate] = useState('2026-06-01');
+  const [stackEndDate, setStackEndDate] = useState('2026-10-31');
+  const [stackSelectedLayers, setStackSelectedLayers] = useState(['B02', 'B03', 'B04']);
+  const [stackClipToDistrict, setStackClipToDistrict] = useState(true);
+  const [stackLoading, setStackLoading] = useState(false);
+  const [stackNotice, setStackNotice] = useState(null);
+  const [stackResult, setStackResult] = useState(null);
+  const [stackHistory, setStackHistory] = useState([]);
+  const [loadingStackHistory, setLoadingStackHistory] = useState(false);
+  const [stackHistorySearch, setStackHistorySearch] = useState('');
+
+  const AVAILABLE_OPTICAL_BANDS = [
+    { id: 'B02', label: 'B02 - Blue (490nm, 10m)' },
+    { id: 'B03', label: 'B03 - Green (560nm, 10m)' },
+    { id: 'B04', label: 'B04 - Red (665nm, 10m)' },
+    { id: 'B08', label: 'B08 - NIR Wide (842nm, 10m)' },
+    { id: 'B8A', label: 'B8A - NIR Narrow (865nm, 20m)' },
+    { id: 'B11', label: 'B11 - SWIR 1 (1610nm, 20m)' },
+    { id: 'SCL', label: 'SCL - Scene Classification Map (20m)' }
+  ];
+
+  const AVAILABLE_SAR_BANDS = [
+    { id: 'VV', label: 'VV - Vertical-Vertical Co-polarization (10m)' },
+    { id: 'VH', label: 'VH - Vertical-Horizontal Cross-polarization (10m)' },
+    { id: 'VV_VH', label: 'VV_VH - Dual-polarization Cross/Co Ratio (10m)' }
+  ];
+
+  const AVAILABLE_INDICES = [
+    { id: 'NDVI', label: 'NDVI - Normalized Difference Vegetation Index (B08 - B04)/(B08 + B04)' },
+    { id: 'LSWI', label: 'LSWI - Land Surface Water Index (B08 - B11)/(B08 + B11)' }
+  ];
+
+  const handleStackSeasonChange = (s) => {
+    setStackSeason(s);
+    if (s === 'Kharif') {
+      setStackStartDate('2026-06-01');
+      setStackEndDate('2026-10-31');
+    } else if (s === 'Rabi') {
+      setStackStartDate('2026-11-01');
+      setStackEndDate('2027-03-31');
+    } else if (s === 'Zaid') {
+      setStackStartDate('2026-03-01');
+      setStackEndDate('2026-06-30');
+    } else if (s === 'Pre-Monsoon') {
+      setStackStartDate('2026-03-01');
+      setStackEndDate('2026-05-31');
+    } else if (s === 'Monsoon') {
+      setStackStartDate('2026-06-01');
+      setStackEndDate('2026-09-30');
+    } else if (s === 'Post-Monsoon') {
+      setStackStartDate('2026-10-01');
+      setStackEndDate('2026-12-31');
+    } else if (s === 'Winter') {
+      setStackStartDate('2026-01-01');
+      setStackEndDate('2026-02-28');
+    } else if (s === 'Annual') {
+      setStackStartDate('2026-01-01');
+      setStackEndDate('2026-12-31');
     }
   };
 
-  const handleDownloadZip = async () => {
-    setDownloadingZip(true);
-    setRetNotice(null);
-    try {
-      const currentToken = token || localStorage.getItem('sdap_token');
-      const params = new URLSearchParams();
-      if (retState) params.append('state', retState);
-      if (retDistrict) params.append('district', retDistrict);
-      if (retSatellite && retSatellite !== 'ALL') params.append('satellite', retSatellite);
-      if (retBand && retBand !== 'ALL') params.append('band', retBand);
-      if (retStartDate) params.append('start_date', retStartDate);
-      if (retEndDate) params.append('end_date', retEndDate);
-      if (currentToken) params.append('token', currentToken);
+  const toggleStackLayer = (layerId) => {
+    setStackSelectedLayers(prev => {
+      if (prev.includes(layerId)) {
+        return prev.filter(l => l !== layerId);
+      } else {
+        return [...prev, layerId];
+      }
+    });
+  };
 
-      const res = await axios.get(`${API_BASE}/requests/tifs/download-zip?${params.toString()}`, {
+  const moveStackLayer = (index, direction) => {
+    setStackSelectedLayers(prev => {
+      const next = [...prev];
+      if (direction === 'up' && index > 0) {
+        const tmp = next[index - 1];
+        next[index - 1] = next[index];
+        next[index] = tmp;
+      } else if (direction === 'down' && index < next.length - 1) {
+        const tmp = next[index + 1];
+        next[index + 1] = next[index];
+        next[index] = tmp;
+      }
+      return next;
+    });
+  };
+
+  const removeStackLayer = (layerId) => {
+    setStackSelectedLayers(prev => prev.filter(l => l !== layerId));
+  };
+
+  const fetchStackHistory = useCallback(async (districtFilter) => {
+    if (!token) return;
+    setLoadingStackHistory(true);
+    try {
+      const params = {};
+      if (districtFilter && districtFilter.trim()) {
+        params.district = districtFilter.trim();
+      }
+      const res = await axios.get(`${API_BASE}/requests/layer-stack/history`, {
+        params,
+        headers: getAuthHeader()
+      });
+      setStackHistory(res.data || []);
+    } catch (err) {
+      console.error('Error fetching stack history:', err);
+    } finally {
+      setLoadingStackHistory(false);
+    }
+  }, [token]);
+
+  const handleExecuteLayerStacking = async () => {
+    if (!stackDistrict) {
+      setStackNotice({
+        type: 'error',
+        text: '⚠️ Please select a District to execute layer stacking.'
+      });
+      return;
+    }
+    if (!stackSelectedLayers || stackSelectedLayers.length === 0) {
+      setStackNotice({
+        type: 'error',
+        text: '⚠️ Please select at least one band or index to build the layer stack.'
+      });
+      return;
+    }
+
+    setStackLoading(true);
+    setStackNotice(null);
+    setStackResult(null);
+
+    try {
+      const payload = {
+        state: stackState || null,
+        district: stackDistrict,
+        season: stackSeason || 'Kharif',
+        start_date: stackStartDate || null,
+        end_date: stackEndDate || null,
+        layers: stackSelectedLayers,
+        clip_to_district: stackClipToDistrict
+      };
+
+      const res = await axios.post(`${API_BASE}/requests/layer-stack`, payload, {
         headers: getAuthHeader(),
-        responseType: 'blob'
+        timeout: 180000
       });
 
-      const fileName = `SDAP_GeoTIFF_${retDistrict || retState || 'Export'}.zip`;
-      const blob = new Blob([res.data], { type: 'application/zip' });
-      const blobUrl = window.URL.createObjectURL(blob);
-      const link = document.createElement('a');
-      link.href = blobUrl;
-      link.download = fileName;
-      document.body.appendChild(link);
-      link.click();
-      document.body.removeChild(link);
-      window.URL.revokeObjectURL(blobUrl);
-      setRetNotice({ type: 'success', text: `✓ ZIP Archive (${fileName}) downloaded successfully!` });
+      setStackResult(res.data);
+      setStackNotice({
+        type: 'success',
+        text: `✓ Layer stack created successfully: "${res.data.filename}" (${res.data.file_size_mb} MB, ${res.data.total_bands} bands)`
+      });
+
+      // Refresh stack history
+      fetchStackHistory(stackDistrict);
     } catch (err) {
-      let msg = 'No matching downloaded GeoTIFF files found for the selected State/District/Date Range criteria.';
-      if (err.response && err.response.data instanceof Blob) {
-        try {
-          const rawText = await err.response.data.text();
-          const parsed = JSON.parse(rawText);
-          if (parsed.detail) msg = parsed.detail;
-        } catch (e) {}
-      } else {
-        msg = formatApiError(err, msg);
-      }
-      setRetNotice({ type: 'warning', text: `⚠️ Data is not available: ${msg}` });
+      setStackNotice({
+        type: 'error',
+        text: `⚠️ Layer stacking failed: ${formatApiError(err, 'Failed to complete layer stacking.')}`
+      });
     } finally {
-      setDownloadingZip(false);
+      setStackLoading(false);
     }
+  };
+
+  const handleDownloadStackedTif = (filePath, fileName) => {
+    const currentToken = token || localStorage.getItem('sdap_token');
+    const params = new URLSearchParams();
+    params.append('file_path', filePath);
+    if (currentToken) params.append('token', currentToken);
+
+    const downloadUrl = `${API_BASE}/requests/layer-stack/download?${params.toString()}`;
+    const link = document.createElement('a');
+    link.href = downloadUrl;
+    link.setAttribute('download', fileName || 'layer_stack.tif');
+    link.setAttribute('target', '_blank');
+    link.rel = 'noopener noreferrer';
+    link.style.display = 'none';
+    document.body.appendChild(link);
+    link.click();
+    setTimeout(() => {
+      try { document.body.removeChild(link); } catch (e) {}
+    }, 1500);
   };
 
   // ---------------------------------------------------------------------------
@@ -437,10 +597,13 @@ export default function App() {
   }, [token]);
 
   useEffect(() => {
-    if (token && activeTab === 'retrieve_data') {
+    if (token && (activeTab === 'retrieve_data' || activeTab === 'layer_stacking')) {
       fetchDownloadedRegions();
     }
-  }, [token, activeTab, fetchDownloadedRegions]);
+    if (token && activeTab === 'layer_stacking') {
+      fetchStackHistory(stackDistrict);
+    }
+  }, [token, activeTab, fetchDownloadedRegions, fetchStackHistory, stackDistrict]);
 
   // Fetch Requests List (scoped to logged-in user - stable reference)
   const fetchRequests = useCallback(async () => {
@@ -836,6 +999,9 @@ export default function App() {
     const scenesMap = {};
     const tilesSet = new Set();
     const tileAuditMap = {};
+    const stagesList = [];
+    const gapSummary = { availableS3: 0, alreadyHeld: 0, missing: 0 };
+    let currentActiveFolder = null;
 
     const configInfo = {
       district: selectedReq?.district || selectedReq?.state || 'Auto',
@@ -865,7 +1031,41 @@ export default function App() {
       const lines = rawLogs.split(/\r?\n/).map(l => l.trim());
 
       for (const line of lines) {
-        // 1. Extract Config Info from header lines
+        // Extract timestamp: [YYYY-MM-DD HH:MM:SS]
+        const tsMatch = line.match(/^\[(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})\]/);
+        const timestamp = tsMatch ? tsMatch[1] : '';
+
+        // 1. Extract Pipeline Execution Stages & Steps
+        const stageM = line.match(/\[(STAGE\s*\d(?:\/\d)?\s*[^\]]*)\]/i) || line.match(/(STEP\s*\d+:\s*[^.]*)/i);
+        if (stageM) {
+          const stageText = stageM[1].trim();
+          if (!stagesList.some(s => s.text === stageText)) {
+            stagesList.push({
+              timestamp,
+              text: stageText,
+              rawLine: line
+            });
+          }
+        }
+
+        // 2. Extract Gap Check summary numbers
+        const gapM = line.match(/Gap Check complete.*Available on S3:\s*(\d+).*Already held:\s*(\d+).*Genuinely missing:\s*(\d+)/i)
+          || line.match(/Available on AWS S3:\s*(\d+)/i);
+        if (gapM) {
+          if (gapM[3] !== undefined) {
+            gapSummary.availableS3 = parseInt(gapM[1]);
+            gapSummary.alreadyHeld = parseInt(gapM[2]);
+            gapSummary.missing = parseInt(gapM[3]);
+          } else {
+            gapSummary.availableS3 = parseInt(gapM[1]);
+          }
+        }
+        const heldM = line.match(/Already held in archive:\s*(\d+)/i);
+        if (heldM) gapSummary.alreadyHeld = parseInt(heldM[1]);
+        const missM = line.match(/Missing from archive:\s*(\d+)/i);
+        if (missM) gapSummary.missing = parseInt(missM[1]);
+
+        // 3. Extract Config Info from header lines
         const distM = line.match(/District:\s*([^\s|]+(?:\s+[^\s|]+)*)/i);
         if (distM) configInfo.district = distM[1].trim();
 
@@ -884,7 +1084,7 @@ export default function App() {
         const compM = line.match(/Composite:\s*([^\s|]+)/i);
         if (compM) configInfo.composite = compM[1].trim();
 
-        // 2. Parse Tile Audit & Storage Status lines (e.g. • [TILE STATUS: DOWNLOADED] Tile '43QHV': 100% CACHED (3/3 scenes held...))
+        // 4. Parse Tile Audit & Storage Status lines
         const tileAuditM = line.match(/\[TILE STATUS:\s*([^\]]+)\]\s*Tile\s+'?([A-Za-z0-9_]+)'?:\s*(.*)/i);
         if (tileAuditM) {
           const statusTag = tileAuditM[1].trim();
@@ -905,7 +1105,7 @@ export default function App() {
           if (tileName !== 'S1_SAR') tilesSet.add(tileName);
         }
 
-        // 3. Extract MGRS / S1 Tiles identified
+        // 5. Extract MGRS / S1 Tiles identified
         const tilesMatch = line.match(/Tiles:\s*\[([^\]]+)\]/i) || line.match(/Tiles identified:\s*\[([^\]]+)\]/i);
         if (tilesMatch) {
           tilesMatch[1].replace(/['"]/g, '').split(',').forEach(t => {
@@ -919,13 +1119,98 @@ export default function App() {
           tilesSet.add(tileDirectMatch[1]);
         }
 
-        // 4. Parse Individual Scene Downloads & Processing lines
+        // 6. Parse Processing Scene lines: e.g. [1/51 - 1%] Processing 'S2B_43PHS_20260502_0_L2A'
+        const procM = line.match(/(?:\[(\d+\/\d+)\s*-\s*(\d+%)\]\s*)?Processing\s+'(S[12][A-C]_[0-9A-Za-z_]+)'/i);
+        if (procM) {
+          const folderName = procM[3];
+          currentActiveFolder = folderName;
+          const parts = folderName.split('_');
+          const sat = parts[0] || 'S2';
+          const isS1 = sat.startsWith('S1');
+          let tile = isS1 ? 'S1_SAR' : (parts[1] || '—');
+          let formattedDate = '—';
+
+          if (isS1) {
+            for (const part of parts) {
+              const dtM = part.match(/^(\d{8})T\d+$/);
+              if (dtM) {
+                const d8 = dtM[1];
+                formattedDate = `${d8.slice(0, 4)}-${d8.slice(4, 6)}-${d8.slice(6, 8)}`;
+                break;
+              }
+            }
+          } else {
+            const datePart = parts[2] || '';
+            formattedDate = (datePart.length === 8 && /^\d+$/.test(datePart))
+              ? `${datePart.slice(0, 4)}-${datePart.slice(4, 6)}-${datePart.slice(6, 8)}`
+              : (datePart || '—');
+            if (tile.length >= 4 && tile !== '—') tilesSet.add(tile);
+          }
+
+          if (!scenesMap[folderName]) {
+            scenesMap[folderName] = {
+              folder: folderName,
+              tile,
+              date: formattedDate !== '—' ? formattedDate : (selectedReq?.start_date || '—'),
+              satellite: sat,
+              status: 'DOWNLOADING',
+              bands: [],
+              bandSizes: {},
+              totalSize: '',
+              storagePath: '',
+              progressRatio: procM[1] || '',
+              progressPct: procM[2] || '',
+              timestamp
+            };
+          } else {
+            scenesMap[folderName].status = 'DOWNLOADING';
+            if (procM[1]) scenesMap[folderName].progressRatio = procM[1];
+            if (procM[2]) scenesMap[folderName].progressPct = procM[2];
+          }
+        }
+
+        // 7. Parse Band download progress lines: ↳ Band 'B02.tif' (203.3 MB) downloaded & verified on NAS.
+        const bandM = line.match(/↳\s*Band\s+'([A-Za-z0-9_]+)\.tif'\s*\(([^)]+)\)\s*downloaded\s*&\s*verified/i);
+        if (bandM && currentActiveFolder && scenesMap[currentActiveFolder]) {
+          const bandName = bandM[1];
+          const bandSize = bandM[2];
+          if (!scenesMap[currentActiveFolder].bands.includes(bandName)) {
+            scenesMap[currentActiveFolder].bands.push(bandName);
+          }
+          scenesMap[currentActiveFolder].bandSizes[bandName] = bandSize;
+          scenesMap[currentActiveFolder].timestamp = timestamp;
+        }
+
+        // 8. Parse Individual Scene Completion lines: ✓ [NEW DOWNLOAD COMPLETED] Scene 'S2B_...' downloaded to '...'
+        const compMatch = line.match(/✓\s*\[NEW DOWNLOAD COMPLETED\]\s*Scene\s+'(S[12][A-C]_[0-9A-Za-z_]+)'/i);
+        if (compMatch) {
+          const folderName = compMatch[1];
+          if (scenesMap[folderName]) {
+            scenesMap[folderName].status = 'COMPLETE';
+            const sizeM = line.match(/(\d+(?:\.\d+)?\s*MB)/i);
+            if (sizeM) scenesMap[folderName].totalSize = sizeM[1];
+            const destM = line.match(/downloaded to\s+'([^']+)'/i);
+            if (destM) scenesMap[folderName].storagePath = destM[1];
+            scenesMap[folderName].timestamp = timestamp;
+          }
+        }
+
+        // 9. Parse failed or incomplete scenes
+        const failMatch = line.match(/Scene\s+(S[12][A-C]_[0-9A-Za-z_]+)\s+incomplete|Failed fetching.*(S[12][A-C]_[0-9A-Za-z_]+)/i);
+        if (failMatch) {
+          const folderName = failMatch[1] || failMatch[2];
+          if (scenesMap[folderName]) {
+            scenesMap[folderName].status = 'FAILED';
+          }
+        }
+
+        // 10. General scene matching for pre-existing or cached scenes
         const sceneMatch = line.match(/\b(S[12][A-C]_[0-9A-Za-z_]+)/i);
         if (sceneMatch) {
           const folderName = sceneMatch[1];
           const parts = folderName.split('_');
 
-          if (parts.length >= 3) {
+          if (parts.length >= 3 && !scenesMap[folderName]) {
             const sat = parts[0];
             const isS1 = sat.startsWith('S1');
             let tile = '—';
@@ -951,29 +1236,20 @@ export default function App() {
             }
 
             const isFailed = /FAILED|ERROR/.test(line);
-            const initialBands = isS1
-              ? ['VV', 'VH', 'VV_VH']
-              : reqBands.filter(b => !S1_BANDS.includes(b));
+            const isComplete = /COMPLETED|downloaded & verified|100% CACHED/.test(line);
 
-            if (!scenesMap[folderName]) {
-              scenesMap[folderName] = {
-                folder: folderName,
-                tile: tile,
-                date: formattedDate !== '—' ? formattedDate : (selectedReq?.start_date || '—'),
-                satellite: sat,
-                status: isFailed ? 'FAILED' : 'COMPLETE',
-                bands: initialBands
-              };
-            } else if (isFailed) {
-              scenesMap[folderName].status = 'FAILED';
-            }
-
-            // Dynamically check for VV_VH or specific index bands in the log line
-            if (/VV_VH|VV\/VH|SAR VV\/VH RATIO/.test(line) && isS1) {
-              if (!scenesMap[folderName].bands.includes('VV_VH')) {
-                scenesMap[folderName].bands.push('VV_VH');
-              }
-            }
+            scenesMap[folderName] = {
+              folder: folderName,
+              tile,
+              date: formattedDate !== '—' ? formattedDate : (selectedReq?.start_date || '—'),
+              satellite: sat,
+              status: isFailed ? 'FAILED' : isComplete ? 'COMPLETE' : 'PENDING',
+              bands: isS1 ? ['VV', 'VH', 'VV_VH'] : reqBands.filter(b => !S1_BANDS.includes(b)),
+              bandSizes: {},
+              totalSize: '',
+              storagePath: '',
+              timestamp
+            };
           }
         }
       }
@@ -989,7 +1265,9 @@ export default function App() {
           date: selectedReq?.start_date || '—',
           satellite: selectedReq?.satellite || 'Sentinel-2',
           status: 'PENDING',
-          bands: [...reqBands]
+          bands: [...reqBands],
+          bandSizes: {},
+          totalSize: ''
         });
       });
     }
@@ -1010,7 +1288,9 @@ export default function App() {
       bandsNeededCount,
       progressPct,
       configInfo,
-      tileAuditList: Object.values(tileAuditMap)
+      tileAuditList: Object.values(tileAuditMap),
+      stagesList,
+      gapSummary
     };
   };
 
@@ -1033,7 +1313,9 @@ export default function App() {
       bandsNeededCount,
       progressPct,
       configInfo,
-      tileAuditList
+      tileAuditList,
+      stagesList,
+      gapSummary
     } = parseAcquisitionScenes(rawLogs, selectedReq);
 
     const filteredScenes = scenes.filter(s => {
@@ -1052,10 +1334,19 @@ export default function App() {
       return true;
     });
 
+    // Sort: Currently DOWNLOADING scene placed at the top (Row 1), followed by latest completed scenes
+    const displayScenes = filteredScenes.slice().sort((a, b) => {
+      if (a.status === 'DOWNLOADING') return -1;
+      if (b.status === 'DOWNLOADING') return 1;
+      return 0;
+    }).reverse();
+
+    const displayStages = (stagesList || []).slice().reverse();
+
     return (
       <div style={{ flex: 1, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: '1.25rem', padding: '0.5rem 0' }}>
 
-        {/* Pipeline Configurations Header Banner */}
+        {/* 1. Pipeline Execution Configurations Banner */}
         <div style={{ backgroundColor: '#0f172a', color: '#f8fafc', borderRadius: '0.65rem', padding: '1rem 1.25rem', boxShadow: '0 2px 4px rgba(0,0,0,0.1)' }}>
           <div style={{ fontSize: '0.78rem', fontWeight: 700, textTransform: 'uppercase', tracking: '0.05em', color: '#38bdf8', marginBottom: '0.65rem' }}>
             Pipeline Execution Configurations
@@ -1088,11 +1379,71 @@ export default function App() {
           </div>
         </div>
 
-        {/* Tile Scenes Audit Summary Insights */}
+        {/* 2. Pipeline Execution Stages & Activity Feed (Latest Active Stage on TOP) */}
+        {displayStages && displayStages.length > 0 && (
+          <div style={{ backgroundColor: '#ffffff', border: '1px solid #cbd5e1', borderRadius: '0.65rem', padding: '0.9rem 1.1rem', boxShadow: '0 1px 3px rgba(0,0,0,0.03)' }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.65rem' }}>
+              <span style={{ fontSize: '0.85rem', fontWeight: 700, color: '#0f172a' }}>Pipeline Execution Stages & Steps Activity Log</span>
+              <span style={{ fontSize: '0.72rem', fontWeight: 700, color: '#2563eb', backgroundColor: '#eff6ff', padding: '0.15rem 0.5rem', borderRadius: '0.25rem', border: '1px solid #bfdbfe' }}>
+                Latest Active Stage on TOP
+              </span>
+            </div>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '0.45rem', maxHeight: '180px', overflowY: 'auto' }}>
+              {displayStages.map((st, idx) => (
+                <div key={idx} style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: '0.75rem',
+                  fontSize: '0.78rem',
+                  padding: '0.45rem 0.65rem',
+                  borderRadius: '0.375rem',
+                  backgroundColor: idx === 0 ? '#f0f9ff' : '#f8fafc',
+                  borderLeft: idx === 0 ? '4px solid #0284c7' : '4px solid #cbd5e1'
+                }}>
+                  {st.timestamp && (
+                    <span style={{ fontFamily: 'monospace', color: '#64748b', fontSize: '0.72rem', minWidth: '130px' }}>
+                      [{st.timestamp}]
+                    </span>
+                  )}
+                  <span style={{ fontWeight: idx === 0 ? 700 : 600, color: idx === 0 ? '#0369a1' : '#334155' }}>
+                    {st.text}
+                  </span>
+                  {idx === 0 && (
+                    <span style={{ fontSize: '0.68rem', fontWeight: 700, color: '#0284c7', backgroundColor: '#e0f2fe', padding: '0.1rem 0.4rem', borderRadius: '0.2rem', marginLeft: 'auto' }}>
+                      ACTIVE / RECENT
+                    </span>
+                  )}
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* 3. AWS S3 vs NAS Storage Gap Check Audit Summary Banner */}
+        {gapSummary.availableS3 > 0 && (
+          <div style={{ backgroundColor: '#ffffff', border: '1px solid #e2e8f0', borderRadius: '0.65rem', padding: '0.85rem 1rem', display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: '0.75rem' }}>
+            <div style={{ fontSize: '0.82rem', fontWeight: 700, color: '#0f172a' }}>
+              Scene Discovery & Archive Gap Check Audit:
+            </div>
+            <div style={{ display: 'flex', gap: '0.75rem', flexWrap: 'wrap' }}>
+              <span style={{ fontSize: '0.75rem', fontWeight: 700, backgroundColor: '#eff6ff', color: '#1d4ed8', border: '1px solid #bfdbfe', padding: '0.25rem 0.65rem', borderRadius: '0.375rem' }}>
+                🌐 Available on AWS S3: {gapSummary.availableS3} scenes
+              </span>
+              <span style={{ fontSize: '0.75rem', fontWeight: 700, backgroundColor: '#ecfdf5', color: '#047857', border: '1px solid #a7f3d0', padding: '0.25rem 0.65rem', borderRadius: '0.375rem' }}>
+                💾 Already Held on NAS: {gapSummary.alreadyHeld} scenes
+              </span>
+              <span style={{ fontSize: '0.75rem', fontWeight: 700, backgroundColor: '#fef3c7', color: '#b45309', border: '1px solid #fde68a', padding: '0.25rem 0.65rem', borderRadius: '0.375rem' }}>
+                ⬇️ Queued for Download: {gapSummary.missing} scenes
+              </span>
+            </div>
+          </div>
+        )}
+
+        {/* 4. Tile Scenes Audit Summary Insights */}
         {tileAuditList && tileAuditList.length > 0 && (
           <div style={{ backgroundColor: '#f8fafc', border: '1px solid #e2e8f0', borderRadius: '0.65rem', padding: '0.85rem 1rem' }}>
             <div style={{ fontSize: '0.82rem', fontWeight: 700, color: '#334155', marginBottom: '0.65rem' }}>
-              Individual Tile Audit & Scenes Insights ({tileAuditList.length} Tiles)
+              Individual Tile Audit & Storage Status ({tileAuditList.length} Tiles)
             </div>
             <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(240px, 1fr))', gap: '0.75rem' }}>
               {tileAuditList.map((t, idx) => (
@@ -1119,15 +1470,15 @@ export default function App() {
           </div>
         )}
 
-        {/* KPI Cards */}
+        {/* 5. KPI Cards */}
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: '1rem' }}>
           <div style={kpiCardStyle}>
-            <div style={kpiLabelStyle}>Total Scenes</div>
+            <div style={kpiLabelStyle}>Total Scenes to Acquire</div>
             <div style={{ fontSize: '1.75rem', fontWeight: 800, color: '#0f172a' }}>{totalScenes}</div>
           </div>
           <div style={kpiCardStyle}>
-            <div style={kpiLabelStyle}>Complete</div>
-            <div style={{ fontSize: '1.75rem', fontWeight: 800, color: '#2563eb' }}>{completeScenes}</div>
+            <div style={kpiLabelStyle}>Complete on NAS</div>
+            <div style={{ fontSize: '1.75rem', fontWeight: 800, color: '#16a34a' }}>{completeScenes}</div>
           </div>
           <div style={kpiCardStyle}>
             <div style={kpiLabelStyle}>Tiles Covered</div>
@@ -1139,58 +1490,81 @@ export default function App() {
           </div>
         </div>
 
-        {/* Progress Bar */}
+        {/* 6. Progress Bar */}
         <div style={{ display: 'flex', flexDirection: 'column', gap: '0.45rem', backgroundColor: '#ffffff', border: '1px solid #e2e8f0', borderRadius: '0.5rem', padding: '0.85rem 1rem' }}>
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
             <span style={{ fontSize: '0.82rem', fontWeight: 600, color: '#334155' }}>Acquisition Progress</span>
-            <span style={{ fontSize: '0.85rem', fontWeight: 700, color: '#2563eb' }}>{progressPct}%</span>
+            <span style={{ fontSize: '0.85rem', fontWeight: 700, color: '#2563eb' }}>{progressPct}% ({completeScenes} of {totalScenes} completed)</span>
           </div>
           <div style={{ height: '8px', width: '100%', backgroundColor: '#e2e8f0', borderRadius: '9999px', overflow: 'hidden' }}>
             <div style={{ height: '100%', width: `${progressPct}%`, backgroundColor: '#2563eb', borderRadius: '9999px', transition: 'width 0.3s ease' }} />
           </div>
         </div>
 
-        {/* Section Header */}
+        {/* 7. Section Header */}
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '0 0.25rem' }}>
-          <span style={{ fontSize: '0.95rem', fontWeight: 700, color: '#0f172a' }}>Acquisition Scenes Breakdown</span>
-          <span style={{ fontSize: '0.75rem', color: '#64748b' }}>Showing {filteredScenes.length} of {totalScenes} scenes</span>
+          <span style={{ fontSize: '0.95rem', fontWeight: 700, color: '#0f172a' }}>
+            Acquisition Scenes Breakdown (Latest Logs & Active Downloads on TOP)
+          </span>
+          <span style={{ fontSize: '0.75rem', color: '#64748b' }}>Showing {displayScenes.length} of {totalScenes} scenes</span>
         </div>
 
-        {/* Scenes Table */}
+        {/* 8. Scenes Table (Reverse Chronological Order: Recently Running Scene on TOP) */}
         <div style={{ backgroundColor: '#ffffff', border: '1px solid #e2e8f0', borderRadius: '0.5rem', overflow: 'hidden', boxShadow: '0 1px 3px rgba(0,0,0,0.03)' }}>
           <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.8rem', textAlign: 'left' }}>
             <thead>
               <tr style={{ backgroundColor: '#f8fafc', borderBottom: '1px solid #e2e8f0' }}>
-                <th style={{ padding: '0.75rem 1rem', width: '120px', fontWeight: 700, color: '#475569' }}>Date</th>
-                <th style={{ padding: '0.75rem 1rem', width: '100px', fontWeight: 700, color: '#475569' }}>Tile</th>
-                <th style={{ padding: '0.75rem 1rem', width: '100px', fontWeight: 700, color: '#475569' }}>Satellite</th>
-                <th style={{ padding: '0.75rem 1rem', fontWeight: 700, color: '#475569' }}>Folder / Scene ID</th>
-                <th style={{ padding: '0.75rem 1rem', width: '130px', fontWeight: 700, color: '#475569' }}>Tile Scenes Info</th>
-                <th style={{ padding: '0.75rem 1rem', width: '110px', fontWeight: 700, color: '#475569' }}>Status</th>
-                <th style={{ padding: '0.75rem 1rem', width: '220px', fontWeight: 700, color: '#475569' }}>Bands Verified</th>
+                <th style={{ padding: '0.75rem 1rem', width: '110px', fontWeight: 700, color: '#475569' }}>Date</th>
+                <th style={{ padding: '0.75rem 1rem', width: '90px', fontWeight: 700, color: '#475569' }}>Tile</th>
+                <th style={{ padding: '0.75rem 1rem', width: '80px', fontWeight: 700, color: '#475569' }}>Satellite</th>
+                <th style={{ padding: '0.75rem 1rem', minWidth: '220px', fontWeight: 700, color: '#475569' }}>Folder / Scene ID</th>
+                <th style={{ padding: '0.75rem 1rem', width: '120px', fontWeight: 700, color: '#475569' }}>Tile Progress</th>
+                <th style={{ padding: '0.75rem 1rem', width: '130px', fontWeight: 700, color: '#475569' }}>Status</th>
+                <th style={{ padding: '0.75rem 1rem', minWidth: '260px', fontWeight: 700, color: '#475569' }}>Bands Verified & Sizes</th>
+                <th style={{ padding: '0.75rem 1rem', width: '100px', fontWeight: 700, color: '#475569' }}>Total Size</th>
               </tr>
             </thead>
             <tbody>
-              {filteredScenes.length === 0 ? (
+              {displayScenes.length === 0 ? (
                 <tr>
-                  <td colSpan={7} style={{ padding: '2.5rem 1rem', textAlign: 'center', color: '#94a3b8' }}>
+                  <td colSpan={8} style={{ padding: '2.5rem 1rem', textAlign: 'center', color: '#94a3b8' }}>
                     <RefreshCw size={20} className="animate-spin" style={{ margin: '0 auto 0.5rem auto', color: '#94a3b8' }} />
-                    <div>No scenes recorded yet in current execution stream.</div>
+                    <div>No scenes recorded yet in current execution stream. Waiting for pipeline...</div>
                   </td>
                 </tr>
               ) : (
-                filteredScenes.map((sc, idx) => {
+                displayScenes.map((sc, idx) => {
                   const auditInfo = tileAuditList.find(a => a.tile === sc.tile);
                   const tileSceneInsight = auditInfo
                     ? `${auditInfo.held}/${auditInfo.total || '?'} scenes`
                     : '1 Scene';
 
+                  const isDownloading = sc.status === 'DOWNLOADING';
+                  const isComplete = sc.status === 'COMPLETE';
+                  const isFailed = sc.status === 'FAILED';
+
                   return (
-                    <tr key={sc.folder + idx} style={{ borderBottom: '1px solid #f1f5f9', backgroundColor: idx % 2 === 0 ? '#ffffff' : '#fcfcfd' }}>
-                      <td style={{ padding: '0.7rem 1rem', color: '#334155', fontFamily: 'monospace', fontWeight: 600 }}>{sc.date}</td>
-                      <td style={{ padding: '0.7rem 1rem', color: '#2563eb', fontWeight: 700, fontFamily: 'monospace' }}>{sc.tile}</td>
-                      <td style={{ padding: '0.7rem 1rem', color: '#475569', fontWeight: 600 }}>{sc.satellite}</td>
-                      <td style={{ padding: '0.7rem 1rem', color: '#64748b', fontFamily: 'monospace', fontSize: '0.75rem' }}>{sc.folder}</td>
+                    <tr key={sc.folder + idx} style={{
+                      borderBottom: '1px solid #f1f5f9',
+                      backgroundColor: isDownloading ? '#f0f9ff' : (idx % 2 === 0 ? '#ffffff' : '#fcfcfd')
+                    }}>
+                      <td style={{ padding: '0.7rem 1rem', color: '#334155', fontFamily: 'monospace', fontWeight: 600 }}>
+                        {sc.date}
+                      </td>
+                      <td style={{ padding: '0.7rem 1rem', color: '#2563eb', fontWeight: 700, fontFamily: 'monospace' }}>
+                        {sc.tile}
+                      </td>
+                      <td style={{ padding: '0.7rem 1rem', color: '#475569', fontWeight: 600 }}>
+                        {sc.satellite}
+                      </td>
+                      <td style={{ padding: '0.7rem 1rem', color: '#0f172a', fontFamily: 'monospace', fontSize: '0.75rem' }}>
+                        <div>{sc.folder}</div>
+                        {sc.storagePath && (
+                          <div style={{ fontSize: '0.68rem', color: '#64748b', wordBreak: 'break-all' }}>
+                            📁 {sc.storagePath}
+                          </div>
+                        )}
+                      </td>
                       <td style={{ padding: '0.7rem 1rem', color: '#475569', fontSize: '0.74rem', fontWeight: 600 }}>
                         <span style={{ backgroundColor: '#f1f5f9', padding: '0.15rem 0.4rem', borderRadius: '0.2rem', color: '#334155' }}>
                           {tileSceneInsight}
@@ -1198,34 +1572,45 @@ export default function App() {
                       </td>
                       <td style={{ padding: '0.7rem 1rem' }}>
                         <span style={{
-                          padding: '0.15rem 0.45rem',
+                          padding: '0.2rem 0.5rem',
                           borderRadius: '0.25rem',
                           fontSize: '0.72rem',
                           fontWeight: 700,
-                          backgroundColor: sc.status === 'COMPLETE' ? '#eff6ff' : sc.status === 'FAILED' ? '#fee2e2' : '#f8fafc',
-                          color: sc.status === 'COMPLETE' ? '#1d4ed8' : sc.status === 'FAILED' ? '#dc2626' : '#64748b',
-                          border: sc.status === 'COMPLETE' ? '1px solid #bfdbfe' : sc.status === 'FAILED' ? '1px solid #fca5a5' : '1px solid #e2e8f0'
+                          backgroundColor: isDownloading ? '#e0f2fe' : isComplete ? '#ecfdf5' : isFailed ? '#fee2e2' : '#f8fafc',
+                          color: isDownloading ? '#0369a1' : isComplete ? '#047857' : isFailed ? '#dc2626' : '#64748b',
+                          border: isDownloading ? '1px solid #7dd3fc' : isComplete ? '1px solid #6ee7b7' : isFailed ? '1px solid #fca5a5' : '1px solid #e2e8f0',
+                          display: 'inline-flex',
+                          alignItems: 'center',
+                          gap: '0.25rem'
                         }}>
+                          {isDownloading && <RefreshCw size={10} className="animate-spin" />}
                           {sc.status}
+                          {sc.progressPct && ` (${sc.progressPct})`}
                         </span>
                       </td>
                       <td style={{ padding: '0.7rem 1rem' }}>
                         <div style={{ display: 'flex', gap: '0.35rem', flexWrap: 'wrap' }}>
-                          {sc.bands && sc.bands.map((b, bIdx) => (
-                            <span key={bIdx} style={{
-                              padding: '0.15rem 0.45rem',
-                              borderRadius: '0.25rem',
-                              fontSize: '0.7rem',
-                              fontWeight: 700,
-                              fontFamily: 'monospace',
-                              backgroundColor: '#f8fafc',
-                              border: '1px solid #cbd5e1',
-                              color: '#1e293b'
-                            }}>
-                              {b}
-                            </span>
-                          ))}
+                          {sc.bands && sc.bands.map((b, bIdx) => {
+                            const bSize = sc.bandSizes ? sc.bandSizes[b] : null;
+                            return (
+                              <span key={bIdx} style={{
+                                padding: '0.15rem 0.45rem',
+                                borderRadius: '0.25rem',
+                                fontSize: '0.7rem',
+                                fontWeight: 700,
+                                fontFamily: 'monospace',
+                                backgroundColor: '#f0fdf4',
+                                border: '1px solid #a7f3d0',
+                                color: '#047857'
+                              }}>
+                                {b}{bSize ? ` (${bSize})` : ''}
+                              </span>
+                            );
+                          })}
                         </div>
+                      </td>
+                      <td style={{ padding: '0.7rem 1rem', fontFamily: 'monospace', fontSize: '0.74rem', fontWeight: 600, color: '#334155' }}>
+                        {sc.totalSize || (sc.bands ? `${sc.bands.length} bands` : '—')}
                       </td>
                     </tr>
                   );
@@ -1931,6 +2316,29 @@ export default function App() {
             }}
           >
             <Database size={16} /> Downloaded Info & Requests
+          </button>
+
+          <button
+            onClick={() => {
+              setActiveTab('layer_stacking');
+              fetchDownloadedRegions();
+              fetchStackHistory(stackDistrict);
+            }}
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              gap: '0.5rem',
+              padding: '0.65rem 1.25rem',
+              fontSize: '0.9rem',
+              fontWeight: 600,
+              border: 'none',
+              borderBottom: activeTab === 'layer_stacking' ? '2px solid #2563eb' : '2px solid transparent',
+              color: activeTab === 'layer_stacking' ? '#2563eb' : '#64748b',
+              backgroundColor: 'transparent',
+              cursor: 'pointer'
+            }}
+          >
+            <Layers size={16} /> Layer Stacking
           </button>
         </div>
 
@@ -3131,6 +3539,31 @@ export default function App() {
                   </select>
                 </div>
 
+                {/* Temporal Composite Interval */}
+                <div>
+                  <label style={{ display: 'block', fontSize: '0.8rem', fontWeight: 600, color: '#334155', marginBottom: '0.35rem' }}>
+                    Temporal Composite Interval {retBand !== 'ALL' && <span style={{ color: '#2563eb', fontSize: '0.72rem', fontWeight: 700 }}>• Active</span>}
+                  </label>
+                  <select
+                    value={retCompositeInterval}
+                    onChange={(e) => setRetCompositeInterval(e.target.value)}
+                    style={{
+                      width: '100%',
+                      padding: '0.5rem 0.75rem',
+                      borderRadius: '0.375rem',
+                      border: retBand !== 'ALL' ? '1px solid #93c5fd' : '1px solid #cbd5e1',
+                      fontSize: '0.875rem',
+                      backgroundColor: retBand !== 'ALL' ? '#f0f9ff' : '#ffffff'
+                    }}
+                  >
+                    <option value="ALL">All Intervals / Any</option>
+                    <option value="weekly">Weekly (7-Day Composite)</option>
+                    <option value="fortnightly">Fortnightly (15-Day Composite)</option>
+                    <option value="monthly">Monthly (30-Day Composite)</option>
+                    <option value="none">None (Individual Scene Rasters)</option>
+                  </select>
+                </div>
+
                 {/* Start Date */}
                 <div>
                   <label style={{ display: 'block', fontSize: '0.8rem', fontWeight: 600, color: '#334155', marginBottom: '0.35rem' }}>
@@ -3161,8 +3594,31 @@ export default function App() {
               <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem', flexWrap: 'wrap' }}>
                 <button
                   type="button"
+                  onClick={handleVerifyNASData}
+                  disabled={verifyingNAS || downloadingZip}
+                  style={{
+                    backgroundColor: verifyingNAS ? '#1d4ed8' : '#2563eb',
+                    color: '#ffffff',
+                    padding: '0.65rem 1.25rem',
+                    borderRadius: '0.375rem',
+                    border: 'none',
+                    fontWeight: 600,
+                    fontSize: '0.9rem',
+                    cursor: (verifyingNAS || downloadingZip) ? 'wait' : 'pointer',
+                    display: 'inline-flex',
+                    alignItems: 'center',
+                    gap: '0.5rem',
+                    boxShadow: '0 1px 2px rgba(37, 99, 235, 0.2)'
+                  }}
+                >
+                  {verifyingNAS ? <RefreshCw size={16} className="animate-spin" /> : <HardDrive size={16} />}
+                  {verifyingNAS ? 'Verifying NAS Storage...' : 'Verify Data on NAS'}
+                </button>
+
+                <button
+                  type="button"
                   onClick={handleDownloadZip}
-                  disabled={downloadingZip}
+                  disabled={downloadingZip || verifyingNAS}
                   style={{
                     backgroundColor: downloadingZip ? '#15803d' : '#166534',
                     color: '#ffffff',
@@ -3171,7 +3627,7 @@ export default function App() {
                     border: 'none',
                     fontWeight: 600,
                     fontSize: '0.9rem',
-                    cursor: downloadingZip ? 'wait' : 'pointer',
+                    cursor: (downloadingZip || verifyingNAS) ? 'wait' : 'pointer',
                     display: 'inline-flex',
                     alignItems: 'center',
                     gap: '0.5rem',
@@ -3179,10 +3635,10 @@ export default function App() {
                   }}
                 >
                   {downloadingZip ? <RefreshCw size={16} className="animate-spin" /> : <Download size={16} />}
-                  {downloadingZip ? 'Preparing ZIP Archive...' : 'Download GeoTIFF Data (.zip)'}
+                  {downloadingZip ? 'Downloading data from NAS...' : 'Download GeoTIFF Data (.zip)'}
                 </button>
 
-                {(retState || retDistrict || retBand !== 'ALL' || retSatellite !== 'ALL' || retStartDate || retEndDate) && (
+                {(retState || retDistrict || retBand !== 'ALL' || retCompositeInterval !== 'ALL' || retSatellite !== 'ALL' || retStartDate || retEndDate) && (
                   <button
                     type="button"
                     onClick={() => {
@@ -3190,11 +3646,13 @@ export default function App() {
                       setRetDistrict('');
                       setRetSatellite('ALL');
                       setRetBand('ALL');
+                      setRetCompositeInterval('ALL');
                       setRetStartDate('');
                       setRetEndDate('');
                       setRetResults(null);
                       setRetCopyNotice(null);
                       setRetNotice(null);
+                      setShowDownloadPromptModal(false);
                     }}
                     style={{
                       backgroundColor: '#f1f5f9',
@@ -3212,21 +3670,250 @@ export default function App() {
                 )}
               </div>
 
+              {/* Status & Notification Banner */}
               {retNotice && (
                 <div style={{
                   marginTop: '1rem',
-                  padding: '0.85rem 1rem',
-                  borderRadius: '0.375rem',
+                  padding: '0.9rem 1.25rem',
+                  borderRadius: '0.5rem',
                   fontSize: '0.875rem',
                   fontWeight: 600,
-                  backgroundColor: retNotice.type === 'success' ? '#dcfce7' : (retNotice.type === 'warning' ? '#fef3c7' : '#fee2e2'),
-                  color: retNotice.type === 'success' ? '#15803d' : (retNotice.type === 'warning' ? '#92400e' : '#991b1b'),
-                  border: `1px solid ${retNotice.type === 'success' ? '#bbf7d0' : (retNotice.type === 'warning' ? '#fde68a' : '#fca5a5')}`
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: '0.75rem',
+                  backgroundColor: retNotice.status === 'completed' || retNotice.type === 'success'
+                    ? '#dcfce7'
+                    : (retNotice.status === 'initiated' || retNotice.type === 'info'
+                      ? '#eff6ff'
+                      : (retNotice.type === 'warning' ? '#fef3c7' : '#fee2e2')),
+                  color: retNotice.status === 'completed' || retNotice.type === 'success'
+                    ? '#15803d'
+                    : (retNotice.status === 'initiated' || retNotice.type === 'info'
+                      ? '#1d4ed8'
+                      : (retNotice.type === 'warning' ? '#92400e' : '#991b1b')),
+                  border: `1px solid ${
+                    retNotice.status === 'completed' || retNotice.type === 'success'
+                      ? '#86efac'
+                      : (retNotice.status === 'initiated' || retNotice.type === 'info'
+                        ? '#93c5fd'
+                        : (retNotice.type === 'warning' ? '#fde68a' : '#fca5a5'))
+                  }`,
+                  boxShadow: '0 1px 2px rgba(0, 0, 0, 0.04)'
                 }}>
-                  {retNotice.text}
+                  {retNotice.status === 'initiated' ? (
+                    <RefreshCw size={19} className="animate-spin" color="#2563eb" style={{ flexShrink: 0 }} />
+                  ) : (retNotice.status === 'completed' || retNotice.type === 'success') ? (
+                    <CheckCircle size={19} color="#166534" style={{ flexShrink: 0 }} />
+                  ) : retNotice.type === 'warning' ? (
+                    <AlertTriangle size={19} color="#d97706" style={{ flexShrink: 0 }} />
+                  ) : (
+                    <XCircle size={19} color="#dc2626" style={{ flexShrink: 0 }} />
+                  )}
+                  <div style={{ flex: 1, lineHeight: 1.4 }}>
+                    {retNotice.text}
+                  </div>
                 </div>
               )}
             </div>
+
+            {/* NAS Data Available Prompt Modal */}
+            {showDownloadPromptModal && retResults && retResults.total_tifs > 0 && (
+              <div style={{
+                position: 'fixed',
+                top: 0,
+                left: 0,
+                right: 0,
+                bottom: 0,
+                backgroundColor: 'rgba(15, 23, 42, 0.6)',
+                backdropFilter: 'blur(3px)',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                zIndex: 9999,
+                padding: '1rem'
+              }}>
+                <div style={{
+                  backgroundColor: '#ffffff',
+                  borderRadius: '0.75rem',
+                  boxShadow: '0 20px 25px -5px rgba(0, 0, 0, 0.2), 0 10px 10px -5px rgba(0, 0, 0, 0.08)',
+                  maxWidth: '560px',
+                  width: '100%',
+                  overflow: 'hidden',
+                  border: '1px solid #bfdbfe'
+                }}>
+                  {/* Header */}
+                  <div style={{
+                    backgroundColor: '#eff6ff',
+                    borderBottom: '1px solid #dbeafe',
+                    padding: '1.25rem 1.5rem',
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'space-between'
+                  }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '0.65rem' }}>
+                      <div style={{
+                        backgroundColor: '#dbeafe',
+                        borderRadius: '0.5rem',
+                        padding: '0.45rem',
+                        display: 'flex',
+                        alignItems: 'center',
+                        justifyContent: 'center'
+                      }}>
+                        <CheckCircle size={22} color="#2563eb" />
+                      </div>
+                      <div>
+                        <h3 style={{ fontSize: '1.1rem', fontWeight: 700, color: '#1e3a8a', margin: 0 }}>
+                          Data Available on NAS Storage
+                        </h3>
+                        <p style={{ fontSize: '0.78rem', color: '#3b82f6', margin: 0, fontWeight: 500 }}>
+                          Verified raster files exist on NAS storage ready for download
+                        </p>
+                      </div>
+                    </div>
+                    <button
+                      onClick={() => setShowDownloadPromptModal(false)}
+                      disabled={downloadingZip}
+                      style={{ background: 'none', border: 'none', cursor: downloadingZip ? 'not-allowed' : 'pointer', color: '#64748b' }}
+                    >
+                      <X size={20} />
+                    </button>
+                  </div>
+
+                  {/* Body Content */}
+                  <div style={{ padding: '1.5rem' }}>
+                    <div style={{
+                      backgroundColor: '#f8fafc',
+                      borderRadius: '0.5rem',
+                      border: '1px solid #e2e8f0',
+                      padding: '1rem',
+                      marginBottom: '1.25rem'
+                    }}>
+                      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, 1fr)', gap: '0.75rem', fontSize: '0.85rem' }}>
+                        <div>
+                          <span style={{ color: '#64748b', fontWeight: 600 }}>Region:</span>{' '}
+                          <span style={{ color: '#0f172a', fontWeight: 700 }}>
+                            {retResults.query_district || 'All Districts'}{retResults.query_state ? `, ${retResults.query_state}` : ''}
+                          </span>
+                        </div>
+                        <div>
+                          <span style={{ color: '#64748b', fontWeight: 600 }}>Sensor:</span>{' '}
+                          <span style={{ color: '#0f172a', fontWeight: 700 }}>{retResults.query_satellite || 'All Sensors'}</span>
+                        </div>
+                        <div>
+                          <span style={{ color: '#64748b', fontWeight: 600 }}>Band:</span>{' '}
+                          <span style={{ color: '#0f172a', fontWeight: 700 }}>{retResults.query_band || 'All Bands'}</span>
+                        </div>
+                        <div>
+                          <span style={{ color: '#64748b', fontWeight: 600 }}>Composite Interval:</span>{' '}
+                          <span style={{ color: '#2563eb', fontWeight: 700 }}>
+                            {retCompositeInterval === 'ALL' ? 'All Intervals' : retCompositeInterval.charAt(0).toUpperCase() + retCompositeInterval.slice(1)}
+                          </span>
+                        </div>
+                        {retResults.query_start_date && (
+                          <div style={{ gridColumn: 'span 2' }}>
+                            <span style={{ color: '#64748b', fontWeight: 600 }}>Date Range:</span>{' '}
+                            <span style={{ color: '#0f172a', fontWeight: 600 }}>{retResults.query_start_date} to {retResults.query_end_date || 'Present'}</span>
+                          </div>
+                        )}
+                      </div>
+
+                      <div style={{
+                        marginTop: '1rem',
+                        paddingTop: '0.75rem',
+                        borderTop: '1px solid #e2e8f0',
+                        display: 'flex',
+                        justifyContent: 'space-between',
+                        alignItems: 'center'
+                      }}>
+                        <div>
+                          <span style={{ fontSize: '0.8rem', color: '#64748b' }}>Total Files Found:</span>{' '}
+                          <strong style={{ fontSize: '0.95rem', color: '#0f172a' }}>{retResults.total_tifs} GeoTIFFs</strong>
+                        </div>
+                        <div>
+                          <span style={{ fontSize: '0.8rem', color: '#64748b' }}>Total Volume:</span>{' '}
+                          <strong style={{ fontSize: '0.95rem', color: '#166534' }}>{retResults.total_size_mb} MB</strong>
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* Question to User */}
+                    <div style={{ textAlign: 'center', marginBottom: '1.25rem' }}>
+                      <p style={{ fontSize: '1.05rem', fontWeight: 700, color: '#0f172a', margin: 0 }}>
+                        Data is available on NAS. Do you want to download this data?
+                      </p>
+                      <p style={{ fontSize: '0.8rem', color: '#64748b', margin: '0.35rem 0 0 0' }}>
+                        The system will archive all verified GeoTIFF raster files matching your query into a ZIP package.
+                      </p>
+                    </div>
+
+                    {/* Progress indicator inside modal */}
+                    {downloadingZip && (
+                      <div style={{
+                        backgroundColor: '#eff6ff',
+                        border: '1px solid #bfdbfe',
+                        borderRadius: '0.5rem',
+                        padding: '0.85rem 1rem',
+                        marginBottom: '1.25rem',
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: '0.75rem'
+                      }}>
+                        <RefreshCw size={20} className="animate-spin" color="#2563eb" />
+                        <div>
+                          <div style={{ fontSize: '0.875rem', fontWeight: 700, color: '#1d4ed8' }}>
+                            Downloading data in progress...
+                          </div>
+                          <div style={{ fontSize: '0.78rem', color: '#3b82f6' }}>
+                            Retrieving rasters from NAS and streaming ZIP archive.
+                          </div>
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Modal Action Buttons */}
+                    <div style={{ display: 'flex', gap: '0.75rem', justifyContent: 'flex-end' }}>
+                      <button
+                        type="button"
+                        onClick={() => setShowDownloadPromptModal(false)}
+                        style={{
+                          padding: '0.65rem 1.25rem',
+                          borderRadius: '0.375rem',
+                          border: '1px solid #cbd5e1',
+                          backgroundColor: '#ffffff',
+                          color: '#475569',
+                          fontWeight: 600,
+                          fontSize: '0.875rem',
+                          cursor: 'pointer'
+                        }}
+                      >
+                        Cancel
+                      </button>
+
+                      <button
+                        type="button"
+                        onClick={handleDownloadZip}
+                        style={{
+                          padding: '0.65rem 1.4rem',
+                          borderRadius: '0.375rem',
+                          border: 'none',
+                          backgroundColor: '#166534',
+                          color: '#ffffff',
+                          fontWeight: 600,
+                          fontSize: '0.875rem',
+                          cursor: 'pointer',
+                          display: 'inline-flex',
+                          alignItems: 'center',
+                          gap: '0.5rem',
+                          boxShadow: '0 2px 4px rgba(22, 101, 52, 0.2)'
+                        }}
+                      >
+                        <Download size={16} /> Yes, Download Data (.zip)
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            )}
 
             {/* Retrieval Results Display Card */}
             {retResults && (
@@ -3284,168 +3971,59 @@ export default function App() {
                   </div>
                 </div>
 
-                {/* Action Toolbar */}
-                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: '0.75rem' }}>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                {/* Action Toolbar & NAS Status */}
+                <div style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'space-between',
+                  flexWrap: 'wrap',
+                  gap: '1rem',
+                  padding: '1.25rem',
+                  backgroundColor: '#f8fafc',
+                  borderRadius: '0.5rem',
+                  border: '1px solid #e2e8f0'
+                }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '0.65rem' }}>
+                    {retResults.total_tifs > 0 ? (
+                      <>
+                        <CheckCircle size={22} color="#166534" />
+                        <div>
+                          <div style={{ fontSize: '0.95rem', fontWeight: 700, color: '#166534' }}>
+                            {retResults.total_tifs} GeoTIFF rasters ({retResults.total_size_mb} MB) verified on NAS
+                          </div>
+                          <div style={{ fontSize: '0.8rem', color: '#64748b', marginTop: '0.15rem' }}>
+                            Ready for background download. You can safely minimize or close the window once download starts.
+                          </div>
+                        </div>
+                      </>
+                    ) : (
+                      <div style={{ color: '#64748b', fontSize: '0.875rem' }}>
+                        No verified GeoTIFF raster files currently found on NAS matching the selected criteria.
+                      </div>
+                    )}
+                  </div>
+
+                  {retResults.total_tifs > 0 && (
                     <button
                       onClick={handleDownloadZip}
-                      disabled={!retResults.tifs || retResults.tifs.length === 0}
                       style={{
                         backgroundColor: '#166534',
                         color: '#ffffff',
                         border: 'none',
                         borderRadius: '0.375rem',
-                        padding: '0.5rem 0.85rem',
-                        fontSize: '0.82rem',
+                        padding: '0.65rem 1.35rem',
+                        fontSize: '0.88rem',
                         fontWeight: 600,
                         cursor: 'pointer',
                         display: 'inline-flex',
                         alignItems: 'center',
-                        gap: '0.4rem'
+                        gap: '0.5rem',
+                        boxShadow: '0 1px 2px rgba(22, 101, 52, 0.2)'
                       }}
                     >
-                      <Download size={14} /> Download All (.zip)
+                      <Download size={16} /> Download GeoTIFF Data (.zip)
                     </button>
-
-                    <button
-                      onClick={handleCopyPaths}
-                      disabled={!retResults.tif_paths || retResults.tif_paths.length === 0}
-                      style={{
-                        backgroundColor: '#0f172a',
-                        color: '#ffffff',
-                        border: 'none',
-                        borderRadius: '0.375rem',
-                        padding: '0.5rem 0.85rem',
-                        fontSize: '0.82rem',
-                        fontWeight: 600,
-                        cursor: 'pointer',
-                        display: 'inline-flex',
-                        alignItems: 'center',
-                        gap: '0.4rem'
-                      }}
-                    >
-                      <FileText size={14} /> Copy All File Paths
-                    </button>
-
-                    <button
-                      onClick={handleExportCsv}
-                      disabled={!retResults.tifs || retResults.tifs.length === 0}
-                      style={{
-                        backgroundColor: '#ffffff',
-                        color: '#334155',
-                        border: '1px solid #cbd5e1',
-                        borderRadius: '0.375rem',
-                        padding: '0.5rem 0.85rem',
-                        fontSize: '0.82rem',
-                        fontWeight: 600,
-                        cursor: 'pointer',
-                        display: 'inline-flex',
-                        alignItems: 'center',
-                        gap: '0.4rem'
-                      }}
-                    >
-                      <Download size={14} /> Export CSV Manifest
-                    </button>
-                  </div>
-
-                  {retCopyNotice && (
-                    <span style={{ fontSize: '0.82rem', fontWeight: 600, color: '#166534', backgroundColor: '#dcfce7', padding: '0.35rem 0.75rem', borderRadius: '0.375rem' }}>
-                      {retCopyNotice}
-                    </span>
                   )}
-                </div>
-
-                {/* GeoTIFF Table */}
-                <div style={{ overflowX: 'auto', border: '1px solid #e2e8f0', borderRadius: '0.5rem' }}>
-                  <table style={{ width: '100%', borderCollapse: 'collapse', textAlign: 'left', fontSize: '0.85rem' }}>
-                    <thead>
-                      <tr style={{ backgroundColor: '#f8fafc', borderBottom: '1px solid #e2e8f0', color: '#475569', fontWeight: 600 }}>
-                        <th style={{ padding: '0.65rem 0.85rem' }}>#</th>
-                        <th style={{ padding: '0.65rem 0.85rem' }}>Band</th>
-                        <th style={{ padding: '0.65rem 0.85rem' }}>Satellite</th>
-                        <th style={{ padding: '0.65rem 0.85rem' }}>Tile</th>
-                        <th style={{ padding: '0.65rem 0.85rem' }}>Sensing Date</th>
-                        <th style={{ padding: '0.65rem 0.85rem' }}>Size</th>
-                        <th style={{ padding: '0.65rem 0.85rem' }}>Status</th>
-                        <th style={{ padding: '0.65rem 0.85rem' }}>Filesystem Path (DB)</th>
-                        <th style={{ padding: '0.65rem 0.85rem', textAlign: 'center' }}>Download Action</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {retResults.tifs && retResults.tifs.length > 0 ? (
-                        retResults.tifs.map((item, idx) => (
-                          <tr key={idx} style={{ borderBottom: '1px solid #f1f5f9' }}>
-                            <td style={{ padding: '0.65rem 0.85rem', color: '#94a3b8', fontSize: '0.78rem' }}>{idx + 1}</td>
-                            <td style={{ padding: '0.65rem 0.85rem' }}>
-                              <span style={{ fontWeight: 700, color: '#2563eb', backgroundColor: '#eff6ff', padding: '0.15rem 0.45rem', borderRadius: '0.25rem', fontSize: '0.78rem' }}>
-                                {item.band}
-                              </span>
-                            </td>
-                            <td style={{ padding: '0.65rem 0.85rem', color: '#334155' }}>{item.satellite}</td>
-                            <td style={{ padding: '0.65rem 0.85rem', fontWeight: 600, color: '#0f172a' }}>{item.tile}</td>
-                            <td style={{ padding: '0.65rem 0.85rem', color: '#475569' }}>{item.sensing_date}</td>
-                            <td style={{ padding: '0.65rem 0.85rem', color: '#334155' }}>{(item.size_bytes / (1024 * 1024)).toFixed(1)} MB</td>
-                            <td style={{ padding: '0.65rem 0.85rem' }}>
-                              <span style={{
-                                fontSize: '0.72rem',
-                                fontWeight: 700,
-                                backgroundColor: item.exists_on_disk ? '#dcfce7' : '#fef2f2',
-                                color: item.exists_on_disk ? '#166534' : '#991b1b',
-                                padding: '0.15rem 0.45rem',
-                                borderRadius: '0.25rem'
-                              }}>
-                                {item.exists_on_disk ? 'VERIFIED' : 'MISSING'}
-                              </span>
-                            </td>
-                            <td style={{ padding: '0.65rem 0.85rem', fontFamily: 'monospace', fontSize: '0.78rem', color: '#334155', wordBreak: 'break-all' }}>
-                              <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-                                <span>{item.path}</span>
-                                <button
-                                  onClick={() => {
-                                    navigator.clipboard.writeText(item.path);
-                                    setRetCopyNotice(`✓ Copied: ${item.band}`);
-                                    setTimeout(() => setRetCopyNotice(null), 2000);
-                                  }}
-                                  title="Copy Path"
-                                  style={{ border: 'none', backgroundColor: '#f1f5f9', padding: '0.2rem 0.4rem', borderRadius: '0.25rem', cursor: 'pointer', color: '#475569' }}
-                                >
-                                  Copy
-                                </button>
-                              </div>
-                            </td>
-                            <td style={{ padding: '0.65rem 0.85rem', textAlign: 'center' }}>
-                              <button
-                                onClick={() => handleDownloadFile(item.path)}
-                                disabled={!item.exists_on_disk}
-                                title={item.exists_on_disk ? `Download ${item.band}.tif` : "File Missing on Disk"}
-                                style={{
-                                  backgroundColor: item.exists_on_disk ? '#2563eb' : '#94a3b8',
-                                  color: '#ffffff',
-                                  border: 'none',
-                                  borderRadius: '0.375rem',
-                                  padding: '0.35rem 0.75rem',
-                                  fontSize: '0.8rem',
-                                  fontWeight: 600,
-                                  cursor: item.exists_on_disk ? 'pointer' : 'not-allowed',
-                                  display: 'inline-flex',
-                                  alignItems: 'center',
-                                  gap: '0.35rem'
-                                }}
-                              >
-                                <Download size={14} /> Download .tif
-                              </button>
-                            </td>
-                          </tr>
-                        ))
-                      ) : (
-                        <tr>
-                          <td colSpan={8} style={{ padding: '2rem', textAlign: 'center', color: '#64748b' }}>
-                            No verified GeoTIFF raster paths matched the selected State/District and filter criteria.
-                          </td>
-                        </tr>
-                      )}
-                    </tbody>
-                  </table>
                 </div>
               </div>
             )}
@@ -3472,12 +4050,9 @@ export default function App() {
               boxShadow: '0 1px 3px rgba(0,0,0,0.03)'
             }}>
               <div>
-                <h2 style={{ fontSize: '1.2rem', fontWeight: 700, color: '#0f172a', margin: '0 0 0.35rem 0', display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                <h2 style={{ fontSize: '1.2rem', fontWeight: 700, color: '#0f172a', margin: 0, display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
                   <Database size={22} color="#2563eb" /> Downloaded Info & Acquisition Requests Overview
                 </h2>
-                <p style={{ fontSize: '0.85rem', color: '#64748b', margin: 0 }}>
-                  Real-time acquisition database retrieved from the PostgreSQL <code style={{ backgroundColor: '#f1f5f9', padding: '0.1rem 0.35rem', borderRadius: '0.25rem', color: '#0f172a', fontWeight: 600 }}>acquisition_requests</code> table.
-                </p>
               </div>
 
               <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', fontSize: '0.78rem', color: '#2563eb', backgroundColor: '#eff6ff', padding: '0.4rem 0.75rem', borderRadius: '0.375rem', border: '1px solid #bfdbfe', fontWeight: 600 }}>
@@ -3664,35 +4239,668 @@ export default function App() {
                           {renderStatusBadge(req.status)}
                         </td>
                         <td style={{ padding: '0.75rem 1rem', textAlign: 'center' }}>
-                          <div style={{ display: 'flex', gap: '0.35rem', justifyContent: 'center' }}>
-                            <button
-                              onClick={() => openLogsModal(req)}
-                              title="View Execution Logs"
-                              style={{ padding: '0.3rem 0.55rem', border: '1px solid #cbd5e1', borderRadius: '0.375rem', backgroundColor: '#ffffff', color: '#334155', cursor: 'pointer', display: 'inline-flex', alignItems: 'center', gap: '0.25rem', fontSize: '0.75rem', fontWeight: 600 }}
-                            >
-                              <Terminal size={12} color="#2563eb" /> Logs
-                            </button>
-                            <button
-                              onClick={() => {
-                                if (req.state) setRetState(req.state);
-                                if (req.district) setRetDistrict(req.district);
-                                if (req.satellite) setRetSatellite(req.satellite.includes('Sentinel-1') && !req.satellite.includes('Sentinel-2') ? 'Sentinel-1' : req.satellite.includes('Sentinel-2') && !req.satellite.includes('Sentinel-1') ? 'Sentinel-2' : 'ALL');
-                                if (req.start_date) setRetStartDate(req.start_date);
-                                if (req.end_date) setRetEndDate(req.end_date);
-                                setActiveTab('retrieve_data');
-                              }}
-                              title="Export GeoTIFF Files"
-                              style={{ padding: '0.3rem 0.55rem', border: 'none', borderRadius: '0.375rem', backgroundColor: '#166534', color: '#ffffff', cursor: 'pointer', display: 'inline-flex', alignItems: 'center', gap: '0.25rem', fontSize: '0.75rem', fontWeight: 600 }}
-                            >
-                              <Download size={12} /> Retrieve
-                            </button>
-                          </div>
+                          <button
+                            onClick={() => openLogsModal(req)}
+                            title="View Execution Logs"
+                            style={{ padding: '0.35rem 0.75rem', border: '1px solid #cbd5e1', borderRadius: '0.375rem', backgroundColor: '#ffffff', color: '#334155', cursor: 'pointer', display: 'inline-flex', alignItems: 'center', gap: '0.35rem', fontSize: '0.78rem', fontWeight: 600 }}
+                          >
+                            <Terminal size={13} color="#2563eb" /> Logs
+                          </button>
                         </td>
                       </tr>
                     ));
                   })()}
                 </tbody>
               </table>
+            </div>
+
+          </div>
+        )}
+
+        {/* ========================================================================= */}
+        {/* TAB: Layer Stacking Studio */}
+        {/* ========================================================================= */}
+        {activeTab === 'layer_stacking' && (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '1.5rem' }}>
+            
+            {/* Header Card */}
+            <div style={{
+              backgroundColor: '#ffffff',
+              borderRadius: '0.75rem',
+              border: '1px solid #e2e8f0',
+              padding: '1.5rem'
+            }}>
+              <div style={{ marginBottom: '1.25rem' }}>
+                <h2 style={{ fontSize: '1.2rem', fontWeight: 700, color: '#0f172a', margin: '0 0 0.35rem 0', display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                  <Layers size={22} color="#2563eb" /> Multi-Band Layer Stacking Studio
+                </h2>
+                <p style={{ fontSize: '0.85rem', color: '#64748b', margin: 0 }}>
+                  Combine individual spectral bands and derived indices into a single unified multi-band GeoTIFF file.
+                  Layers are ordered strictly according to your selection sequence and stored to NAS storage in <code style={{ backgroundColor: '#f1f5f9', padding: '0.15rem 0.35rem', borderRadius: '0.25rem', color: '#0f172a' }}>Composites/stack/{'{district}'}/</code>.
+                </p>
+              </div>
+
+              {/* Notice Banner */}
+              {stackNotice && (
+                <div style={{
+                  padding: '0.85rem 1.25rem',
+                  borderRadius: '0.5rem',
+                  marginBottom: '1.25rem',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'space-between',
+                  backgroundColor: stackNotice.type === 'success' ? '#f0fdf4' : stackNotice.type === 'error' ? '#fef2f2' : '#eff6ff',
+                  border: `1px solid ${stackNotice.type === 'success' ? '#bbf7d0' : stackNotice.type === 'error' ? '#fecaca' : '#bfdbfe'}`,
+                  color: stackNotice.type === 'success' ? '#15803d' : stackNotice.type === 'error' ? '#b91c1c' : '#1d4ed8',
+                  fontSize: '0.85rem',
+                  fontWeight: 500
+                }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                    {stackNotice.type === 'success' ? <CheckCircle size={18} /> : stackNotice.type === 'error' ? <AlertTriangle size={18} /> : <Info size={18} />}
+                    <span>{stackNotice.text}</span>
+                  </div>
+                  <button onClick={() => setStackNotice(null)} style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'inherit' }}>
+                    <X size={16} />
+                  </button>
+                </div>
+              )}
+
+              {/* Controls Grid */}
+              <div style={{
+                display: 'grid',
+                gridTemplateColumns: 'repeat(auto-fit, minmax(210px, 1fr))',
+                gap: '1rem',
+                backgroundColor: '#f8fafc',
+                padding: '1.25rem',
+                borderRadius: '0.5rem',
+                border: '1px solid #e2e8f0',
+                marginBottom: '1.25rem'
+              }}>
+                {/* State Select */}
+                <div>
+                  <label style={{ display: 'block', fontSize: '0.8rem', fontWeight: 600, color: '#334155', marginBottom: '0.35rem' }}>
+                    State / Region
+                  </label>
+                  <select
+                    value={stackState}
+                    onChange={(e) => {
+                      const st = e.target.value;
+                      setStackState(st);
+                      setStackDistrict('');
+                      fetchStackHistory('');
+                    }}
+                    style={{ width: '100%', padding: '0.5rem 0.75rem', borderRadius: '0.375rem', border: '1px solid #cbd5e1', fontSize: '0.875rem', backgroundColor: '#ffffff' }}
+                  >
+                    <option value="">-- All States / Select State --</option>
+                    {(retDownloadedStates.length > 0 ? retDownloadedStates : statesList).map((s, i) => {
+                      const stName = typeof s === 'string' ? s : (s.state_name || '');
+                      return <option key={i} value={stName}>{stName}</option>;
+                    })}
+                  </select>
+                </div>
+
+                {/* District Select */}
+                <div>
+                  <label style={{ display: 'block', fontSize: '0.8rem', fontWeight: 600, color: '#334155', marginBottom: '0.35rem' }}>
+                    Target District <span style={{ color: '#ef4444' }}>*</span>
+                  </label>
+                  <select
+                    value={stackDistrict}
+                    onChange={(e) => {
+                      const d = e.target.value;
+                      setStackDistrict(d);
+                      fetchStackHistory(d);
+                    }}
+                    style={{ width: '100%', padding: '0.5rem 0.75rem', borderRadius: '0.375rem', border: '1px solid #cbd5e1', fontSize: '0.875rem', backgroundColor: '#ffffff', fontWeight: 600 }}
+                  >
+                    <option value="">-- Select Target District --</option>
+                    {(retDownloadedDistricts.length > 0 ? retDownloadedDistricts : districtsList)
+                      .filter(d => {
+                        const dState = typeof d === 'string' ? '' : (d.state_name || '');
+                        return !stackState || (dState && dState.toLowerCase() === stackState.toLowerCase());
+                      })
+                      .map((d, i) => {
+                        const dName = typeof d === 'string' ? d : (d.district_name || '');
+                        return <option key={i} value={dName}>{dName}</option>;
+                      })}
+                  </select>
+                </div>
+
+                {/* Season Select */}
+                <div>
+                  <label style={{ display: 'block', fontSize: '0.8rem', fontWeight: 600, color: '#334155', marginBottom: '0.35rem' }}>
+                    Crop / Meteorological Season
+                  </label>
+                  <select
+                    value={stackSeason}
+                    onChange={(e) => handleStackSeasonChange(e.target.value)}
+                    style={{ width: '100%', padding: '0.5rem 0.75rem', borderRadius: '0.375rem', border: '1px solid #cbd5e1', fontSize: '0.875rem', backgroundColor: '#ffffff' }}
+                  >
+                    <option value="Kharif">Kharif (Jun – Oct)</option>
+                    <option value="Rabi">Rabi (Nov – Mar)</option>
+                    <option value="Zaid">Zaid (Mar – Jun)</option>
+                    <option value="Pre-Monsoon">Pre-Monsoon (Mar – May)</option>
+                    <option value="Monsoon">Monsoon (Jun – Sep)</option>
+                    <option value="Post-Monsoon">Post-Monsoon (Oct – Dec)</option>
+                    <option value="Winter">Winter (Jan – Feb)</option>
+                    <option value="Annual">Annual (Jan – Dec)</option>
+                    <option value="Custom">Custom Date Range</option>
+                  </select>
+                </div>
+
+                {/* Start Date */}
+                <div>
+                  <label style={{ display: 'block', fontSize: '0.8rem', fontWeight: 600, color: '#334155', marginBottom: '0.35rem' }}>
+                    Start Date
+                  </label>
+                  <input
+                    type="date"
+                    value={stackStartDate}
+                    onChange={(e) => setStackStartDate(e.target.value)}
+                    style={{ width: '100%', padding: '0.5rem 0.75rem', borderRadius: '0.375rem', border: '1px solid #cbd5e1', fontSize: '0.875rem', backgroundColor: '#ffffff', boxSizing: 'border-box' }}
+                  />
+                </div>
+
+                {/* End Date */}
+                <div>
+                  <label style={{ display: 'block', fontSize: '0.8rem', fontWeight: 600, color: '#334155', marginBottom: '0.35rem' }}>
+                    End Date
+                  </label>
+                  <input
+                    type="date"
+                    value={stackEndDate}
+                    onChange={(e) => setStackEndDate(e.target.value)}
+                    style={{ width: '100%', padding: '0.5rem 0.75rem', borderRadius: '0.375rem', border: '1px solid #cbd5e1', fontSize: '0.875rem', backgroundColor: '#ffffff', boxSizing: 'border-box' }}
+                  />
+                </div>
+              </div>
+
+              {/* Order-Preserved Stack Sequence Visualizer */}
+              <div style={{
+                marginBottom: '1.5rem',
+                padding: '1rem 1.25rem',
+                backgroundColor: '#f1f5f9',
+                borderRadius: '0.5rem',
+                border: '1px dashed #94a3b8'
+              }}>
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '0.75rem', flexWrap: 'wrap', gap: '0.5rem' }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                    <Sliders size={16} color="#2563eb" />
+                    <span style={{ fontSize: '0.85rem', fontWeight: 700, color: '#0f172a' }}>
+                      Layer Attachment Sequence (Order-Preserved Stacking):
+                    </span>
+                    <span style={{ fontSize: '0.75rem', color: '#64748b' }}>
+                      ({stackSelectedLayers.length} layers in stack)
+                    </span>
+                  </div>
+                  <div style={{ display: 'flex', gap: '0.5rem' }}>
+                    <button
+                      onClick={() => setStackSelectedLayers(['B02', 'B03', 'B04'])}
+                      style={{ fontSize: '0.75rem', padding: '0.25rem 0.5rem', borderRadius: '0.25rem', border: '1px solid #cbd5e1', backgroundColor: '#ffffff', cursor: 'pointer', color: '#475569' }}
+                    >
+                      Default RGB (B02, B03, B04)
+                    </button>
+                    <button
+                      onClick={() => setStackSelectedLayers([])}
+                      style={{ fontSize: '0.75rem', padding: '0.25rem 0.5rem', borderRadius: '0.25rem', border: '1px solid #cbd5e1', backgroundColor: '#ffffff', cursor: 'pointer', color: '#b91c1c' }}
+                    >
+                      Clear All
+                    </button>
+                  </div>
+                </div>
+
+                {stackSelectedLayers.length === 0 ? (
+                  <div style={{ padding: '0.75rem', textAlign: 'center', color: '#94a3b8', fontSize: '0.82rem' }}>
+                    No layers selected yet. Check individual spectral bands or indices below to add them to your stacking sequence.
+                  </div>
+                ) : (
+                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.5rem', alignItems: 'center' }}>
+                    {stackSelectedLayers.map((layer, idx) => {
+                      const isIndex = ['NDVI', 'LSWI'].includes(layer);
+                      const isSar = ['VV', 'VH', 'VV_VH'].includes(layer);
+                      const badgeColor = isIndex ? '#2563eb' : (isSar ? '#d97706' : '#059669');
+                      const borderColor = isIndex ? '#93c5fd' : (isSar ? '#fde68a' : '#86efac');
+                      return (
+                        <div
+                          key={layer}
+                          style={{
+                            display: 'inline-flex',
+                            alignItems: 'center',
+                            gap: '0.4rem',
+                            backgroundColor: '#ffffff',
+                            border: `1px solid ${borderColor}`,
+                            padding: '0.35rem 0.65rem',
+                            borderRadius: '0.375rem',
+                            boxShadow: '0 1px 2px rgba(0,0,0,0.05)'
+                          }}
+                        >
+                          <span style={{
+                            backgroundColor: badgeColor,
+                            color: '#ffffff',
+                            borderRadius: '9999px',
+                            padding: '0.1rem 0.45rem',
+                            fontSize: '0.7rem',
+                            fontWeight: 700
+                          }}>
+                            Band {idx + 1}
+                          </span>
+                          <span style={{ fontWeight: 700, fontSize: '0.85rem', color: '#0f172a' }}>
+                            {layer}
+                          </span>
+                          <div style={{ display: 'inline-flex', gap: '0.15rem', marginLeft: '0.25rem' }}>
+                            <button
+                              onClick={() => moveStackLayer(idx, 'up')}
+                              disabled={idx === 0}
+                              title="Move Left / Earlier in Stack"
+                              style={{ border: 'none', background: 'none', cursor: idx === 0 ? 'not-allowed' : 'pointer', color: idx === 0 ? '#cbd5e1' : '#475569', padding: '0 0.15rem' }}
+                            >
+                              <ArrowUp size={13} style={{ transform: 'rotate(-90deg)' }} />
+                            </button>
+                            <button
+                              onClick={() => moveStackLayer(idx, 'down')}
+                              disabled={idx === stackSelectedLayers.length - 1}
+                              title="Move Right / Later in Stack"
+                              style={{ border: 'none', background: 'none', cursor: idx === stackSelectedLayers.length - 1 ? 'not-allowed' : 'pointer', color: idx === stackSelectedLayers.length - 1 ? '#cbd5e1' : '#475569', padding: '0 0.15rem' }}
+                            >
+                              <ArrowDown size={13} style={{ transform: 'rotate(-90deg)' }} />
+                            </button>
+                            <button
+                              onClick={() => removeStackLayer(layer)}
+                              title="Remove from Stack"
+                              style={{ border: 'none', background: 'none', cursor: 'pointer', color: '#ef4444', padding: '0 0.15rem' }}
+                            >
+                              <X size={13} />
+                            </button>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+
+              {/* Band and Index Checkbox Groups */}
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))', gap: '1.25rem', marginBottom: '1.5rem' }}>
+                
+                {/* 1. Optical Spectral Bands */}
+                <div style={{ border: '1px solid #e2e8f0', borderRadius: '0.5rem', padding: '1rem' }}>
+                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '0.75rem', borderBottom: '1px solid #f1f5f9', paddingBottom: '0.5rem' }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
+                      <Satellite size={16} color="#059669" />
+                      <span style={{ fontSize: '0.85rem', fontWeight: 700, color: '#0f172a' }}>
+                        Optical Spectral Bands (Sentinel-2 MSI)
+                      </span>
+                    </div>
+                  </div>
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: '0.45rem', maxHeight: '280px', overflowY: 'auto' }}>
+                    {AVAILABLE_OPTICAL_BANDS.map(b => {
+                      const isChecked = stackSelectedLayers.includes(b.id);
+                      const orderIdx = stackSelectedLayers.indexOf(b.id);
+                      return (
+                        <label
+                          key={b.id}
+                          style={{
+                            display: 'flex',
+                            alignItems: 'center',
+                            justifyContent: 'space-between',
+                            padding: '0.45rem 0.65rem',
+                            borderRadius: '0.25rem',
+                            backgroundColor: isChecked ? '#f0fdf4' : 'transparent',
+                            cursor: 'pointer',
+                            fontSize: '0.82rem',
+                            color: isChecked ? '#065f46' : '#334155'
+                          }}
+                        >
+                          <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                            <input
+                              type="checkbox"
+                              checked={isChecked}
+                              onChange={() => toggleStackLayer(b.id)}
+                            />
+                            <span style={{ fontWeight: isChecked ? 600 : 400 }}>{b.label}</span>
+                          </div>
+                          {isChecked && (
+                            <span style={{ backgroundColor: '#059669', color: '#ffffff', borderRadius: '0.2rem', padding: '0.05rem 0.35rem', fontSize: '0.7rem', fontWeight: 700 }}>
+                              #{orderIdx + 1}
+                            </span>
+                          )}
+                        </label>
+                      );
+                    })}
+                  </div>
+                </div>
+
+                {/* 2. SAR Radar Polarizations */}
+                <div style={{ border: '1px solid #e2e8f0', borderRadius: '0.5rem', padding: '1rem' }}>
+                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '0.75rem', borderBottom: '1px solid #f1f5f9', paddingBottom: '0.5rem' }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
+                      <Activity size={16} color="#d97706" />
+                      <span style={{ fontSize: '0.85rem', fontWeight: 700, color: '#0f172a' }}>
+                        SAR Radar Polarizations (Sentinel-1 C-Band)
+                      </span>
+                    </div>
+                  </div>
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: '0.45rem', maxHeight: '280px', overflowY: 'auto' }}>
+                    {AVAILABLE_SAR_BANDS.map(b => {
+                      const isChecked = stackSelectedLayers.includes(b.id);
+                      const orderIdx = stackSelectedLayers.indexOf(b.id);
+                      return (
+                        <label
+                          key={b.id}
+                          style={{
+                            display: 'flex',
+                            alignItems: 'center',
+                            justifyContent: 'space-between',
+                            padding: '0.45rem 0.65rem',
+                            borderRadius: '0.25rem',
+                            backgroundColor: isChecked ? '#fffbeb' : 'transparent',
+                            cursor: 'pointer',
+                            fontSize: '0.82rem',
+                            color: isChecked ? '#92400e' : '#334155'
+                          }}
+                        >
+                          <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                            <input
+                              type="checkbox"
+                              checked={isChecked}
+                              onChange={() => toggleStackLayer(b.id)}
+                            />
+                            <span style={{ fontWeight: isChecked ? 600 : 400 }}>{b.label}</span>
+                          </div>
+                          {isChecked && (
+                            <span style={{ backgroundColor: '#d97706', color: '#ffffff', borderRadius: '0.2rem', padding: '0.05rem 0.35rem', fontSize: '0.7rem', fontWeight: 700 }}>
+                              #{orderIdx + 1}
+                            </span>
+                          )}
+                        </label>
+                      );
+                    })}
+                  </div>
+                </div>
+
+                {/* 3. Derived Spectral Indices */}
+                <div style={{ border: '1px solid #e2e8f0', borderRadius: '0.5rem', padding: '1rem' }}>
+                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '0.75rem', borderBottom: '1px solid #f1f5f9', paddingBottom: '0.5rem' }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
+                      <Sliders size={16} color="#2563eb" />
+                      <span style={{ fontSize: '0.85rem', fontWeight: 700, color: '#0f172a' }}>
+                        Derived Spectral Indices (Calculated On-The-Fly)
+                      </span>
+                    </div>
+                  </div>
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: '0.45rem', maxHeight: '280px', overflowY: 'auto' }}>
+                    {AVAILABLE_INDICES.map(idx => {
+                      const isChecked = stackSelectedLayers.includes(idx.id);
+                      const orderIdx = stackSelectedLayers.indexOf(idx.id);
+                      return (
+                        <label
+                          key={idx.id}
+                          style={{
+                            display: 'flex',
+                            alignItems: 'center',
+                            justifyContent: 'space-between',
+                            padding: '0.45rem 0.65rem',
+                            borderRadius: '0.25rem',
+                            backgroundColor: isChecked ? '#eff6ff' : 'transparent',
+                            cursor: 'pointer',
+                            fontSize: '0.82rem',
+                            color: isChecked ? '#1d4ed8' : '#334155'
+                          }}
+                        >
+                          <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                            <input
+                              type="checkbox"
+                              checked={isChecked}
+                              onChange={() => toggleStackLayer(idx.id)}
+                            />
+                            <span style={{ fontWeight: isChecked ? 600 : 400 }}>{idx.label}</span>
+                          </div>
+                          {isChecked && (
+                            <span style={{ backgroundColor: '#2563eb', color: '#ffffff', borderRadius: '0.2rem', padding: '0.05rem 0.35rem', fontSize: '0.7rem', fontWeight: 700 }}>
+                              #{orderIdx + 1}
+                            </span>
+                          )}
+                        </label>
+                      );
+                    })}
+                  </div>
+                </div>
+
+              </div>
+
+              {/* Execution Actions & Output Preview */}
+              <div style={{
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'space-between',
+                paddingTop: '1rem',
+                borderTop: '1px solid #e2e8f0',
+                flexWrap: 'wrap',
+                gap: '1rem'
+              }}>
+                <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', fontSize: '0.85rem', color: '#334155', cursor: 'pointer' }}>
+                  <input
+                    type="checkbox"
+                    checked={stackClipToDistrict}
+                    onChange={(e) => setStackClipToDistrict(e.target.checked)}
+                  />
+                  <span>Mask and clip output layers to district administrative boundary (EPSG:4326)</span>
+                </label>
+
+                <button
+                  onClick={handleExecuteLayerStacking}
+                  disabled={stackLoading || !stackDistrict || stackSelectedLayers.length === 0}
+                  style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: '0.5rem',
+                    backgroundColor: (stackLoading || !stackDistrict || stackSelectedLayers.length === 0) ? '#94a3b8' : '#2563eb',
+                    color: '#ffffff',
+                    fontWeight: 600,
+                    fontSize: '0.9rem',
+                    padding: '0.65rem 1.5rem',
+                    border: 'none',
+                    borderRadius: '0.375rem',
+                    cursor: (stackLoading || !stackDistrict || stackSelectedLayers.length === 0) ? 'not-allowed' : 'pointer',
+                    boxShadow: '0 1px 3px rgba(0,0,0,0.1)'
+                  }}
+                >
+                  {stackLoading ? (
+                    <>
+                      <RefreshCw size={16} className="spin" /> Generating Layer Stack on NAS...
+                    </>
+                  ) : (
+                    <>
+                      <Layers size={16} /> Execute Layer Stacking
+                    </>
+                  )}
+                </button>
+              </div>
+
+            </div>
+
+            {/* Success Result Card */}
+            {stackResult && (
+              <div style={{
+                backgroundColor: '#ffffff',
+                borderRadius: '0.75rem',
+                border: '1px solid #bbf7d0',
+                padding: '1.5rem',
+                boxShadow: '0 4px 6px -1px rgba(0, 0, 0, 0.05)'
+              }}>
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '1rem', flexWrap: 'wrap', gap: '0.5rem' }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                    <CheckCircle size={22} color="#16a34a" />
+                    <h3 style={{ fontSize: '1.1rem', fontWeight: 700, color: '#0f172a', margin: 0 }}>
+                      Layer Stack Generated Successfully
+                    </h3>
+                  </div>
+                  <button
+                    onClick={() => handleDownloadStackedTif(stackResult.output_path, stackResult.filename)}
+                    style={{
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: '0.45rem',
+                      backgroundColor: '#16a34a',
+                      color: '#ffffff',
+                      fontWeight: 600,
+                      fontSize: '0.85rem',
+                      padding: '0.55rem 1.15rem',
+                      borderRadius: '0.375rem',
+                      border: 'none',
+                      cursor: 'pointer',
+                      boxShadow: '0 2px 4px rgba(0,0,0,0.1)'
+                    }}
+                  >
+                    <Download size={16} /> Download Stacked GeoTIFF ({stackResult.file_size_mb} MB)
+                  </button>
+                </div>
+
+                <div style={{
+                  display: 'grid',
+                  gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))',
+                  gap: '1rem',
+                  backgroundColor: '#f8fafc',
+                  padding: '1.25rem',
+                  borderRadius: '0.5rem',
+                  border: '1px solid #e2e8f0',
+                  fontSize: '0.85rem'
+                }}>
+                  <div>
+                    <span style={{ color: '#64748b', display: 'block', fontSize: '0.75rem' }}>OUTPUT FILENAME</span>
+                    <span style={{ fontWeight: 700, color: '#0f172a', fontFamily: 'monospace' }}>{stackResult.filename}</span>
+                  </div>
+                  <div>
+                    <span style={{ color: '#64748b', display: 'block', fontSize: '0.75rem' }}>DISTRICT & SEASON</span>
+                    <span style={{ fontWeight: 600, color: '#0f172a' }}>{stackResult.district} • {stackResult.season}</span>
+                  </div>
+                  <div>
+                    <span style={{ color: '#64748b', display: 'block', fontSize: '0.75rem' }}>TOTAL BANDS & RESOLUTION</span>
+                    <span style={{ fontWeight: 600, color: '#0f172a' }}>{stackResult.total_bands} Bands ({stackResult.dimensions})</span>
+                  </div>
+                  <div>
+                    <span style={{ color: '#64748b', display: 'block', fontSize: '0.75rem' }}>ATTACHMENT ORDER</span>
+                    <span style={{ fontWeight: 700, color: '#2563eb', fontFamily: 'monospace' }}>{(stackResult.layers_order || []).join(' ➔ ')}</span>
+                  </div>
+                </div>
+
+                <div style={{ marginTop: '0.75rem', fontSize: '0.75rem', color: '#64748b', fontFamily: 'monospace' }}>
+                  NAS Path: {stackResult.output_path}
+                </div>
+              </div>
+            )}
+
+            {/* Previously Stacked Files History Table */}
+            <div style={{
+              backgroundColor: '#ffffff',
+              borderRadius: '0.75rem',
+              border: '1px solid #e2e8f0',
+              padding: '1.5rem'
+            }}>
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '1rem', flexWrap: 'wrap', gap: '0.75rem' }}>
+                <div>
+                  <h3 style={{ fontSize: '1.05rem', fontWeight: 700, color: '#0f172a', margin: '0 0 0.25rem 0', display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
+                    <HardDrive size={18} color="#2563eb" /> Existing Layer Stacks on NAS Archive
+                  </h3>
+                  <span style={{ fontSize: '0.8rem', color: '#64748b' }}>
+                    Archived in <code style={{ backgroundColor: '#f1f5f9', padding: '0.1rem 0.3rem', borderRadius: '0.2rem' }}>Composites/stack/</code> directory
+                  </span>
+                </div>
+
+                <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                  <div style={{ position: 'relative' }}>
+                    <Search size={14} style={{ position: 'absolute', left: '0.65rem', top: '50%', transform: 'translateY(-50%)', color: '#94a3b8' }} />
+                    <input
+                      type="text"
+                      placeholder="Search files or district..."
+                      value={stackHistorySearch}
+                      onChange={(e) => setStackHistorySearch(e.target.value)}
+                      style={{ padding: '0.4rem 0.65rem 0.4rem 2rem', borderRadius: '0.375rem', border: '1px solid #cbd5e1', fontSize: '0.8rem' }}
+                    />
+                  </div>
+                  <button
+                    onClick={() => fetchStackHistory(stackDistrict)}
+                    disabled={loadingStackHistory}
+                    title="Refresh History"
+                    style={{ padding: '0.4rem 0.65rem', borderRadius: '0.375rem', border: '1px solid #cbd5e1', backgroundColor: '#ffffff', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '0.35rem', fontSize: '0.8rem', color: '#475569' }}
+                  >
+                    <RefreshCw size={13} className={loadingStackHistory ? 'spin' : ''} /> Refresh
+                  </button>
+                </div>
+              </div>
+
+              <div style={{ overflowX: 'auto' }}>
+                <table style={{ width: '100%', borderCollapse: 'collapse', textAlign: 'left', fontSize: '0.85rem' }}>
+                  <thead>
+                    <tr style={{ backgroundColor: '#f8fafc', borderBottom: '1px solid #e2e8f0', color: '#475569', fontSize: '0.78rem', textTransform: 'uppercase' }}>
+                      <th style={{ padding: '0.75rem 1rem' }}>Stacked File Name</th>
+                      <th style={{ padding: '0.75rem 1rem' }}>District</th>
+                      <th style={{ padding: '0.75rem 1rem' }}>File Size</th>
+                      <th style={{ padding: '0.75rem 1rem' }}>Generated / Modified</th>
+                      <th style={{ padding: '0.75rem 1rem', textAlign: 'right' }}>Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {loadingStackHistory ? (
+                      <tr>
+                        <td colSpan="5" style={{ padding: '2rem', textAlign: 'center', color: '#64748b' }}>
+                          <RefreshCw size={20} className="spin" style={{ display: 'inline-block', marginBottom: '0.5rem' }} />
+                          <div>Checking NAS archive for stacked rasters...</div>
+                        </td>
+                      </tr>
+                    ) : stackHistory.length === 0 ? (
+                      <tr>
+                        <td colSpan="5" style={{ padding: '2rem', textAlign: 'center', color: '#94a3b8' }}>
+                          No layer stacks found in NAS archive for the selected district. Use the studio form above to generate one.
+                        </td>
+                      </tr>
+                    ) : (
+                      stackHistory
+                        .filter(item => {
+                          if (!stackHistorySearch) return true;
+                          const q = stackHistorySearch.toLowerCase();
+                          return (item.filename || '').toLowerCase().includes(q) || (item.district || '').toLowerCase().includes(q);
+                        })
+                        .map((item, idx) => (
+                          <tr key={idx} style={{ borderBottom: '1px solid #f1f5f9' }}>
+                            <td style={{ padding: '0.75rem 1rem', fontWeight: 600, color: '#0f172a', fontFamily: 'monospace', fontSize: '0.82rem' }}>
+                              {item.filename}
+                            </td>
+                            <td style={{ padding: '0.75rem 1rem', color: '#334155' }}>
+                              {item.district || '—'}
+                            </td>
+                            <td style={{ padding: '0.75rem 1rem', fontFamily: 'monospace', color: '#475569' }}>
+                              {item.size_mb} MB
+                            </td>
+                            <td style={{ padding: '0.75rem 1rem', color: '#64748b', fontSize: '0.8rem' }}>
+                              {item.modified_at || '—'}
+                            </td>
+                            <td style={{ padding: '0.75rem 1rem', textAlign: 'right' }}>
+                              <button
+                                onClick={() => handleDownloadStackedTif(item.path, item.filename)}
+                                style={{
+                                  display: 'inline-flex',
+                                  alignItems: 'center',
+                                  gap: '0.35rem',
+                                  padding: '0.35rem 0.75rem',
+                                  borderRadius: '0.375rem',
+                                  backgroundColor: '#eff6ff',
+                                  border: '1px solid #bfdbfe',
+                                  color: '#1d4ed8',
+                                  fontSize: '0.78rem',
+                                  fontWeight: 600,
+                                  cursor: 'pointer'
+                                }}
+                              >
+                                <Download size={13} /> Download .tif
+                              </button>
+                            </td>
+                          </tr>
+                        ))
+                    )}
+                  </tbody>
+                </table>
+              </div>
             </div>
 
           </div>

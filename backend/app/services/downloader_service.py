@@ -993,6 +993,16 @@ def resolve_tif_path(raw_path: str) -> tuple:
     norm_p = os.path.normpath(raw_path)
     if os.path.exists(norm_p):
         return os.path.abspath(norm_p), True
+    if hasattr(settings, "RAW_ARCHIVE_DIR") and settings.RAW_ARCHIVE_DIR:
+        parts = os.path.normpath(raw_path).split(os.sep)
+        if "archive" in parts:
+            rel = os.sep.join(parts[parts.index("archive") + 1:])
+            nas_cand = os.path.join(settings.RAW_ARCHIVE_DIR, rel)
+            if os.path.exists(nas_cand):
+                return os.path.abspath(nas_cand), True
+        nas_cand2 = os.path.join(settings.RAW_ARCHIVE_DIR, os.path.basename(raw_path))
+        if os.path.exists(nas_cand2):
+            return os.path.abspath(nas_cand2), True
     return os.path.abspath(raw_path) if not os.path.isabs(raw_path) else raw_path, False
 
 
@@ -1133,7 +1143,8 @@ def search_downloaded_tifs_by_region(
     satellite: Optional[str] = None,
     band: Optional[str] = None,
     start_date: Optional[str] = None,
-    end_date: Optional[str] = None
+    end_date: Optional[str] = None,
+    composite_interval: Optional[str] = None
 ) -> dict:
     def _clean_str(val):
         if not val or not isinstance(val, str):
@@ -1154,6 +1165,10 @@ def search_downloaded_tifs_by_region(
     band = _clean_str(band)
     start_date = _clean_date(start_date)
     end_date = _clean_date(end_date)
+    
+    clean_interval = _clean_str(composite_interval)
+    if clean_interval:
+        clean_interval = clean_interval.lower()
 
     # 1. Resolve matching tile IDs from district_tiles_mapping & district_boundaries in DB
     tiles = []
@@ -1205,6 +1220,7 @@ def search_downloaded_tifs_by_region(
             "query_district": district,
             "query_satellite": satellite,
             "query_band": band,
+            "query_composite_interval": composite_interval,
             "query_start_date": start_date,
             "query_end_date": end_date,
             "matched_tiles": [],
@@ -1217,86 +1233,138 @@ def search_downloaded_tifs_by_region(
             "tifs": []
         }
 
+    # Filter scenes strictly to those requested/downloaded for the specified district/state
+    # This prevents neighboring districts that share the same 100km MGRS tile from displaying
+    # or downloading data when no acquisition request has been submitted for this district.
+    allowed_scene_ids = None
+    if district or state:
+        from app.models.sdap_models import ProcessJobModel, RequestModel
+        from sqlalchemy import func
+
+        pj_query = db.query(ProcessJobModel.scene_id).join(
+            RequestModel, ProcessJobModel.request_id == RequestModel.id
+        ).filter(
+            ProcessJobModel.scene_id.isnot(None),
+            ProcessJobModel.stage == "DOWNLOAD",
+            ProcessJobModel.status == "COMPLETED"
+        )
+        if district:
+            clean_d = district.split(",")[0].strip().lower()
+            pj_query = pj_query.filter(func.lower(RequestModel.district) == clean_d)
+        if state:
+            clean_s = state.split(",")[0].strip().lower()
+            pj_query = pj_query.filter(func.lower(RequestModel.state) == clean_s)
+
+        allowed_scene_ids = set(r[0] for r in pj_query.distinct().all() if r[0])
+
+        # If user explicitly filtered by district or state, but no scenes were acquired for it:
+        if len(allowed_scene_ids) == 0:
+            return {
+                "query_state": state,
+                "query_district": district,
+                "query_satellite": satellite,
+                "query_band": band,
+                "query_composite_interval": composite_interval,
+                "query_start_date": start_date,
+                "query_end_date": end_date,
+                "matched_tiles": [],
+                "matched_districts": [district] if district else (resolved_districts or []),
+                "total_scenes": 0,
+                "total_tifs": 0,
+                "total_size_bytes": 0,
+                "total_size_mb": 0.0,
+                "tif_paths": [],
+                "tifs": []
+            }
+
     # Support Sentinel-1 tile alias if tile filter was generated from region
     if tiles and (not satellite or "Sentinel-1" in satellite):
         tiles.append("S1_SAR")
 
-    # 2. Build Scene Query
-    scene_query = db.query(SceneModel).filter(SceneModel.status == "HELD")
-    if tiles:
-        scene_query = scene_query.filter(SceneModel.tile.in_(tiles))
-
-    if satellite and satellite.strip():
-        # Handle comma-separated or single satellite
-        sat_parts = [s.strip() for s in satellite.split(",") if s.strip()]
-        if len(sat_parts) == 1:
-            scene_query = scene_query.filter(SceneModel.satellite.ilike(f"%{sat_parts[0]}%"))
-        elif len(sat_parts) > 1:
-            from sqlalchemy import or_
-            or_clauses = [SceneModel.satellite.ilike(f"%{sp}%") for sp in sat_parts]
-            scene_query = scene_query.filter(or_(*or_clauses))
-
-    if start_date:
-        scene_query = scene_query.filter(SceneModel.sensing_date >= start_date)
-    if end_date:
-        scene_query = scene_query.filter(SceneModel.sensing_date <= end_date)
-
-    matched_scenes = scene_query.all()
-    scene_ids = [s.scene_id for s in matched_scenes]
-
     tif_files = []
     tif_paths = []
     total_size = 0
+    matched_scenes = []
 
-    if scene_ids:
-        # 3. Query Band Files from DB using path column
-        bf_query = db.query(BandFileModel).filter(
-            BandFileModel.scene_id.in_(scene_ids),
-            BandFileModel.verified == 1
-        )
+    # 2. Build Scene Query for raw individual scenes (skip if user explicitly requested only interval composite products)
+    skip_raw_scenes = clean_interval in ("weekly", "fortnightly", "monthly")
+    if not skip_raw_scenes:
+        scene_query = db.query(SceneModel).filter(SceneModel.status == "HELD")
+        if tiles:
+            scene_query = scene_query.filter(SceneModel.tile.in_(tiles))
 
-        if band and band.strip() and band.upper() != "ALL":
-            clean_b = band.replace(".tif", "").replace(".tiff", "").strip()
-            if clean_b.upper() in ("VV_VH", "VV/VH", "SAR_RATIO"):
+        # Enforce strict district/state association from acquisition requests
+        if allowed_scene_ids is not None:
+            scene_query = scene_query.filter(SceneModel.scene_id.in_(allowed_scene_ids))
+
+        if satellite and satellite.strip():
+            sat_parts = [s.strip() for s in satellite.split(",") if s.strip()]
+            if len(sat_parts) == 1:
+                scene_query = scene_query.filter(SceneModel.satellite.ilike(f"%{sat_parts[0]}%"))
+            elif len(sat_parts) > 1:
                 from sqlalchemy import or_
-                bf_query = bf_query.filter(or_(
-                    BandFileModel.band.ilike("%VV_VH%"),
-                    BandFileModel.band.ilike("%VV/VH%")
-                ))
-            elif clean_b.upper() in ("COMPOSITE", "COMPOSITES"):
-                from sqlalchemy import or_
-                bf_query = bf_query.filter(or_(
-                    BandFileModel.band.ilike("%Composite%"),
-                    BandFileModel.band.ilike("%clipped%")
-                ))
-            else:
-                bf_query = bf_query.filter(BandFileModel.band.ilike(f"%{clean_b}%"))
+                or_clauses = [SceneModel.satellite.ilike(f"%{sp}%") for sp in sat_parts]
+                scene_query = scene_query.filter(or_(*or_clauses))
 
-        band_records = bf_query.order_by(BandFileModel.tile, BandFileModel.sensing_date, BandFileModel.band).all()
+        if start_date:
+            scene_query = scene_query.filter(SceneModel.sensing_date >= start_date)
+        if end_date:
+            scene_query = scene_query.filter(SceneModel.sensing_date <= end_date)
 
-        for bf in band_records:
-            raw_p = bf.path
-            if not (raw_p.lower().endswith(".tif") or raw_p.lower().endswith(".tiff")):
-                continue
-            path, exists = resolve_tif_path(raw_p)
-            actual_size = os.path.getsize(path) if exists else bf.size_bytes
-            total_size += actual_size
+        matched_scenes = scene_query.all()
+        scene_ids = [s.scene_id for s in matched_scenes]
 
-            tif_paths.append(path)
-            tif_files.append({
-                "scene_id": bf.scene_id,
-                "tile": bf.tile,
-                "sensing_date": bf.sensing_date,
-                "satellite": bf.satellite,
-                "band": bf.band,
-                "path": path,
-                "size_bytes": actual_size,
-                "exists_on_disk": exists
-            })
+        if scene_ids:
+            # 3. Query Band Files from DB using path column
+            bf_query = db.query(BandFileModel).filter(
+                BandFileModel.scene_id.in_(scene_ids),
+                BandFileModel.verified == 1
+            )
+
+            if band and band.strip() and band.upper() != "ALL":
+                clean_b = band.replace(".tif", "").replace(".tiff", "").strip()
+                if clean_b.upper() in ("VV_VH", "VV/VH", "SAR_RATIO"):
+                    from sqlalchemy import or_
+                    bf_query = bf_query.filter(or_(
+                        BandFileModel.band.ilike("%VV_VH%"),
+                        BandFileModel.band.ilike("%VV/VH%")
+                    ))
+                elif clean_b.upper() in ("COMPOSITE", "COMPOSITES"):
+                    from sqlalchemy import or_
+                    bf_query = bf_query.filter(or_(
+                        BandFileModel.band.ilike("%Composite%"),
+                        BandFileModel.band.ilike("%clipped%")
+                    ))
+                else:
+                    bf_query = bf_query.filter(BandFileModel.band.ilike(f"%{clean_b}%"))
+
+            band_records = bf_query.order_by(BandFileModel.tile, BandFileModel.sensing_date, BandFileModel.band).all()
+
+            for bf in band_records:
+                raw_p = bf.path
+                if not (raw_p.lower().endswith(".tif") or raw_p.lower().endswith(".tiff")):
+                    continue
+                path, exists = resolve_tif_path(raw_p)
+                actual_size = os.path.getsize(path) if exists else bf.size_bytes
+                total_size += actual_size
+
+                tif_paths.append(path)
+                tif_files.append({
+                    "scene_id": bf.scene_id,
+                    "tile": bf.tile,
+                    "sensing_date": bf.sensing_date,
+                    "satellite": bf.satellite,
+                    "band": bf.band,
+                    "path": path,
+                    "size_bytes": actual_size,
+                    "exists_on_disk": exists
+                })
 
     # 4. Search NAS Composites directory and local delivery folder for composite / clipped rasters
-    clean_b = (band or "").upper().strip()
-    if clean_b in ("COMPOSITE", "COMPOSITES", "ALL", "NDVI", "LSWI", "VV_VH", "VV/VH"):
+    # Skip if user explicitly requested scene-level only ("none" or "individual")
+    skip_composites = clean_interval in ("none", "individual", "scene")
+    if not skip_composites:
+        clean_b = (band or "").upper().strip()
         import re
         search_dirs = []
         if district and district.strip():
@@ -1321,6 +1389,11 @@ def search_downloaded_tifs_by_region(
                     full_p_lower = full_p.lower()
                     if dist_clean and dist_clean not in full_p_lower:
                         continue
+
+                    # Filter by composite interval if specified (weekly, fortnightly, monthly)
+                    if clean_interval and clean_interval in ("weekly", "fortnightly", "monthly"):
+                        if clean_interval not in full_p_lower:
+                            continue
 
                     f_upper = f.upper()
                     if clean_b in ("COMPOSITE", "COMPOSITES"):
@@ -1360,16 +1433,19 @@ def search_downloaded_tifs_by_region(
                         "exists_on_disk": True
                     })
 
+    total_scenes_cnt = len(matched_scenes) if not skip_raw_scenes else len(set(f["scene_id"] for f in tif_files))
+    actual_tiles = sorted(list(set(s.tile for s in matched_scenes if s.tile))) if matched_scenes else (tiles if not region_filtered else [])
     return {
         "query_state": state,
         "query_district": district,
         "query_satellite": satellite,
         "query_band": band,
+        "query_composite_interval": composite_interval,
         "query_start_date": start_date,
         "query_end_date": end_date,
-        "matched_tiles": tiles,
-        "matched_districts": resolved_districts,
-        "total_scenes": len(matched_scenes),
+        "matched_tiles": actual_tiles,
+        "matched_districts": [district] if district else (resolved_districts or []),
+        "total_scenes": total_scenes_cnt,
         "total_tifs": len(tif_files),
         "total_size_bytes": total_size,
         "total_size_mb": round(total_size / (1024 * 1024), 2),
@@ -1383,56 +1459,47 @@ def get_available_downloaded_regions(db: Session) -> dict:
     Returns only the States and Districts for which data has actually been downloaded
     and stored in PostgreSQL / local storage. Used to populate frontend retrieval dropdowns.
     """
-    held_tiles = [
-        r[0] for r in db.query(SceneModel.tile).filter(
-            SceneModel.status == "HELD"
-        ).distinct().all()
-    ]
-
-    bf_tiles = [
-        r[0] for r in db.query(BandFileModel.tile).filter(
-            BandFileModel.verified == 1
-        ).distinct().all()
-    ]
-
-    all_tiles = list(set(held_tiles + bf_tiles))
-
-    req_rows = db.execute(
-        text("SELECT DISTINCT state, district FROM requests WHERE status IN ('HELD', 'COMPLETED', 'SUCCESS', 'PROCESSING')")
-    ).fetchall()
+    rows = db.execute(text("""
+        SELECT DISTINCT r.state, r.district
+        FROM requests r
+        JOIN process_jobs pj ON pj.request_id = r.id AND pj.stage = 'DOWNLOAD' AND pj.status = 'COMPLETED'
+        JOIN scene s ON pj.scene_id = s.scene_id AND s.status = 'HELD'
+        WHERE r.district IS NOT NULL AND r.district != ''
+        ORDER BY r.state, r.district
+    """)).fetchall()
 
     states_set = set()
     districts_list = []
     seen_districts = set()
 
-    for r in req_rows:
+    for r in rows:
         st, dist = r[0], r[1]
         if st and st.strip():
             states_set.add(st.strip())
         if dist and dist.strip():
-            districts_list.append({"district_name": dist.strip(), "state_name": st.strip() if st else ""})
-            seen_districts.add(dist.strip().lower())
+            key = (st.strip().lower() if st else "", dist.strip().lower())
+            if key not in seen_districts:
+                districts_list.append({"district_name": dist.strip(), "state_name": st.strip() if st else ""})
+                seen_districts.add(key)
 
-    if all_tiles:
-        clean_tiles = [t for t in all_tiles if t != "S1_SAR"]
-        if clean_tiles:
-            mapping_rows = db.execute(
-                text("""
-                    SELECT DISTINCT dtm.district_name, db.state_name
-                    FROM district_tiles_mapping dtm
-                    LEFT JOIN district_boundaries db ON dtm.district_id = db.id
-                    WHERE dtm.tile_id IN :tiles AND dtm.district_name IS NOT NULL
-                """),
-                {"tiles": tuple(clean_tiles) if len(clean_tiles) > 1 else (clean_tiles[0], clean_tiles[0])}
-            ).fetchall()
-
-            for r in mapping_rows:
-                dist_name, st_name = r[0], r[1]
-                if st_name and st_name.strip():
-                    states_set.add(st_name.strip())
-                if dist_name and dist_name.strip() and dist_name.strip().lower() not in seen_districts:
-                    districts_list.append({"district_name": dist_name.strip(), "state_name": st_name.strip() if st_name else ""})
-                    seen_districts.add(dist_name.strip().lower())
+    # Fallback to requests with COMPLETED / HELD status if jobs table is empty
+    if not districts_list:
+        fallback_rows = db.execute(text("""
+            SELECT DISTINCT state, district
+            FROM requests
+            WHERE status IN ('HELD', 'COMPLETED', 'SUCCESS')
+              AND district IS NOT NULL AND district != ''
+            ORDER BY state, district
+        """)).fetchall()
+        for r in fallback_rows:
+            st, dist = r[0], r[1]
+            if st and st.strip():
+                states_set.add(st.strip())
+            if dist and dist.strip():
+                key = (st.strip().lower() if st else "", dist.strip().lower())
+                if key not in seen_districts:
+                    districts_list.append({"district_name": dist.strip(), "state_name": st.strip() if st else ""})
+                    seen_districts.add(key)
 
     sorted_states = sorted(list(states_set))
     sorted_districts = sorted(districts_list, key=lambda x: (x.get("state_name", ""), x.get("district_name", "")))

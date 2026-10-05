@@ -10,7 +10,10 @@ from datetime import datetime
 from app.core.database import get_db, SessionLocal
 from app.core.security import get_current_user, get_current_admin
 from app.models.sdap_models import RequestModel, UserModel, ProcessJobModel
-from app.schemas.request_schema import RequestCreate, RequestResponse, RequestEstimateResponse
+from app.schemas.request_schema import (
+    RequestCreate, RequestResponse, RequestEstimateResponse,
+    LayerStackCreate, LayerStackResponse
+)
 from app.core.config import settings
 
 import threading
@@ -549,6 +552,7 @@ def download_tifs_zip(
     district: Optional[str] = Query(None),
     satellite: Optional[str] = Query(None),
     band: Optional[str] = Query(None),
+    composite_interval: Optional[str] = Query(None, description="Temporal interval: weekly, fortnightly, monthly, or none"),
     start_date: Optional[str] = Query(None),
     end_date: Optional[str] = Query(None),
     token: Optional[str] = Query(None, description="Optional JWT authentication token"),
@@ -564,7 +568,8 @@ def download_tifs_zip(
 
     ret = search_downloaded_tifs_by_region(
         db=db, state=state, district=district, satellite=satellite,
-        band=band, start_date=start_date, end_date=end_date
+        band=band, start_date=start_date, end_date=end_date,
+        composite_interval=composite_interval
     )
 
     tifs = ret.get("tifs", [])
@@ -593,10 +598,21 @@ def download_tifs_zip(
                     arcname = f"{item['tile']}/{item['scene_id']}/{item['band']}.tif"
                 zf.write(p, arcname=arcname)
 
+    import shutil
+    from starlette.background import BackgroundTask
+
+    def _cleanup():
+        try:
+            if os.path.exists(tmp_dir):
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+        except Exception:
+            pass
+
     return FileResponse(
         path=zip_path,
         filename=zip_filename,
-        media_type="application/zip"
+        media_type="application/zip",
+        background=BackgroundTask(_cleanup)
     )
 
 
@@ -606,6 +622,7 @@ def retrieve_tifs_by_region(
     district: Optional[str] = Query(None, description="Filter by District name (e.g. Khammam, Cuttack)"),
     satellite: Optional[str] = Query(None, description="Filter by Satellite (Sentinel-1, Sentinel-2)"),
     band: Optional[str] = Query(None, description="Filter by Band name (e.g. B04, B08, TCI, SCL, VV, VH)"),
+    composite_interval: Optional[str] = Query(None, description="Filter by Composite interval (weekly, fortnightly, monthly, none)"),
     start_date: Optional[str] = Query(None, description="Filter start date YYYY-MM-DD"),
     end_date: Optional[str] = Query(None, description="Filter end date YYYY-MM-DD"),
     db: Session = Depends(get_db),
@@ -624,7 +641,8 @@ def retrieve_tifs_by_region(
         satellite=satellite,
         band=band,
         start_date=start_date,
-        end_date=end_date
+        end_date=end_date,
+        composite_interval=composite_interval
     )
 
 
@@ -761,5 +779,70 @@ def download_request_composite(
         filename=os.path.basename(target_file),
         media_type="image/tiff"
     )
+
+
+@router.post("/layer-stack", response_model=LayerStackResponse, summary="Execute multi-band layer stacking across bands and indices")
+def create_layer_stack(
+    payload: LayerStackCreate,
+    db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_user)
+):
+    """
+    Executes multi-band layer stacking in user's exact chosen selection order:
+    Saves to: {RAW_ARCHIVE_DIR}/Composites/stack/{district}/
+    Filename: {district}_{season}_{start_date}-{end_date}_{bands}.tif
+    """
+    from app.services.stacker_service import execute_layer_stacking
+    try:
+        res = execute_layer_stacking(
+            db=db,
+            district=payload.district,
+            state=payload.state,
+            season=payload.season or "Custom",
+            start_date=payload.start_date,
+            end_date=payload.end_date,
+            layers=payload.layers,
+            clip_to_district=payload.clip_to_district if payload.clip_to_district is not None else True
+        )
+        res["download_url"] = f"/api/v1/requests/layer-stack/download?file_path={res['output_path']}"
+        return res
+    except FileNotFoundError as fnf_err:
+        raise HTTPException(status_code=404, detail=str(fnf_err))
+    except ValueError as val_err:
+        raise HTTPException(status_code=400, detail=str(val_err))
+    except Exception as exc:
+        logger.error(f"Layer stacking failed: {exc}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Layer stacking execution failed: {exc}")
+
+
+@router.get("/layer-stack/download", summary="Download a generated layer-stacked GeoTIFF")
+def download_layer_stack(
+    file_path: str = Query(..., description="Path to the layer-stacked GeoTIFF"),
+    token: Optional[str] = Query(None, description="Optional JWT token"),
+    db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_user)
+):
+    from app.services.downloader_service import resolve_tif_path
+    resolved_path, exists = resolve_tif_path(file_path)
+    if not exists or not os.path.exists(resolved_path):
+        raise HTTPException(status_code=404, detail=f"Layer-stacked GeoTIFF file not found on disk: {file_path}")
+
+    filename = os.path.basename(resolved_path)
+    return FileResponse(
+        path=resolved_path,
+        filename=filename,
+        media_type="image/tiff"
+    )
+
+
+@router.get("/layer-stack/history", summary="List previously generated layer-stacked GeoTIFFs")
+def list_layer_stacks(
+    district: Optional[str] = Query(None, description="Filter by district"),
+    db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_user)
+):
+    from app.services.stacker_service import list_existing_layer_stacks
+    return list_existing_layer_stacks(district=district)
+
 
 

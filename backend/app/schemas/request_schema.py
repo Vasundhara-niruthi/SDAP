@@ -119,3 +119,31 @@ class RequestResponse(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+class LayerStackCreate(BaseModel):
+    state: Optional[str] = None
+    district: str = Field(..., description="Target district name")
+    season: Optional[str] = Field("Kharif", description="Agricultural or meteorological season")
+    start_date: Optional[str] = Field(None, description="Start date bounds (YYYY-MM-DD)")
+    end_date: Optional[str] = Field(None, description="End date bounds (YYYY-MM-DD)")
+    layers: List[str] = Field(..., min_length=1, description="Ordered list of bands and indices to stack")
+    clip_to_district: Optional[bool] = Field(True, description="Clip multi-band stack to district boundary")
+
+
+class LayerStackResponse(BaseModel):
+    status: str
+    message: str
+    output_path: str
+    filename: str
+    file_size_mb: float
+    file_size_bytes: int
+    total_bands: int
+    layers_order: List[str]
+    district: str
+    state: Optional[str] = None
+    season: str
+    date_range: str
+    crs: str
+    dimensions: str
+    download_url: Optional[str] = None
