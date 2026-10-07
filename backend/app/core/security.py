@@ -83,7 +83,7 @@ def get_current_user(
 
 def get_current_admin(current_user: UserModel = Depends(get_current_user)) -> UserModel:
     """FastAPI Dependency: Ensure current user has ADMIN role."""
-    if current_user.role != "ADMIN":
+    if (current_user.role or "").strip().upper() != "ADMIN":
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Access restricted to System Administrators only"

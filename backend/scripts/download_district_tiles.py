@@ -38,7 +38,7 @@ from app.core.config import settings
 from app.core.database import SessionLocal
 from app.models.sdap_models import SceneModel, RequestModel, ProcessJobModel
 from app.services.gap_check_service import perform_gap_check, get_all_mapped_districts, get_tiles_for_state
-from app.services.downloader_service import download_and_verify_scene
+from app.services.downloader_service import download_and_verify_scene, ensure_nas_connection, prune_empty_dirs
 from scripts.cloud_removal_and_indices import process_and_save_indices
 from app.services.processor_service import compute_full_tile_index
 from app.services.delivery_service import produce_district_delivery_output
@@ -295,7 +295,8 @@ def run_district_acquisition_pipeline(
     request_id: int = 1,
     state_name: str = None,
     max_cloud_cover: float = 100.0,
-    composite_interval: str = "none"
+    composite_interval: str = "none",
+    level: str = "max"
 ) -> bool:
     """
     Executes the complete SDAP acquisition & processing workflow for a district.
@@ -312,17 +313,22 @@ def run_district_acquisition_pipeline(
 
     db = SessionLocal()
     try:
-        # Use composite_interval from the request record if not given explicitly
-        if (not composite_interval or composite_interval.lower() == "none") and request_id:
+        # Use composite_interval and level from the request record if available
+        if request_id:
             req_rec = db.query(RequestModel).filter(RequestModel.id == request_id).first()
-            if req_rec and req_rec.composite_interval and req_rec.composite_interval.lower() != "none":
-                composite_interval = req_rec.composite_interval
+            if req_rec:
+                if (not composite_interval or composite_interval.lower() == "none") and req_rec.composite_interval and req_rec.composite_interval.lower() != "none":
+                    composite_interval = req_rec.composite_interval
+                if not level or level == "max":
+                    level = getattr(req_rec, "level", "max") or "max"
+
+        level = (level or "max").lower().strip()
 
         banner_top = "=" * 78
         header_title = f"SDAP PIPELINE EXECUTION | District: {district_name} ({state_name or 'Auto'})"
         header_sub = (
             f"Range: {start_date} to {end_date} | Satellite: {satellite} | Indices: {indices} | "
-            f"Max Cloud: {max_cloud_cover}% | Composite: {composite_interval.upper() if composite_interval else 'NONE'}"
+            f"Level: {level.upper()} | Max Cloud: {max_cloud_cover}% | Composite: {composite_interval.upper() if composite_interval else 'NONE'}"
         )
         logger.info(banner_top)
         logger.info(header_title)
@@ -426,6 +432,20 @@ def run_district_acquisition_pipeline(
         req_record = db.query(RequestModel).filter(RequestModel.id == request_id).first()
         user_id = req_record.user_id if req_record else None
 
+        # Pre-check NAS connectivity if there are missing scenes to process
+        nas_root = getattr(settings, "RAW_ARCHIVE_DIR", "")
+        if len(missing_scenes) > 0 and nas_root:
+            if nas_root.startswith("\\\\") or ":" in nas_root:
+                if not ensure_nas_connection(nas_root):
+                    nas_err_msg = (
+                        f"[NAS_CONNECTION_ERROR] Target NAS storage '{nas_root}' is disconnected or unreachable. "
+                        "Aborting download pipeline immediately. Local storage fallback is strictly prohibited to preserve local disk space."
+                    )
+                    logger.error(nas_err_msg)
+                    append_request_log(db, request_id, nas_err_msg, level="ERROR")
+                    _update_job(db, dl_job, "FAILED", error_log=nas_err_msg)
+                    return False
+
         downloaded_count = 0       # actually fetched from S3 in this run
         nas_cached_count = 0       # found valid on NAS, download skipped
         failed_count = 0
@@ -502,11 +522,18 @@ def run_district_acquisition_pipeline(
             else:
                 failed_count += 1
                 failed_bands = [b['band'] for b in band_details if not b.get('ok')]
-                append_request_log(
-                    db, request_id,
-                    f"     ⚠ WARN: Scene '{sc['scene_id']}' download failed (Incomplete bands: {failed_bands}) - remains PENDING.",
-                    level="WARNING"
-                )
+                if dl_log and "[NAS_ERROR]" in dl_log:
+                    append_request_log(
+                        db, request_id,
+                        f"     ❌ {dl_log}",
+                        level="ERROR"
+                    )
+                else:
+                    append_request_log(
+                        db, request_id,
+                        f"     ⚠ WARN: Scene '{sc['scene_id']}' download failed (Incomplete bands: {failed_bands}) - remains PENDING.",
+                        level="WARNING"
+                    )
 
         dl_summary = (
             f"  ✓ Stage 2 Complete: {downloaded_count} downloaded, {nas_cached_count} already on NAS "
@@ -729,7 +756,7 @@ def run_district_acquisition_pipeline(
                 append_request_log(db, request_id, "[STOPPED] Pipeline halted before compositing because request was cancelled.", level="WARNING")
                 return False
 
-            append_request_log(db, request_id, f"\n[STAGE 4/4] TEMPORAL COMPOSITING ({composite_interval.upper()})")
+            append_request_log(db, request_id, f"\n[STAGE 4/4] TEMPORAL COMPOSITING ({composite_interval.upper()} - LEVEL: {level.upper()})")
             comp_job = _get_or_create_job(db, request_id, "DELIVERY_CLIP")
             _update_job(db, comp_job, "RUNNING")
             try:
@@ -737,7 +764,8 @@ def run_district_acquisition_pipeline(
                 run_temporal_compositing_for_request(
                     db=db,
                     request_id=request_id,
-                    composite_interval=composite_interval
+                    composite_interval=composite_interval,
+                    level=level
                 )
                 _update_job(db, comp_job, "COMPLETED")
             except Exception as comp_err:
@@ -798,6 +826,7 @@ def run_district_acquisition_pipeline(
                             os.remove(ip)
                         except Exception:
                             pass
+                prune_empty_dirs(stg_dir)
                 logger.info(f"Cleaned up local staging directory: '{stg_dir}'")
         except Exception as stg_err:
             logger.warning(f"Staging cleanup error: {stg_err}")

@@ -234,15 +234,21 @@ def create_temporal_composite_raster(
     input_raster_paths: List[str],
     output_path: str,
     district_geom: Optional[dict] = None,
-    target_crs: str = "EPSG:4326"
+    target_crs: str = "EPSG:4326",
+    method: str = "max"
 ) -> Optional[Dict[str, Any]]:
     """
-    Computes a single seamless cloud-masked Maximum Value Composite (MVC) GeoTIFF
+    Computes a single seamless cloud-masked Composite GeoTIFF
     from a list of multi-day index rasters across one or more tiles.
+    
+    Supported methods / levels:
+      - 'max': Maximum Value Composite (MVC / nanmax)
+      - 'min': Minimum Value Composite (nanmin)
+      - 'mean': Average Value Composite (pixel-wise sum / count)
     
     Steps:
       1. Reprojects all rasters to unified target CRS (EPSG:4326).
-      2. Mosaics & stacks temporal scenes using maximum value pixel composite (nanmax).
+      2. Mosaics & stacks temporal scenes using requested aggregation method.
       3. Clips to district polygon boundary if provided.
       4. Saves compressed GeoTIFF with LZW predictor.
       5. Calculates clear coverage percentage & mean index value.
@@ -253,6 +259,7 @@ def create_temporal_composite_raster(
         return None
 
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    method_clean = (method or "max").lower().strip()
 
     with tempfile.TemporaryDirectory() as tmp_dir:
         # Step 1: Reproject all candidate rasters to unified target CRS (EPSG:4326)
@@ -295,11 +302,26 @@ def create_temporal_composite_raster(
             logger.error("Failed to reproject any input rasters for compositing.")
             return None
 
-        # Step 2: Temporal Merge with Maximum Value Composite (MVC / method='max')
+        # Step 2: Temporal Merge with selected method ('max', 'min', 'mean')
         opened_srcs = [rasterio.open(p) for p in reprojected_paths]
         mosaic_meta = opened_srcs[0].profile.copy()
         try:
-            mosaic_arr, mosaic_transform = merge(opened_srcs, method="max", nodata=np.nan)
+            if method_clean == "min":
+                mosaic_arr, mosaic_transform = merge(opened_srcs, method="min", nodata=np.nan)
+            elif method_clean == "mean":
+                sum_arr, mosaic_transform = merge(opened_srcs, method="sum", nodata=np.nan)
+                # Count valid non-nodata pixels across source rasters
+                opened_count_srcs = [rasterio.open(p) for p in reprojected_paths]
+                try:
+                    count_arr, _ = merge(opened_count_srcs, method="count", nodata=np.nan)
+                finally:
+                    for cs in opened_count_srcs:
+                        cs.close()
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    mosaic_arr = np.where(count_arr > 0, sum_arr / count_arr, np.nan).astype("float32")
+            else:
+                # Default to max (Maximum Value Composite)
+                mosaic_arr, mosaic_transform = merge(opened_srcs, method="max", nodata=np.nan)
         finally:
             for s in opened_srcs:
                 s.close()
@@ -383,12 +405,13 @@ def create_temporal_composite_raster(
 def run_temporal_compositing_for_request(
     db: Session,
     request_id: int,
-    composite_interval: Optional[str] = None
+    composite_interval: Optional[str] = None,
+    level: Optional[str] = None
 ) -> List[Dict[str, Any]]:
     """
     Executes Stage 4 Temporal Compositing for a given processing request.
     Generates single merged composite GeoTIFF files for all days in each interval window
-    for every requested spectral index (NDVI, LSWI).
+    for every requested spectral index (NDVI, LSWI) aggregated using the specified level ('max', 'min', 'mean').
     """
     req = db.query(RequestModel).filter(RequestModel.id == request_id).first()
     if not req:
@@ -399,6 +422,10 @@ def run_temporal_compositing_for_request(
     if not interval or interval.lower() in ("none", "null", "false"):
         logger.info(f"Request #{request_id} composite interval is '{interval}' (no compositing requested).")
         return []
+
+    req_level = (level or getattr(req, "level", "max") or "max").lower().strip()
+    if req_level not in ("max", "min", "mean"):
+        req_level = "max"
 
     district_name = req.district or req.state or "Region"
     start_str = req.start_date.strftime("%Y-%m-%d")
@@ -420,7 +447,7 @@ def run_temporal_compositing_for_request(
 
     header_msg = (
         f"\n==============================================================================\n"
-        f"  [STAGE 4/4] TEMPORAL COMPOSITING & DISTRICT MOSAICING (Interval: '{interval.upper()}')\n"
+        f"  [STAGE 4/4] TEMPORAL COMPOSITING & DISTRICT MOSAICING (Interval: '{interval.upper()}', Level: '{req_level.upper()}')\n"
         f"  District: {district_name} | Date Windows ({len(windows)}): {', '.join([w['label'] for w in windows])}\n"
         f"=============================================================================="
     )
@@ -469,7 +496,7 @@ def run_temporal_compositing_for_request(
                 append_request_log(db, request_id, warn_msg, level="WARNING")
                 continue
 
-            out_filename = f"Composite_{idx_clean}_{interval.lower()}_{district_name}_{w_start.replace('-', '')}_{w_end.replace('-', '')}.tif"
+            out_filename = f"Composite_{idx_clean}_{req_level}_{interval.lower()}_{district_name}_{w_start.replace('-', '')}_{w_end.replace('-', '')}.tif"
             nas_out_path = os.path.join(nas_composite_dir, out_filename)
             local_out_path = os.path.join(local_delivery_dir, out_filename)
 
@@ -517,7 +544,7 @@ def run_temporal_compositing_for_request(
                     composite_results.append(stats)
 
                     comp_log = (
-                        f"     ✓ [{idx_clean} COMPOSITE ALREADY EXISTS - SKIPPED] Window '{w_label}' ({w_start} to {w_end}) "
+                        f"     ✓ [{idx_clean} ({req_level.upper()}) COMPOSITE ALREADY EXISTS - SKIPPED] Window '{w_label}' ({w_start} to {w_end}) "
                         f"verified on NAS -> '{out_filename}' ({stats['file_size_mb']:.1f} MB, Clear Coverage: {stats['coverage_pct']:.1f}%)."
                     )
                     logger.info(comp_log)
@@ -530,7 +557,8 @@ def run_temporal_compositing_for_request(
                 input_raster_paths=input_rasters,
                 output_path=nas_out_path,
                 district_geom=geom_dict,
-                target_crs="EPSG:4326"
+                target_crs="EPSG:4326",
+                method=req_level
             )
 
             if stats:
@@ -547,7 +575,7 @@ def run_temporal_compositing_for_request(
                 composite_results.append(stats)
 
                 comp_log = (
-                    f"     ✓ [{idx_clean} TEMPORAL COMPOSITE CREATED] Window '{w_label}' ({w_start} to {w_end}) "
+                    f"     ✓ [{idx_clean} ({req_level.upper()}) TEMPORAL COMPOSITE CREATED] Window '{w_label}' ({w_start} to {w_end}) "
                     f"merged from {stats['input_scenes_count']} scene days -> Saved '{out_filename}' "
                     f"({stats['file_size_mb']:.1f} MB, Clear Coverage: {stats['coverage_pct']:.1f}%, Mean: {stats['mean_value']:.4f})."
                 )

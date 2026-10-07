@@ -26,8 +26,8 @@ class RequestCreate(BaseModel):
     indices: List[str] = Field(default=["NDVI", "LSWI"], example=["NDVI", "LSWI"])
     composite_interval: Optional[str] = Field("none", example="fortnightly")  # none, weekly, fortnightly, monthly
     max_cloud_cover: Optional[float] = Field(100.0, ge=0.0, le=100.0, example=100.0)
-    max_cloud_cover: Optional[int] = Field(100, ge=0, le=100, example=100)
-    priority: Optional[str] = Field("normal", example="high")  # high, normal, low
+    level: Optional[str] = Field("max", example="max", description="Calculation level for NDVI & LSWI: 'max', 'min', or 'mean'")
+    priority: Optional[str] = Field("normal", example="normal")  # Kept for backward compatibility
     delivery_outputs: Optional[List[str]] = Field(default=["clipped_images"], example=["clipped_images"])
 
     @field_validator("satellite")
@@ -109,9 +109,9 @@ class RequestResponse(BaseModel):
     bands: Optional[List[str]]
     indices: Optional[List[str]]
     composite_interval: Optional[str]
-    max_cloud_cover: Optional[float] = 100.0
-    max_cloud_cover: Optional[int] = 100
-    priority: Optional[str]
+    max_cloud_cover: Optional[int] = 20
+    level: Optional[str] = "max"
+
     status: str
     storage_estimated_gb: Optional[float]
     execution_logs: Optional[str] = None
@@ -129,6 +129,9 @@ class LayerStackCreate(BaseModel):
     end_date: Optional[str] = Field(None, description="End date bounds (YYYY-MM-DD)")
     layers: List[str] = Field(..., min_length=1, description="Ordered list of bands and indices to stack")
     clip_to_district: Optional[bool] = Field(True, description="Clip multi-band stack to district boundary")
+    output_filename: Optional[str] = Field(None, description="Preserve exact original filename or custom name")
+    selected_files: Optional[List[str]] = Field(None, description="Specific file paths to stack")
+    request_id: Optional[int] = Field(None, description="Associated request ID")
 
 
 class LayerStackResponse(BaseModel):

@@ -169,6 +169,7 @@ def run_pipeline_background(request_id: int):
         indices = req.indices if isinstance(req.indices, list) and req.indices else ["NDVI", "LSWI"]
 
         max_cloud_cover = float(getattr(req, "max_cloud_cover", 100.0) or 100.0)
+        req_level = (getattr(req, "level", "max") or "max").lower().strip()
 
         from scripts.download_district_tiles import run_district_acquisition_pipeline
         ok = run_district_acquisition_pipeline(
@@ -179,7 +180,8 @@ def run_pipeline_background(request_id: int):
             indices=indices,
             request_id=req.id,
             max_cloud_cover=max_cloud_cover,
-            composite_interval=req.composite_interval or "none"
+            composite_interval=req.composite_interval or "none",
+            level=req_level
         )
         db.refresh(req)
         # Only overwrite status if user didn't stop it during execution
@@ -222,8 +224,8 @@ def build_request_response(req: RequestModel) -> RequestResponse:
         bands=req.bands,
         indices=req.indices,
         composite_interval=req.composite_interval,
-        max_cloud_cover=getattr(req, "max_cloud_cover", 100.0) or 100.0,
-        priority=req.priority,
+        max_cloud_cover=getattr(req, "max_cloud_cover", 20) or 20,
+        level=getattr(req, "level", "max") or "max",
         status=req.status,
         storage_estimated_gb=req.storage_estimated_gb,
         execution_logs=req.execution_logs,
@@ -325,7 +327,8 @@ def create_request(
         indices=req_in.indices,
         composite_interval=req_in.composite_interval,
         max_cloud_cover=getattr(req_in, "max_cloud_cover", 100.0) or 100.0,
-        priority=req_in.priority,
+        level=(getattr(req_in, "level", "max") or "max").lower().strip(),
+        
         status=req_status,
         storage_estimated_gb=est["estimated_total_gb"]
     )
@@ -368,7 +371,8 @@ def list_requests(
       - otherwise: sees all requests.
     """
     query = db.query(RequestModel).options(joinedload(RequestModel.user))
-    if current_user.role != "ADMIN" or scope == "mine":
+    is_admin = (current_user.role or "").strip().upper() == "ADMIN"
+    if not is_admin or scope == "mine":
         query = query.filter(RequestModel.user_id == current_user.id)
     elif user_id is not None:
         query = query.filter(RequestModel.user_id == user_id)
@@ -708,12 +712,15 @@ def get_request_composites(
                         if full_p not in seen:
                             seen.add(full_p)
                             size_mb = os.path.getsize(full_p) / (1024 * 1024)
+                            idx_type = "LSWI" if "LSWI" in f.upper() else ("NDVI" if "NDVI" in f.upper() else "INDEX")
+                            inferred_interval = interval if interval != "none" else ("weekly" if "weekly" in f.lower() else ("fortnightly" if "fortnightly" in f.lower() else ("monthly" if "monthly" in f.lower() else "none")))
                             composites.append({
                                 "filename": f,
                                 "path": full_p,
                                 "size_mb": round(size_mb, 2),
-                                "composite_interval": interval,
+                                "composite_interval": inferred_interval,
                                 "district": district_name,
+                                "index": idx_type,
                                 "download_url": f"/api/v1/requests/{request_id}/composites/download?filename={f}"
                             })
 
@@ -802,7 +809,9 @@ def create_layer_stack(
             start_date=payload.start_date,
             end_date=payload.end_date,
             layers=payload.layers,
-            clip_to_district=payload.clip_to_district if payload.clip_to_district is not None else True
+            clip_to_district=payload.clip_to_district if payload.clip_to_district is not None else True,
+            output_filename=getattr(payload, "output_filename", None),
+            selected_files=getattr(payload, "selected_files", None)
         )
         res["download_url"] = f"/api/v1/requests/layer-stack/download?file_path={res['output_path']}"
         return res
@@ -843,6 +852,20 @@ def list_layer_stacks(
 ):
     from app.services.stacker_service import list_existing_layer_stacks
     return list_existing_layer_stacks(district=district)
+
+
+@router.get("/admin/daily-storage", summary="Admin Daily Storage Overview")
+def get_admin_daily_storage(
+    start_date: Optional[str] = Query(None, description="Start date YYYY-MM-DD"),
+    end_date: Optional[str] = Query(None, description="End date YYYY-MM-DD"),
+    db: Session = Depends(get_db),
+    admin: UserModel = Depends(get_current_admin)
+):
+    """
+    Admin-only endpoint returning daily storage occupancy and request volume metrics.
+    """
+    from app.services.analytics_service import get_daily_storage_analytics
+    return get_daily_storage_analytics(db=db, start_date=start_date, end_date=end_date)
 
 
 

@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session, joinedload
 from sqlalchemy import func
-from typing import List
+from typing import List, Optional
 
 from app.core.database import get_db
 from app.core.security import get_current_admin, hash_password
@@ -129,8 +129,21 @@ def delete_user(
     if not user:
         raise HTTPException(status_code=404, detail="User account not found")
 
-    # Cascade delete associated user requests
-    db.query(RequestModel).filter(RequestModel.user_id == user_id).delete()
+    from app.models.sdap_models import ProcessJobModel, TileSceneMetadataModel, Sentinel1SceneMetadataModel
+    # Cascade clean up associated process jobs and user requests
+    user_reqs = db.query(RequestModel.id).filter(RequestModel.user_id == user_id).all()
+    req_ids = [r[0] for r in user_reqs]
+    if req_ids:
+        db.query(ProcessJobModel).filter(ProcessJobModel.request_id.in_(req_ids)).delete(synchronize_session=False)
+        db.query(RequestModel).filter(RequestModel.id.in_(req_ids)).delete(synchronize_session=False)
+
+    # Detach granules or scenes downloaded by this user
+    try:
+        db.query(TileSceneMetadataModel).filter(TileSceneMetadataModel.downloaded_by_user_id == user_id).update({"downloaded_by_user_id": None}, synchronize_session=False)
+        db.query(Sentinel1SceneMetadataModel).filter(Sentinel1SceneMetadataModel.downloaded_by_user_id == user_id).update({"downloaded_by_user_id": None}, synchronize_session=False)
+    except Exception:
+        pass
+
     db.delete(user)
     db.commit()
     return None
@@ -150,4 +163,19 @@ def get_work_breakdown(
         "audit": migration_mgr.audit_user_directory(),
         "work_breakdown": migration_mgr.get_user_work_breakdown()
     }
+
+
+@router.get("/analytics/daily-storage", summary="Get Daily Request & Physical Storage Analytics (Admin Only)")
+def get_daily_storage_analytics_endpoint(
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    db: Session = Depends(get_db),
+    admin: UserModel = Depends(get_current_admin)
+):
+    """
+    Admin-only endpoint to retrieve daily request and physical storage occupancy metrics,
+    cumulative totals, and request breakdown over time.
+    """
+    from app.services.analytics_service import get_daily_storage_analytics
+    return get_daily_storage_analytics(db=db, start_date=start_date, end_date=end_date)
 

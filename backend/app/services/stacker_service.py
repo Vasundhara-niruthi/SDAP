@@ -310,7 +310,9 @@ def execute_layer_stacking(
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
     layers: Optional[List[str]] = None,
-    clip_to_district: bool = True
+    clip_to_district: bool = True,
+    output_filename: Optional[str] = None,
+    selected_files: Optional[List[str]] = None
 ) -> Dict[str, Any]:
     """
     Executes ordered layer stacking of selected bands and indices for a district.
@@ -365,23 +367,39 @@ def execute_layer_stacking(
     # 3. Locate files for each needed raw band
     raw_band_paths = {}
     sample_candidate_paths = []
+    filter_norm_paths = set(_normalize_unc_path(p) for p in selected_files) if selected_files else set()
+
     for b_name in needed_raw_bands:
-        paths = find_band_rasters_for_district(
-            db=db,
-            district=clean_dist,
-            state=clean_state,
-            band_name=b_name,
-            start_date=s_clean,
-            end_date=e_clean
-        )
-        if not paths:
-            # Try without strict date bounds for held rasters
+        # Check if selected_files provides direct paths for this band
+        direct_selected = [
+            p for p in filter_norm_paths
+            if os.path.basename(p).upper().startswith(b_name)
+            or f"/{b_name.lower()}." in p.lower()
+            or f"/{b_name.lower()}/" in p.lower()
+        ]
+        if direct_selected:
+            paths = direct_selected
+        else:
             paths = find_band_rasters_for_district(
                 db=db,
                 district=clean_dist,
                 state=clean_state,
-                band_name=b_name
+                band_name=b_name,
+                start_date=s_clean,
+                end_date=e_clean
             )
+            if not paths:
+                # Try without strict date bounds for held rasters
+                paths = find_band_rasters_for_district(
+                    db=db,
+                    district=clean_dist,
+                    state=clean_state,
+                    band_name=b_name
+                )
+            if filter_norm_paths:
+                subset = [p for p in paths if _normalize_unc_path(p) in filter_norm_paths]
+                if subset:
+                    paths = subset
 
         if not paths:
             raise FileNotFoundError(
@@ -449,13 +467,28 @@ def execute_layer_stacking(
         target_dir = local_fallback_dir
         os.makedirs(target_dir, exist_ok=True)
 
-    # File name formatting: {district}_{season}_{start-date}_{end-date}_{bands}.tif
-    d_range_str = f"{s_clean.replace('-', '')}-{e_clean.replace('-', '')}"
-    bands_str = "_".join(layer_names_ordered)
-    clean_fn_dist = clean_dist.replace(" ", "_")
-    clean_fn_season = clean_season.replace(" ", "_")
+    # File name formatting: preserve original filename if requested or if single band/index is stacked
+    if output_filename and output_filename.strip():
+        fn_clean = output_filename.strip()
+        if not (fn_clean.lower().endswith(".tif") or fn_clean.lower().endswith(".tiff")):
+            fn_clean += ".tif"
+        filename = fn_clean
+    elif len(layer_names_ordered) == 1:
+        # User specified requirement:
+        # "ex. if user select the NDVI which are already downloaded NDVI are stcaking right. while stacking don't change it's file name which are before keep filename same."
+        if selected_files and len(selected_files) > 0:
+            filename = os.path.basename(selected_files[0])
+        elif raw_band_paths.get(layer_names_ordered[0]):
+            filename = os.path.basename(raw_band_paths[layer_names_ordered[0]][0])
+        else:
+            filename = f"{layer_names_ordered[0]}.tif"
+    else:
+        d_range_str = f"{s_clean.replace('-', '')}-{e_clean.replace('-', '')}"
+        bands_str = "_".join(layer_names_ordered)
+        clean_fn_dist = clean_dist.replace(" ", "_")
+        clean_fn_season = clean_season.replace(" ", "_")
+        filename = f"{clean_fn_dist}_{clean_fn_season}_{d_range_str}_{bands_str}.tif"
 
-    filename = f"{clean_fn_dist}_{clean_fn_season}_{d_range_str}_{bands_str}.tif"
     output_file_path = os.path.join(target_dir, filename)
 
     # 8. Write Multi-band Layer Stacked GeoTIFF

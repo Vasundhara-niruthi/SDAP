@@ -155,12 +155,51 @@ def ensure_nas_connection(path: str) -> bool:
     return os.path.exists(unc_share) or os.path.exists(path)
 
 
+def prune_empty_dirs(root_dir: str):
+    """
+    Recursively prunes all empty directories inside root_dir from bottom up.
+    Ensures no leftover empty folders remain in local staging tree.
+    """
+    if not root_dir or not os.path.exists(root_dir):
+        return
+    try:
+        for dirpath, dirnames, filenames in os.walk(root_dir, topdown=False):
+            if dirpath == root_dir:
+                continue
+            try:
+                if not os.listdir(dirpath):
+                    os.rmdir(dirpath)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+def prune_empty_parent_dirs(path: str, stop_at: str = None):
+    """
+    Traverses upwards from the parent directory of path, removing empty directories
+    until reaching stop_at (or non-empty folder).
+    """
+    try:
+        curr = os.path.dirname(os.path.abspath(path))
+        stop = os.path.abspath(stop_at) if stop_at else None
+        while curr and curr != stop and (not stop or curr.startswith(stop)):
+            if os.path.isdir(curr) and not os.listdir(curr):
+                os.rmdir(curr)
+                curr = os.path.dirname(curr)
+            else:
+                break
+    except Exception:
+        pass
+
+
 def safe_move_file(src: str, dst: str, max_retries: int = 5, delay: float = 0.5) -> bool:
     """
-    Safely moves a file from src to dst on Windows / Network share.
-    Retries up to max_retries if Windows file lock [WinError 32] or network latency occurs.
-    Auto-reconnects NAS UNC share if WinError 53/67/64 occurs and retries.
-    Falls back to local archive directory if NAS network share is completely unreachable.
+    Safely moves a file from local staging (src) to destination on NAS (dst).
+    Automatically reconnects NAS UNC network share if disconnected.
+    IMPORTANT: If NAS is unavailable or connection fails, local fallback is STRICTLY PROHIBITED.
+    The temporary staged file is deleted immediately, empty staging directories are pruned,
+    and a clear error is logged and raised.
     """
     if not os.path.exists(src):
         if os.path.exists(dst):
@@ -168,20 +207,40 @@ def safe_move_file(src: str, dst: str, max_retries: int = 5, delay: float = 0.5)
         logger.warning(f"safe_move_file source file missing: {src}")
         return False
 
-    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    # Check and ensure NAS connection if target is a network path
     if dst.startswith("\\\\"):
-        ensure_nas_connection(dst)
+        if not ensure_nas_connection(dst):
+            # Clean up local staging file immediately
+            if os.path.exists(src):
+                try:
+                    os.remove(src)
+                    logger.info(f"Cleaned up local staging file '{src}' due to unavailable NAS destination.")
+                except Exception:
+                    pass
+            prune_empty_parent_dirs(src, stop_at=getattr(settings, "STAGING_DIR", None))
+            err_msg = f"[NAS_ERROR] Cannot move file: NAS path '{dst}' is unreachable or disconnected. File removed from local staging; local storage is prohibited."
+            logger.error(err_msg)
+            raise RuntimeError(err_msg)
 
     try:
         os.makedirs(os.path.dirname(dst), exist_ok=True)
-    except Exception:
+    except Exception as mk_err:
         if dst.startswith("\\\\"):
             ensure_nas_connection(dst)
             try:
                 os.makedirs(os.path.dirname(dst), exist_ok=True)
-            except Exception:
-                pass
+            except Exception as mk_err2:
+                if os.path.exists(src):
+                    try:
+                        os.remove(src)
+                    except Exception:
+                        pass
+                prune_empty_parent_dirs(src, stop_at=getattr(settings, "STAGING_DIR", None))
+                err_msg = f"[NAS_ERROR] Failed creating directory on NAS '{os.path.dirname(dst)}': {mk_err2}. Staged file deleted; local storage prohibited."
+                logger.error(err_msg)
+                raise RuntimeError(err_msg)
 
+    last_error = None
     for attempt in range(1, max_retries + 1):
         try:
             if os.path.exists(dst):
@@ -194,36 +253,30 @@ def safe_move_file(src: str, dst: str, max_retries: int = 5, delay: float = 0.5)
                 os.remove(src)
             except Exception:
                 pass
+            # Prune empty parent directories inside local staging
+            prune_empty_parent_dirs(src, stop_at=getattr(settings, "STAGING_DIR", None))
             return True
         except Exception as e:
+            last_error = e
             if dst.startswith("\\\\"):
                 ensure_nas_connection(dst)
                 try:
                     os.makedirs(os.path.dirname(dst), exist_ok=True)
                 except Exception:
                     pass
-
-            if attempt == max_retries:
-                logger.warning(f"Could not move {src} -> {dst} after {max_retries} attempts: {e}")
-                # Failure-Safe Local Fallback: if NAS UNC network share is down, save to local fallback archive
-                if dst.startswith("\\\\"):
-                    local_fallback_root = os.path.abspath("data/archive")
-                    rel_p = dst.split("SDAP_DATA_STORAGE\\")[-1] if "SDAP_DATA_STORAGE\\" in dst else os.path.basename(dst)
-                    fallback_dst = os.path.join(local_fallback_root, rel_p)
-                    logger.warning(f"NAS network share unreachable ({e}). Saving scene raster to local fallback: {fallback_dst}")
-                    try:
-                        os.makedirs(os.path.dirname(fallback_dst), exist_ok=True)
-                        shutil.copy2(src, fallback_dst)
-                        try:
-                            os.remove(src)
-                        except Exception:
-                            pass
-                        return True
-                    except Exception as fb_err:
-                        logger.error(f"Fallback save failed: {fb_err}")
-                raise e
             time.sleep(delay)
-    return False
+
+    # If all attempts failed: Clean up local staging file and fail without local fallback!
+    if os.path.exists(src):
+        try:
+            os.remove(src)
+            logger.info(f"Deleted local staging file '{src}' after {max_retries} failed NAS transfer attempts.")
+        except Exception:
+            pass
+    prune_empty_parent_dirs(src, stop_at=getattr(settings, "STAGING_DIR", None))
+    err_msg = f"[NAS_ERROR] Could not transfer file to NAS '{dst}' after {max_retries} attempts: {last_error}. Download discarded; not stored in local directory."
+    logger.error(err_msg)
+    raise RuntimeError(err_msg)
 
 def fetch_s3_object(key: str, target_path: str, bucket: str = None, client: boto3.client = None) -> bool:
     """
@@ -564,7 +617,13 @@ def download_and_verify_scene(
 
     scene_archive_dir = os.path.join(archive_dir, tile, year, month, folder)
     if scene_archive_dir.startswith("\\\\") or ":" in scene_archive_dir:
-        ensure_nas_connection(scene_archive_dir)
+        if not ensure_nas_connection(scene_archive_dir):
+            nas_err = (
+                f"[NAS_ERROR] NAS path '{scene_archive_dir}' is unreachable or disconnected. "
+                "Download cancelled; local storage fallback is strictly prohibited."
+            )
+            logger.error(nas_err)
+            return False, [], nas_err
 
     try:
         os.makedirs(scene_archive_dir, exist_ok=True)
@@ -573,10 +632,17 @@ def download_and_verify_scene(
             ensure_nas_connection(scene_archive_dir)
             try:
                 os.makedirs(scene_archive_dir, exist_ok=True)
-            except Exception:
-                # Fallback to local archive dir if NAS network path is unreachable
-                scene_archive_dir = os.path.abspath(os.path.join("data/archive", tile, year, month, folder))
-                os.makedirs(scene_archive_dir, exist_ok=True)
+            except Exception as _mk_err2:
+                nas_err = (
+                    f"[NAS_ERROR] Cannot create scene directory on NAS '{scene_archive_dir}': {_mk_err2}. "
+                    "Download cancelled; local storage fallback is strictly prohibited."
+                )
+                logger.error(nas_err)
+                return False, [], nas_err
+        else:
+            nas_err = f"[STORAGE_ERROR] Cannot create archive directory '{scene_archive_dir}': {_mk_err}."
+            logger.error(nas_err)
+            return False, [], nas_err
 
     # ─────────────────────────────────────────────────────────────
     # STEP 0: DB Deduplication Check before downloading
@@ -676,6 +742,12 @@ def download_and_verify_scene(
             staged_path = os.path.join(staging_dir, folder, local_filename)
 
             if not fetch_s3_object(s3_key, staged_path):
+                if os.path.exists(staged_path):
+                    try:
+                        os.remove(staged_path)
+                    except Exception:
+                        pass
+                prune_empty_parent_dirs(staged_path, stop_at=staging_dir)
                 return local_filename, False, 0, "download failed"
 
             ok, size, note = verify_raster(staged_path)
@@ -685,6 +757,7 @@ def download_and_verify_scene(
                         os.remove(staged_path)
                     except Exception:
                         pass
+                prune_empty_parent_dirs(staged_path, stop_at=staging_dir)
                 return local_filename, False, size, note
 
             os.makedirs(scene_archive_dir, exist_ok=True)
@@ -703,6 +776,13 @@ def download_and_verify_scene(
             return local_filename, True, size, "ok"
         except Exception as err:
             logger.error(f"Error processing band {band_name} for {folder}: {err}")
+            try:
+                staged_path = os.path.join(staging_dir, folder, local_filename)
+                if os.path.exists(staged_path):
+                    os.remove(staged_path)
+                prune_empty_parent_dirs(staged_path, stop_at=staging_dir)
+            except Exception:
+                pass
             return band_name, False, 0, str(err)
 
     with ThreadPoolExecutor(max_workers=BAND_WORKERS) as pool:
@@ -750,6 +830,13 @@ def download_and_verify_scene(
     if not all(ok for _, ok, _, _ in results):
         missing_bands = [b for b, ok, _, _ in results if not ok]
         logger.warning(f"Scene {folder} incomplete missing {missing_bands} - remains PENDING")
+        try:
+            staged_scene_folder = os.path.join(staging_dir, folder)
+            if os.path.exists(staged_scene_folder):
+                shutil.rmtree(staged_scene_folder, ignore_errors=True)
+            prune_empty_dirs(staging_dir)
+        except Exception:
+            pass
         return False, band_details, f"Incomplete bands: {missing_bands}"
 
     # ─────────────────────────────────────────────────────────────
@@ -973,6 +1060,15 @@ def download_and_verify_scene(
         f"downloaded to '{scene_archive_dir}' ({downloaded_new} new bands, {total_mb:.1f} MB: {bands_summary}, {meta_name} stored). "
         f"Recorded in {table_name} table."
     )
+    # Clean up local staged scene directory and prune empty folders in staging_dir
+    try:
+        staged_scene_folder = os.path.join(staging_dir, folder)
+        if os.path.exists(staged_scene_folder):
+            shutil.rmtree(staged_scene_folder, ignore_errors=True)
+        prune_empty_dirs(staging_dir)
+    except Exception:
+        pass
+
     logger.info(log_msg)
     return True, band_details, log_msg
 
@@ -1060,7 +1156,7 @@ def get_downloaded_tifs_for_request(db: Session, request_id: int) -> dict:
         tiles.append("S1_SAR")
 
     matched_scene_ids = set(scene_ids_from_jobs)
-    if tiles:
+    if not matched_scene_ids and tiles:
         spatial_scenes = db.query(SceneModel.scene_id).filter(
             SceneModel.tile.in_(tiles),
             SceneModel.sensing_date >= start_str,

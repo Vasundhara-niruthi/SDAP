@@ -5,7 +5,7 @@ import {
   CheckCircle, Clock, AlertTriangle, XCircle, Plus, Search, Database,
   Calendar, MapPin, Sliders, Shield, Users, Check, ChevronRight, ChevronDown, Info,
   HelpCircle, X, Download, Play, Terminal, Eye, EyeOff, KeyRound, ArrowLeft, Square, Table,
-  Layers, ArrowUp, ArrowDown
+  Layers, ArrowUp, ArrowDown, TrendingUp, BarChart3, Filter, Trash2
 } from 'lucide-react';
 
 const API_BASE = '/api/v1';
@@ -92,7 +92,7 @@ export default function App() {
   const satellite = selectedSatellites.join(', ');
   const [selectedIndices, setSelectedIndices] = useState(['NDVI', 'LSWI']);
   const [compositeInterval, setCompositeInterval] = useState('none');
-  const [priority, setPriority] = useState('normal');
+  const [level, setLevel] = useState('max');
   const [maxCloudCover, setMaxCloudCover] = useState(100);
   const [submittingReq, setSubmittingReq] = useState(false);
   const [reqFormMessage, setReqFormMessage] = useState(null);
@@ -132,6 +132,14 @@ export default function App() {
   const [newAdminFullName, setNewAdminFullName] = useState('');
   const [newAdminRole, setNewAdminRole] = useState('USER');
   const [adminUserMsg, setAdminUserMsg] = useState(null);
+
+  // Daily Storage Analytics (Admin Only)
+  const [dailyStorageData, setDailyStorageData] = useState(null);
+  const [loadingDailyStorage, setLoadingDailyStorage] = useState(false);
+  const [dailyStorageFilter, setDailyStorageFilter] = useState('ALL'); // 'ALL' | '7D' | '30D' | 'CUSTOM'
+  const [dailyStartDate, setDailyStartDate] = useState('');
+  const [dailyEndDate, setDailyEndDate] = useState('');
+  const [expandedDailyDate, setExpandedDailyDate] = useState(null);
 
   // ---------------------------------------------------------------------------
   // 7. Data Retrieval & Export State & Handlers
@@ -270,7 +278,7 @@ export default function App() {
   const [stackSeason, setStackSeason] = useState('Kharif');
   const [stackStartDate, setStackStartDate] = useState('2026-06-01');
   const [stackEndDate, setStackEndDate] = useState('2026-10-31');
-  const [stackSelectedLayers, setStackSelectedLayers] = useState(['B02', 'B03', 'B04']);
+  const [stackSelectedLayers, setStackSelectedLayers] = useState(['NDVI', 'LSWI']);
   const [stackClipToDistrict, setStackClipToDistrict] = useState(true);
   const [stackLoading, setStackLoading] = useState(false);
   const [stackNotice, setStackNotice] = useState(null);
@@ -278,6 +286,13 @@ export default function App() {
   const [stackHistory, setStackHistory] = useState([]);
   const [loadingStackHistory, setLoadingStackHistory] = useState(false);
   const [stackHistorySearch, setStackHistorySearch] = useState('');
+
+  // Request-linked downloaded scenes & filename preservation state
+  const [stackSelectedRequestId, setStackSelectedRequestId] = useState('');
+  const [stackDownloadedBandsData, setStackDownloadedBandsData] = useState({});
+  const [stackSelectedScenes, setStackSelectedScenes] = useState({});
+  const [stackCustomFilename, setStackCustomFilename] = useState('');
+  const [loadingStackReqFiles, setLoadingStackReqFiles] = useState(false);
 
   const AVAILABLE_OPTICAL_BANDS = [
     { id: 'B02', label: 'B02 - Blue (490nm, 10m)' },
@@ -300,42 +315,372 @@ export default function App() {
     { id: 'LSWI', label: 'LSWI - Land Surface Water Index (B08 - B11)/(B08 + B11)' }
   ];
 
+  const loadBandsAndScenesForRegion = useCallback(async (stateVal, distVal, seasonVal, startVal, endVal, targetReqId = null) => {
+    if (!distVal && !stateVal && !targetReqId) {
+      setStackDownloadedBandsData({});
+      setStackSelectedScenes({});
+      setStackSelectedRequestId('');
+      return;
+    }
+
+    setLoadingStackReqFiles(true);
+    try {
+      // 1. Find matching requests for this district / state / targetReqId
+      let matchingReq = null;
+      let matchingList = [];
+
+      if (targetReqId) {
+        matchingReq = requests.find(r => String(r.id) === String(targetReqId)) || null;
+      }
+
+      if (!matchingReq && distVal) {
+        matchingList = requests.filter(r => 
+          r.district && r.district.toLowerCase() === distVal.toLowerCase()
+        );
+      }
+      if (!matchingReq && matchingList.length === 0 && stateVal) {
+        matchingList = requests.filter(r => 
+          r.state && r.state.toLowerCase() === stateVal.toLowerCase()
+        );
+      }
+
+      if (!matchingReq && matchingList.length > 0) {
+        // Sort matchingList: prefer matching season, then COMPLETED/HELD/new runs, then highest ID
+        matchingList.sort((a, b) => {
+          let scoreA = a.status === 'COMPLETED' ? 10 : (['HELD', 'PROCESSING', 'DOWNLOADING', 'PENDING'].includes(a.status) ? 8 : 4);
+          let scoreB = b.status === 'COMPLETED' ? 10 : (['HELD', 'PROCESSING', 'DOWNLOADING', 'PENDING'].includes(b.status) ? 8 : 4);
+          if (seasonVal && a.season && a.season.toLowerCase() === seasonVal.toLowerCase()) scoreA += 5;
+          if (seasonVal && b.season && b.season.toLowerCase() === seasonVal.toLowerCase()) scoreB += 5;
+          const diff = scoreB - scoreA;
+          return diff !== 0 ? diff : (b.id - a.id);
+        });
+        matchingReq = matchingList[0];
+      }
+
+      let tifs = [];
+      if (matchingReq) {
+        setStackSelectedRequestId(matchingReq.id);
+        if (matchingReq.state && !stateVal) setStackState(matchingReq.state);
+        if (matchingReq.district && !distVal) setStackDistrict(matchingReq.district);
+        if (matchingReq.season) setStackSeason(matchingReq.season);
+        if (matchingReq.start_date) setStackStartDate(matchingReq.start_date.split('T')[0]);
+        if (matchingReq.end_date) setStackEndDate(matchingReq.end_date.split('T')[0]);
+
+        // Query candidate requests for tifs - take the highest priority matching request with data
+        const reqsToTry = matchingList.length > 0 ? matchingList : [matchingReq];
+        for (const r of reqsToTry) {
+          try {
+            const res = await axios.get(`${API_BASE}/requests/${r.id}/tifs`, { headers: getAuthHeader() });
+            const list = res.data?.tifs || [];
+            if (list.length > 0) {
+              tifs = list;
+              matchingReq = r;
+              setStackSelectedRequestId(r.id);
+              if (r.season) setStackSeason(r.season);
+              if (r.start_date) setStackStartDate(r.start_date.split('T')[0]);
+              if (r.end_date) setStackEndDate(r.end_date.split('T')[0]);
+              break;
+            }
+          } catch (e) {
+            console.warn('Could not fetch request tifs directly:', e);
+          }
+        }
+      } else {
+        setStackSelectedRequestId('');
+      }
+
+      // If direct request tifs yielded 0 or no matchingReq, fallback to region search
+      if (tifs.length === 0 && (distVal || stateVal)) {
+        try {
+          const retRes = await axios.get(`${API_BASE}/requests/tifs/retrieve`, {
+            params: {
+              state: stateVal || undefined,
+              district: distVal || undefined,
+              start_date: startVal || undefined,
+              end_date: endVal || undefined
+            },
+            headers: getAuthHeader()
+          });
+          tifs = retRes.data?.tifs || [];
+        } catch (rErr) {
+          console.warn('Could not retrieve tifs by region:', rErr);
+        }
+      }
+
+      const grouped = {};
+      tifs.forEach(item => {
+        let rawBand = (item.band || '').trim();
+        let b = rawBand.replace(/\.tiff?$/i, '').toUpperCase().trim();
+        if (b.includes('LSWI')) {
+          b = 'LSWI';
+        } else if (b.includes('NDVI')) {
+          b = 'NDVI';
+        } else if (b.includes('VV_VH') || b.includes('VV/VH')) {
+          b = 'VV_VH';
+        } else if (b.includes('_')) {
+          const parts = b.split('_');
+          const lastPart = parts[parts.length - 1];
+          if (['B02', 'B03', 'B04', 'B08', 'B8A', 'B08A', 'B11', 'SCL', 'TCI', 'VV', 'VH'].includes(lastPart)) {
+            b = lastPart;
+          }
+        }
+        if (b === 'B2') b = 'B02';
+        if (b === 'B3') b = 'B03';
+        if (b === 'B4') b = 'B04';
+        if (b === 'B8') b = 'B08';
+        if (b === 'B08A') b = 'B8A';
+        if (b === 'VV/VH' || b === 'VV-VH') b = 'VV_VH';
+
+        if (!grouped[b]) grouped[b] = [];
+        const filePath = item.path;
+        const fileName = item.path ? item.path.split(/[\\/]/).pop() : (item.filename || `${b}.tif`);
+
+        let tileVal = item.tile || '';
+        if (!tileVal && item.path) {
+          const tm = item.path.match(/T([0-9]{2}[A-Z]{3})/i) || item.path.match(/([0-9]{2}[A-Z]{3})/i);
+          if (tm) tileVal = tm[1];
+        }
+
+        // Deduplicate scenes strictly by file path or unique (scene_id + tile). Never deduplicate by generic band filename like B04.tif!
+        const isDuplicate = grouped[b].some(existing => {
+          if (existing.path && filePath && existing.path.toLowerCase() === filePath.toLowerCase()) return true;
+          if (existing.scene_id && item.scene_id && existing.scene_id === item.scene_id && existing.tile === tileVal) return true;
+          return false;
+        });
+
+        if (!isDuplicate) {
+          let sDate = item.sensing_date || '';
+          if (!sDate && fileName) {
+            const dm = fileName.match(/(\d{4})(\d{2})(\d{2})_(\d{4})(\d{2})(\d{2})/);
+            if (dm) sDate = `${dm[1]}-${dm[2]}-${dm[3]} to ${dm[4]}-${dm[5]}-${dm[6]}`;
+          }
+          grouped[b].push({
+            scene_id: item.scene_id || (fileName.includes('Composite') ? 'Composite' : 'Scene'),
+            tile: tileVal,
+            sensing_date: sDate,
+            path: filePath,
+            filename: fileName,
+            size_bytes: item.size_bytes
+          });
+        }
+      });
+
+      // Also try fetching composites for the matched request
+      const candidateReqs = matchingReq ? [matchingReq] : [];
+      for (const reqItem of candidateReqs) {
+        try {
+          const compRes = await axios.get(`${API_BASE}/requests/${reqItem.id}/composites`, { headers: getAuthHeader() });
+          const comps = compRes.data?.composites || compRes.data || [];
+          comps.forEach(c => {
+            let b = c.index;
+            if (!b && c.filename) {
+              const fn = c.filename.toUpperCase();
+              if (fn.includes('LSWI')) b = 'LSWI';
+              else if (fn.includes('NDVI')) b = 'NDVI';
+              else if (fn.includes('VV_VH') || fn.includes('VV/VH')) b = 'VV_VH';
+              else if (fn.includes('B02') || fn.includes('_B2')) b = 'B02';
+              else if (fn.includes('B03') || fn.includes('_B3')) b = 'B03';
+              else if (fn.includes('B04') || fn.includes('_B4')) b = 'B04';
+              else if (fn.includes('B08') || fn.includes('_B8')) b = 'B08';
+              else if (fn.includes('B8A') || fn.includes('B08A')) b = 'B8A';
+              else if (fn.includes('B11')) b = 'B11';
+            }
+            if (!b) b = 'NDVI';
+            b = b.toUpperCase().trim();
+            if (b === 'B08A') b = 'B8A';
+            if (!grouped[b]) grouped[b] = [];
+            const cPath = c.path || c.output_path || c.local_delivery_path;
+            const cFilename = c.filename || (cPath ? cPath.split(/[\\/]/).pop() : `Composite_${b}.tif`);
+            const isDup = grouped[b].some(existing => (existing.path && cPath && existing.path.toLowerCase() === cPath.toLowerCase()) || (existing.filename && existing.filename.toLowerCase() === cFilename.toLowerCase()));
+            if (!isDup) {
+              let sDate = c.window ? `${c.window.start_date} to ${c.window.end_date}` : '';
+              if (!sDate && cFilename) {
+                const dm = cFilename.match(/(\d{4})(\d{2})(\d{2})_(\d{4})(\d{2})(\d{2})/);
+                if (dm) sDate = `${dm[1]}-${dm[2]}-${dm[3]} to ${dm[4]}-${dm[5]}-${dm[6]}`;
+              }
+              if (!sDate) sDate = reqItem.start_date ? reqItem.start_date.split('T')[0] : (startVal || '');
+
+              grouped[b].push({
+                scene_id: `Composite (${c.window?.label || c.composite_interval || 'Delivered'})`,
+                tile: c.district || distVal || 'Composite',
+                sensing_date: sDate,
+                path: cPath,
+                filename: cFilename,
+                size_bytes: (c.file_size_mb || c.size_mb || 0) * 1024 * 1024
+              });
+            }
+          });
+        } catch (cErr) {
+          // ignore
+        }
+      }
+
+      setStackDownloadedBandsData(grouped);
+
+      // Default selection of layers based on request / available data
+      const initialLayers = [];
+      const initSelectedScenes = {};
+
+      if (matchingReq) {
+        const reqIndices = Array.isArray(matchingReq.indices) ? matchingReq.indices : (matchingReq.indices ? [matchingReq.indices] : []);
+        reqIndices.forEach(idx => {
+          const cleanIdx = idx.toUpperCase().trim();
+          if (['NDVI', 'LSWI'].includes(cleanIdx) && !initialLayers.includes(cleanIdx)) {
+            initialLayers.push(cleanIdx);
+          }
+        });
+        const reqBands = Array.isArray(matchingReq.bands) ? matchingReq.bands : [];
+        reqBands.forEach(b => {
+          let cleanB = b.toUpperCase().replace(/\.TIFF?$/i, '').trim();
+          if (cleanB === 'B08A') cleanB = 'B8A';
+          if (!initialLayers.includes(cleanB)) initialLayers.push(cleanB);
+        });
+      }
+
+      if (grouped['NDVI'] && !initialLayers.includes('NDVI')) initialLayers.push('NDVI');
+      if (grouped['LSWI'] && !initialLayers.includes('LSWI')) initialLayers.push('LSWI');
+
+      // Default selected stage: all downloaded scenes for EVERY band are selected by default
+      Object.keys(grouped).forEach(bKey => {
+        initSelectedScenes[bKey] = new Set(grouped[bKey].map(s => s.path || s.scene_id));
+      });
+
+      setStackSelectedScenes(initSelectedScenes);
+      if (initialLayers.length > 0) {
+        setStackSelectedLayers(initialLayers);
+      }
+
+      // Preserve exact filename for downloaded layers (e.g., NDVI.tif)
+      if (initialLayers.includes('NDVI') && initialLayers.length <= 2) {
+        const ndviScene = grouped['NDVI']?.[0];
+        setStackCustomFilename(ndviScene?.filename || 'NDVI.tif');
+      } else if (initialLayers.length === 1) {
+        const singleB = initialLayers[0];
+        const firstScene = grouped[singleB]?.[0];
+        setStackCustomFilename(firstScene?.filename || `${singleB}.tif`);
+      } else {
+        const firstB = initialLayers[0];
+        const firstScene = grouped[firstB]?.[0];
+        setStackCustomFilename(firstScene?.filename || `${distVal || 'district'}_stacked.tif`);
+      }
+
+    } catch (err) {
+      console.warn('Could not fetch tifs for selected region:', err);
+    } finally {
+      setLoadingStackReqFiles(false);
+    }
+  }, [requests]);
+
+  const selectAllScenesForBand = (band) => {
+    const allScenes = stackDownloadedBandsData[band] || [];
+    setStackSelectedScenes(prev => ({
+      ...prev,
+      [band]: new Set(allScenes.map(s => s.path || s.scene_id))
+    }));
+  };
+
+  const deselectAllScenesForBand = (band) => {
+    setStackSelectedScenes(prev => ({
+      ...prev,
+      [band]: new Set()
+    }));
+  };
+
+  const toggleSceneSelection = (band, sceneKey) => {
+    setStackSelectedScenes(prev => {
+      const allScenes = stackDownloadedBandsData[band] || [];
+      const currentSet = new Set(prev[band] !== undefined ? prev[band] : allScenes.map(s => s.path || s.scene_id));
+      if (currentSet.has(sceneKey)) {
+        currentSet.delete(sceneKey);
+      } else {
+        currentSet.add(sceneKey);
+      }
+      return { ...prev, [band]: currentSet };
+    });
+  };
+
+  const deleteSceneFromBand = (band, sceneKey) => {
+    setStackDownloadedBandsData(prev => {
+      const list = prev[band] || [];
+      return {
+        ...prev,
+        [band]: list.filter(s => (s.path || s.scene_id) !== sceneKey)
+      };
+    });
+    setStackSelectedScenes(prev => {
+      const allScenes = stackDownloadedBandsData[band] || [];
+      const currentSet = new Set(prev[band] !== undefined ? prev[band] : allScenes.map(s => s.path || s.scene_id));
+      currentSet.delete(sceneKey);
+      return { ...prev, [band]: currentSet };
+    });
+  };
+
   const handleStackSeasonChange = (s) => {
     setStackSeason(s);
+    let sDate = '2026-06-01';
+    let eDate = '2026-10-31';
     if (s === 'Kharif') {
-      setStackStartDate('2026-06-01');
-      setStackEndDate('2026-10-31');
+      sDate = '2026-06-01';
+      eDate = '2026-10-31';
     } else if (s === 'Rabi') {
-      setStackStartDate('2026-11-01');
-      setStackEndDate('2027-03-31');
+      sDate = '2026-11-01';
+      eDate = '2027-03-31';
     } else if (s === 'Zaid') {
-      setStackStartDate('2026-03-01');
-      setStackEndDate('2026-06-30');
+      sDate = '2026-03-01';
+      eDate = '2026-06-30';
     } else if (s === 'Pre-Monsoon') {
-      setStackStartDate('2026-03-01');
-      setStackEndDate('2026-05-31');
+      sDate = '2026-03-01';
+      eDate = '2026-05-31';
     } else if (s === 'Monsoon') {
-      setStackStartDate('2026-06-01');
-      setStackEndDate('2026-09-30');
+      sDate = '2026-06-01';
+      eDate = '2026-09-30';
     } else if (s === 'Post-Monsoon') {
-      setStackStartDate('2026-10-01');
-      setStackEndDate('2026-12-31');
+      sDate = '2026-10-01';
+      eDate = '2026-12-31';
     } else if (s === 'Winter') {
-      setStackStartDate('2026-01-01');
-      setStackEndDate('2026-02-28');
+      sDate = '2026-01-01';
+      eDate = '2026-02-28';
     } else if (s === 'Annual') {
-      setStackStartDate('2026-01-01');
-      setStackEndDate('2026-12-31');
+      sDate = '2026-01-01';
+      eDate = '2026-12-31';
+    }
+    setStackStartDate(sDate);
+    setStackEndDate(eDate);
+    if (stackDistrict) {
+      loadBandsAndScenesForRegion(stackState, stackDistrict, s, sDate, eDate);
     }
   };
 
   const toggleStackLayer = (layerId) => {
     setStackSelectedLayers(prev => {
+      let next;
       if (prev.includes(layerId)) {
-        return prev.filter(l => l !== layerId);
+        next = prev.filter(l => l !== layerId);
       } else {
-        return [...prev, layerId];
+        next = [...prev, layerId];
+        // Ensure all downloaded scenes for this band/index are selected by default
+        setStackSelectedScenes(prevScenes => {
+          const bandScenes = stackDownloadedBandsData[layerId] || [];
+          if (bandScenes.length > 0 && !prevScenes[layerId]) {
+            return {
+              ...prevScenes,
+              [layerId]: new Set(bandScenes.map(s => s.path || s.scene_id))
+            };
+          }
+          return prevScenes;
+        });
       }
+
+      // Preserve exact filename for downloaded layers (e.g., NDVI.tif)
+      if (next.length === 1) {
+        const singleB = next[0];
+        const scenes = stackDownloadedBandsData[singleB] || [];
+        setStackCustomFilename(scenes[0]?.filename || `${singleB}.tif`);
+      } else if (next.includes('NDVI') && next.length <= 2) {
+        const ndviScenes = stackDownloadedBandsData['NDVI'] || [];
+        setStackCustomFilename(ndviScenes[0]?.filename || 'NDVI.tif');
+      }
+      return next;
     });
   };
 
@@ -399,6 +744,21 @@ export default function App() {
     setStackNotice(null);
     setStackResult(null);
 
+    // Collect all selected file paths from scenes
+    const selectedPaths = [];
+    stackSelectedLayers.forEach(lyr => {
+      const scenes = stackDownloadedBandsData[lyr] || [];
+      const selectedSet = stackSelectedScenes[lyr] !== undefined
+        ? stackSelectedScenes[lyr]
+        : new Set(scenes.map(s => s.path || s.scene_id));
+      scenes.forEach(sc => {
+        const key = sc.path || sc.scene_id;
+        if (selectedSet.has(key) && sc.path) {
+          selectedPaths.push(sc.path);
+        }
+      });
+    });
+
     try {
       const payload = {
         state: stackState || null,
@@ -407,7 +767,10 @@ export default function App() {
         start_date: stackStartDate || null,
         end_date: stackEndDate || null,
         layers: stackSelectedLayers,
-        clip_to_district: stackClipToDistrict
+        clip_to_district: stackClipToDistrict,
+        output_filename: stackCustomFilename ? stackCustomFilename.trim() : (stackSelectedLayers.length === 1 ? `${stackSelectedLayers[0]}.tif` : null),
+        selected_files: selectedPaths.length > 0 ? selectedPaths : null,
+        request_id: stackSelectedRequestId ? Number(stackSelectedRequestId) : null
       };
 
       const res = await axios.post(`${API_BASE}/requests/layer-stack`, payload, {
@@ -605,12 +968,13 @@ export default function App() {
     }
   }, [token, activeTab, fetchDownloadedRegions, fetchStackHistory, stackDistrict]);
 
-  // Fetch Requests List (scoped to logged-in user - stable reference)
+  // Fetch Requests List (scoped to logged-in user, or all requests for administrators)
   const fetchRequests = useCallback(async () => {
     if (!token) return;
     setLoadingRequests(true);
     try {
-      const res = await axios.get(`${API_BASE}/requests/?scope=mine`, { headers: getAuthHeader() });
+      const scopeParam = currentUser?.role === 'ADMIN' ? '' : '?scope=mine';
+      const res = await axios.get(`${API_BASE}/requests/${scopeParam}`, { headers: getAuthHeader() });
       const data = res.data || [];
       setRequests(data);
 
@@ -625,7 +989,7 @@ export default function App() {
     } finally {
       setLoadingRequests(false);
     }
-  }, [token]);
+  }, [token, currentUser?.role]);
 
   // Fetch Admin Users Directory
   const fetchAdminData = useCallback(async () => {
@@ -640,6 +1004,43 @@ export default function App() {
       setLoadingAdmin(false);
     }
   }, [token, currentUser]);
+
+  // Fetch Daily Storage Analytics (Admin Only)
+  const fetchDailyStorage = useCallback(async (start = dailyStartDate, end = dailyEndDate) => {
+    if (!token || currentUser?.role !== 'ADMIN') return;
+    setLoadingDailyStorage(true);
+    try {
+      const params = new URLSearchParams();
+      if (start) params.append('start_date', start);
+      if (end) params.append('end_date', end);
+      const qStr = params.toString();
+      const res = await axios.get(`${API_BASE}/users/analytics/daily-storage${qStr ? '?' + qStr : ''}`, { headers: getAuthHeader() });
+      setDailyStorageData(res.data);
+    } catch (err) {
+      console.error('Error loading daily storage analytics:', err);
+    } finally {
+      setLoadingDailyStorage(false);
+    }
+  }, [token, currentUser, dailyStartDate, dailyEndDate]);
+
+  const handleDailyStorageQuickFilter = (range) => {
+    setDailyStorageFilter(range);
+    let start = '';
+    let end = '';
+    const now = new Date();
+    if (range === '7D') {
+      const past = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+      start = past.toISOString().split('T')[0];
+      end = now.toISOString().split('T')[0];
+    } else if (range === '30D') {
+      const past = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
+      start = past.toISOString().split('T')[0];
+      end = now.toISOString().split('T')[0];
+    }
+    setDailyStartDate(start);
+    setDailyEndDate(end);
+    fetchDailyStorage(start, end);
+  };
 
   // Fetch Specific User's Requests (Admin Only)
   const fetchUserRequests = useCallback(async (userId) => {
@@ -684,10 +1085,14 @@ export default function App() {
 
   // Initial / tab-switch fetch for admin data
   useEffect(() => {
-    if (token && currentUser?.role === 'ADMIN' && activeTab === 'admin') {
-      fetchAdminData();
+    if (token && currentUser?.role === 'ADMIN') {
+      if (activeTab === 'admin') {
+        fetchDailyStorage();
+      } else if (activeTab === 'users') {
+        fetchAdminData();
+      }
     }
-  }, [token, currentUser, activeTab, fetchAdminData]);
+  }, [token, currentUser, activeTab, fetchAdminData, fetchDailyStorage]);
 
   // Smart polling: poll requests & active log modal continuously every 2s
   useEffect(() => {
@@ -695,10 +1100,12 @@ export default function App() {
 
     const interval = setInterval(async () => {
       fetchRequests();
-      if (activeTab === 'admin' && currentUser?.role === 'ADMIN') {
-        fetchAdminData();
-        if (expandedUserId) {
-          fetchUserRequests(expandedUserId);
+      if (currentUser?.role === 'ADMIN') {
+        if (activeTab === 'users') {
+          fetchAdminData();
+          if (expandedUserId) {
+            fetchUserRequests(expandedUserId);
+          }
         }
       }
       if (isLogsModalOpen && selectedReqIdRef.current) {
@@ -755,12 +1162,29 @@ export default function App() {
       scenesEstimate = Math.round(tileCount * 6.0 * months);
     }
 
+    const totalMB = totalGB * 1024;
+    // Estimated download throughput ~12 MB/s (sustained multi-band HTTP/S3 pipeline transfer)
+    const totalSeconds = Math.max(30, Math.round(totalMB / 12.0));
+    let downloadTimeText = '';
+    if (totalSeconds < 60) {
+      downloadTimeText = '< 1 min';
+    } else if (totalSeconds < 3600) {
+      const m = Math.round(totalSeconds / 60);
+      downloadTimeText = `~${m} min${m > 1 ? 's' : ''}`;
+    } else {
+      const h = Math.floor(totalSeconds / 3600);
+      const m = Math.round((totalSeconds % 3600) / 60);
+      downloadTimeText = m > 0 ? `~${h} hr${h > 1 ? 's' : ''} ${m} min` : `~${h} hr${h > 1 ? 's' : ''}`;
+    }
+
     return {
       gb: Math.round(totalGB * 100) / 100,
       tiles: tileCount,
       scenes: scenesEstimate,
       days,
-      months: months.toFixed(1)
+      months: months.toFixed(1),
+      downloadTimeText,
+      totalSeconds
     };
   };
 
@@ -826,7 +1250,8 @@ export default function App() {
       bands: bands,
       indices: selectedIndices,
       composite_interval: compositeInterval,
-      priority: priority,
+      level: level,
+      priority: 'normal',
       max_cloud_cover: parseFloat(maxCloudCover) || 100.0,
       delivery_outputs: ['clipped_images']
     };
@@ -930,6 +1355,26 @@ export default function App() {
     }
   };
 
+  // Admin Delete User Handler
+  const handleDeleteUser = async (userId, userEmail) => {
+    if (userId === currentUser?.id || userEmail === currentUser?.email) {
+      alert("Administrators cannot delete their own active account.");
+      return;
+    }
+    if (!window.confirm(`Are you sure you want to delete user account "${userEmail}"?\n\nThis will remove their account and clear associated work.`)) {
+      return;
+    }
+    setAdminUserMsg(null);
+    try {
+      await axios.delete(`${API_BASE}/users/${userId}`, { headers: getAuthHeader() });
+      setAdminUserMsg({ type: 'success', text: `User account "${userEmail}" deleted successfully.` });
+      fetchAdminData();
+      if (expandedUserId === userId) setExpandedUserId(null);
+    } catch (err) {
+      setAdminUserMsg({ type: 'error', text: formatApiError(err, 'Failed to delete user account.') });
+    }
+  };
+
   // Filtered Districts based on selectedState (case-insensitive & trimmed)
   const availableDistricts = selectedState
     ? districtsList.filter(d => {
@@ -1009,6 +1454,7 @@ export default function App() {
       satellite: selectedReq?.satellite || 'Sentinel-1, Sentinel-2',
       indices: selectedReq?.indices ? selectedReq.indices.join(', ') : 'NDVI, LSWI, VV/VH',
       maxCloud: selectedReq?.max_cloud_cover ? `${selectedReq.max_cloud_cover}%` : '70.0%',
+      level: selectedReq?.level ? selectedReq.level.toUpperCase() : 'MAX',
       composite: selectedReq?.composite_interval || 'WEEKLY'
     };
 
@@ -1080,6 +1526,9 @@ export default function App() {
 
         const cloudM = line.match(/Max Cloud:\s*([^|]+)/i);
         if (cloudM) configInfo.maxCloud = cloudM[1].trim();
+
+        const levelM = line.match(/Level:\s*([^|]+)/i);
+        if (levelM) configInfo.level = levelM[1].trim().toUpperCase();
 
         const compM = line.match(/Composite:\s*([^\s|]+)/i);
         if (compM) configInfo.composite = compM[1].trim();
@@ -1371,6 +1820,10 @@ export default function App() {
             <div>
               <span style={{ color: '#94a3b8' }}>Max Cloud: </span>
               <span style={{ fontWeight: 700, color: '#ffffff' }}>{configInfo.maxCloud}</span>
+            </div>
+            <div>
+              <span style={{ color: '#94a3b8' }}>Level: </span>
+              <span style={{ fontWeight: 700, color: '#38bdf8' }}>{configInfo.level}</span>
             </div>
             <div>
               <span style={{ color: '#94a3b8' }}>Composite: </span>
@@ -2295,7 +2748,31 @@ export default function App() {
                 cursor: 'pointer'
               }}
             >
-              <Shield size={16} /> Admin Control & Live Feed
+              <Shield size={16} /> Admin Storage & Feed
+            </button>
+          )}
+
+          {currentUser.role === 'ADMIN' && (
+            <button
+              onClick={() => {
+                setActiveTab('users');
+                fetchAdminData();
+              }}
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: '0.5rem',
+                padding: '0.65rem 1.25rem',
+                fontSize: '0.9rem',
+                fontWeight: 600,
+                border: 'none',
+                borderBottom: activeTab === 'users' ? '2px solid #2563eb' : '2px solid transparent',
+                color: activeTab === 'users' ? '#2563eb' : '#64748b',
+                backgroundColor: 'transparent',
+                cursor: 'pointer'
+              }}
+            >
+              <Users size={16} /> User Management
             </button>
           )}
 
@@ -2483,8 +2960,13 @@ export default function App() {
                           </td>
                           <td style={{ padding: '0.85rem 1rem' }}>
                             <span style={{ fontWeight: 600, color: '#1e293b' }}>{req.satellite}</span>
-                            <div style={{ fontSize: '0.72rem', color: '#64748b' }}>
-                              {Array.isArray(req.indices) ? req.indices.join(', ') : req.indices}
+                            <div style={{ fontSize: '0.72rem', color: '#64748b', display: 'flex', alignItems: 'center', gap: '0.35rem', flexWrap: 'wrap' }}>
+                              <span>{Array.isArray(req.indices) ? req.indices.join(', ') : req.indices}</span>
+                              {req.level && (
+                                <span style={{ fontSize: '0.66rem', backgroundColor: '#e0f2fe', color: '#0369a1', padding: '0.05rem 0.35rem', borderRadius: '0.25rem', fontWeight: 700 }}>
+                                  {req.level.toUpperCase()}
+                                </span>
+                              )}
                             </div>
                           </td>
                           <td style={{ padding: '0.85rem 1rem', fontWeight: 600, color: '#0f172a' }}>
@@ -2875,7 +3357,7 @@ export default function App() {
                   </div>
                 </div>
 
-                {/* Composite Interval + Priority Row */}
+                {/* Composite Interval + Level Row */}
                 <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: '1rem' }}>
                   <div>
                     <label style={{ display: 'block', fontSize: '0.8rem', fontWeight: 600, color: '#334155', marginBottom: '0.35rem' }}>Composite Interval</label>
@@ -2888,13 +3370,13 @@ export default function App() {
                   </div>
 
                   <div>
-                    <label style={{ display: 'block', fontSize: '0.8rem', fontWeight: 600, color: '#334155', marginBottom: '0.35rem' }}>Priority</label>
-                    <select value={priority} onChange={(e) => setPriority(e.target.value)} style={{ width: '100%', padding: '0.6rem 0.75rem', borderRadius: '0.375rem', border: '1px solid #cbd5e1', fontSize: '0.875rem', backgroundColor: '#ffffff', outline: 'none' }}>
-                      <option value="high">High Priority</option>
-                      <option value="normal">Normal</option>
-                      <option value="low">Low Priority</option>
+                    <label style={{ display: 'block', fontSize: '0.8rem', fontWeight: 600, color: '#334155', marginBottom: '0.35rem' }}>Level</label>
+                    <select value={level} onChange={(e) => setLevel(e.target.value)} style={{ width: '100%', padding: '0.6rem 0.75rem', borderRadius: '0.375rem', border: '1px solid #cbd5e1', fontSize: '0.875rem', backgroundColor: '#ffffff', outline: 'none' }}>
+                      <option value="max">max (Maximum Value Composite)</option>
+                      <option value="min">min (Minimum Value Composite)</option>
+                      <option value="mean">mean (Average Value Composite)</option>
                     </select>
-                    <span style={{ fontSize: '0.72rem', color: '#94a3b8' }}>High-priority requests are downloaded first</span>
+                    <span style={{ fontSize: '0.72rem', color: '#94a3b8' }}>Calculation level for NDVI &amp; LSWI temporal compositing</span>
                   </div>
 
                   <div>
@@ -2911,29 +3393,37 @@ export default function App() {
                   </div>
                 </div>
 
-                {/* Delivery Outputs */}
-                <div>
-                  <label style={{ display: 'block', fontSize: '0.8rem', fontWeight: 600, color: '#334155', marginBottom: '0.5rem' }}>Delivery Outputs</label>
-                  <label style={{ display: 'inline-flex', alignItems: 'center', gap: '0.5rem', padding: '0.5rem 0.85rem', borderRadius: '0.375rem', border: '1px solid #2563eb', backgroundColor: '#eff6ff', fontSize: '0.82rem', fontWeight: 600, color: '#1d4ed8', cursor: 'default' }}>
-                    <CheckCircle size={14} /> Clipped Images (always produced)
-                  </label>
-                  <span style={{ fontSize: '0.7rem', color: '#94a3b8', marginLeft: '0.5rem' }}>Per-district boundary clip, reprojected to unified CRS</span>
-                </div>
-
-                {/* Dynamic Estimated Storage Box */}
+                {/* Dynamic Estimated Storage & Download Time Box */}
                 <div style={{ backgroundColor: willBeRejected ? '#fef2f2' : willRequireApproval ? '#fffbeb' : '#f0fdf4', border: `1px solid ${willBeRejected ? '#fca5a5' : willRequireApproval ? '#fde68a' : '#bbf7d0'}`, borderRadius: '0.5rem', padding: '1rem 1.25rem' }}>
-                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: '0.75rem' }}>
-                    <div>
-                      <div style={{ display: 'flex', alignItems: 'center', gap: '0.35rem', fontSize: '0.8rem', fontWeight: 600, color: '#64748b', marginBottom: '0.25rem' }}>
-                        <HardDrive size={14} color="#2563eb" /> Estimated Storage Requirement
+                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: '1rem' }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '1.75rem', flexWrap: 'wrap' }}>
+                      {/* Storage Estimate */}
+                      <div>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '0.35rem', fontSize: '0.8rem', fontWeight: 600, color: '#64748b', marginBottom: '0.25rem' }}>
+                          <HardDrive size={14} color="#2563eb" /> Estimated Storage Requirement
+                        </div>
+                        <div style={{ fontSize: '1.45rem', fontWeight: 800, color: '#0f172a' }}>
+                          {estimatedGb} <span style={{ fontSize: '0.85rem', fontWeight: 500, color: '#64748b' }}>GB</span>
+                        </div>
+                        <div style={{ fontSize: '0.74rem', color: '#64748b', marginTop: '0.2rem' }}>
+                          ~{estResult.scenes} scenes · {estResult.tiles} tiles · {estResult.months} months
+                        </div>
                       </div>
-                      <div style={{ fontSize: '1.5rem', fontWeight: 800, color: '#0f172a' }}>
-                        {estimatedGb} <span style={{ fontSize: '0.9rem', fontWeight: 500, color: '#64748b' }}>GB</span>
-                      </div>
-                      <div style={{ fontSize: '0.75rem', color: '#64748b', marginTop: '0.2rem' }}>
-                        ~{estResult.scenes} scenes · {estResult.tiles} tiles · {estResult.months} months
+
+                      {/* Download Time Estimate */}
+                      <div style={{ borderLeft: '1px solid #cbd5e1', paddingLeft: '1.5rem' }}>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '0.35rem', fontSize: '0.8rem', fontWeight: 600, color: '#64748b', marginBottom: '0.25rem' }}>
+                          <Clock size={14} color="#d97706" /> Estimated Download Duration
+                        </div>
+                        <div style={{ fontSize: '1.45rem', fontWeight: 800, color: '#92400e' }}>
+                          {estResult.downloadTimeText}
+                        </div>
+                        <div style={{ fontSize: '0.74rem', color: '#64748b', marginTop: '0.2rem' }}>
+                          Est. at ~12 MB/s pipeline network transfer
+                        </div>
                       </div>
                     </div>
+
                     <div>
                       {willBeRejected ? (
                         <span style={{ padding: '0.4rem 0.75rem', borderRadius: '0.375rem', fontSize: '0.78rem', fontWeight: 600, backgroundColor: '#fee2e2', color: '#991b1b', border: '1px solid #fca5a5', display: 'inline-flex', alignItems: 'center', gap: '0.35rem' }}>
@@ -3007,9 +3497,11 @@ export default function App() {
                       <div style={{ display: 'flex', justifyContent: 'space-between' }}><span style={{ color: '#64748b' }}>Satellite</span><span style={{ fontWeight: 600, color: '#0f172a' }}>{confirmPayload.satellite}</span></div>
                       <div style={{ display: 'flex', justifyContent: 'space-between' }}><span style={{ color: '#64748b' }}>Date Range</span><span style={{ fontWeight: 600, color: '#0f172a' }}>{confirmPayload.start_date} → {confirmPayload.end_date}</span></div>
                       <div style={{ display: 'flex', justifyContent: 'space-between' }}><span style={{ color: '#64748b' }}>Indices</span><span style={{ fontWeight: 600, color: '#0f172a' }}>{(confirmPayload.indices || []).join(', ')}</span></div>
+                      <div style={{ display: 'flex', justifyContent: 'space-between' }}><span style={{ color: '#64748b' }}>Calculation Level</span><span style={{ fontWeight: 600, color: '#0284c7' }}>{confirmPayload.level ? confirmPayload.level.toUpperCase() : 'MAX'}</span></div>
                       <hr style={{ border: 'none', borderTop: '1px solid #e2e8f0', margin: '0.25rem 0' }} />
                       <div style={{ display: 'flex', justifyContent: 'space-between' }}><span style={{ color: '#64748b' }}>Estimated Scenes</span><span style={{ fontWeight: 700, color: '#0f172a' }}>~{estResult.scenes}</span></div>
                       <div style={{ display: 'flex', justifyContent: 'space-between' }}><span style={{ color: '#64748b' }}>Estimated Storage</span><span style={{ fontWeight: 700, fontSize: '1rem', color: willRequireApproval ? '#92400e' : '#166534' }}>{estimatedGb} GB</span></div>
+                      <div style={{ display: 'flex', justifyContent: 'space-between' }}><span style={{ color: '#64748b' }}>Estimated Download Time</span><span style={{ fontWeight: 700, fontSize: '1rem', color: '#92400e' }}>{estResult.downloadTimeText}</span></div>
                       <div style={{ display: 'flex', justifyContent: 'space-between' }}><span style={{ color: '#64748b' }}>Expected Status</span><span style={{ fontWeight: 700, color: willRequireApproval ? '#92400e' : '#166534' }}>{willRequireApproval ? 'HOLD FOR APPROVAL' : 'AUTO-ACCEPTED + PIPELINE STARTS'}</span></div>
                     </div>
 
@@ -3042,6 +3534,640 @@ export default function App() {
         {activeTab === 'admin' && currentUser.role === 'ADMIN' && (
           <div style={{ display: 'flex', flexDirection: 'column', gap: '1.5rem' }}>
 
+            {/* ========================================================================= */}
+            {/* Daily Storage Occupancy & Request Analytics (Admin Only) */}
+            {/* ========================================================================= */}
+            <div style={{
+              backgroundColor: '#ffffff',
+              borderRadius: '0.75rem',
+              border: '1px solid #e2e8f0',
+              padding: '1.5rem',
+              boxShadow: '0 1px 3px 0 rgba(0, 0, 0, 0.05)'
+            }}>
+              {/* Card Header & Controls */}
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '1.25rem', flexWrap: 'wrap', gap: '0.75rem' }}>
+                <div>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '0.6rem' }}>
+                    <h3 style={{ fontSize: '1.15rem', fontWeight: 700, color: '#0f172a', margin: 0, display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                      <HardDrive size={20} color="#2563eb" /> Daily Storage Occupancy & Request Tracking
+                    </h3>
+                    <span style={{
+                      display: 'inline-flex',
+                      alignItems: 'center',
+                      gap: '0.25rem',
+                      padding: '0.2rem 0.55rem',
+                      borderRadius: '9999px',
+                      fontSize: '0.72rem',
+                      fontWeight: 700,
+                      backgroundColor: '#eff6ff',
+                      color: '#1d4ed8',
+                      border: '1px solid #bfdbfe'
+                    }}>
+                      <Shield size={11} /> ADMIN RESTRICTED
+                    </span>
+                  </div>
+                  <p style={{ fontSize: '0.82rem', color: '#64748b', margin: '0.25rem 0 0 0' }}>
+                    Audit day-by-day storage allocations requested by users alongside physical raster data held on the NAS array.
+                  </p>
+                </div>
+
+                {/* Filter & Action Buttons */}
+                <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', flexWrap: 'wrap' }}>
+                  {/* Quick Filters */}
+                  <div style={{ display: 'flex', alignItems: 'center', backgroundColor: '#f1f5f9', borderRadius: '0.375rem', padding: '0.2rem' }}>
+                    <button
+                      type="button"
+                      onClick={() => handleDailyStorageQuickFilter('ALL')}
+                      style={{
+                        padding: '0.3rem 0.65rem',
+                        borderRadius: '0.25rem',
+                        border: 'none',
+                        fontSize: '0.78rem',
+                        fontWeight: 600,
+                        backgroundColor: dailyStorageFilter === 'ALL' ? '#ffffff' : 'transparent',
+                        color: dailyStorageFilter === 'ALL' ? '#0f172a' : '#64748b',
+                        boxShadow: dailyStorageFilter === 'ALL' ? '0 1px 2px rgba(0,0,0,0.06)' : 'none',
+                        cursor: 'pointer'
+                      }}
+                    >
+                      All Time
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => handleDailyStorageQuickFilter('7D')}
+                      style={{
+                        padding: '0.3rem 0.65rem',
+                        borderRadius: '0.25rem',
+                        border: 'none',
+                        fontSize: '0.78rem',
+                        fontWeight: 600,
+                        backgroundColor: dailyStorageFilter === '7D' ? '#ffffff' : 'transparent',
+                        color: dailyStorageFilter === '7D' ? '#0f172a' : '#64748b',
+                        boxShadow: dailyStorageFilter === '7D' ? '0 1px 2px rgba(0,0,0,0.06)' : 'none',
+                        cursor: 'pointer'
+                      }}
+                    >
+                      Last 7 Days
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => handleDailyStorageQuickFilter('30D')}
+                      style={{
+                        padding: '0.3rem 0.65rem',
+                        borderRadius: '0.25rem',
+                        border: 'none',
+                        fontSize: '0.78rem',
+                        fontWeight: 600,
+                        backgroundColor: dailyStorageFilter === '30D' ? '#ffffff' : 'transparent',
+                        color: dailyStorageFilter === '30D' ? '#0f172a' : '#64748b',
+                        boxShadow: dailyStorageFilter === '30D' ? '0 1px 2px rgba(0,0,0,0.06)' : 'none',
+                        cursor: 'pointer'
+                      }}
+                    >
+                      Last 30 Days
+                    </button>
+                  </div>
+
+                  {/* Date Pickers */}
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '0.35rem', backgroundColor: '#f8fafc', padding: '0.25rem 0.5rem', borderRadius: '0.375rem', border: '1px solid #cbd5e1' }}>
+                    <Calendar size={13} color="#64748b" />
+                    <input
+                      type="date"
+                      value={dailyStartDate}
+                      onChange={(e) => {
+                        setDailyStartDate(e.target.value);
+                        setDailyStorageFilter('CUSTOM');
+                      }}
+                      title="Start Date"
+                      style={{ border: 'none', backgroundColor: 'transparent', fontSize: '0.78rem', color: '#334155', outline: 'none' }}
+                    />
+                    <span style={{ fontSize: '0.78rem', color: '#94a3b8' }}>to</span>
+                    <input
+                      type="date"
+                      value={dailyEndDate}
+                      onChange={(e) => {
+                        setDailyEndDate(e.target.value);
+                        setDailyStorageFilter('CUSTOM');
+                      }}
+                      title="End Date"
+                      style={{ border: 'none', backgroundColor: 'transparent', fontSize: '0.78rem', color: '#334155', outline: 'none' }}
+                    />
+                    <button
+                      type="button"
+                      onClick={() => fetchDailyStorage(dailyStartDate, dailyEndDate)}
+                      style={{
+                        padding: '0.2rem 0.45rem',
+                        borderRadius: '0.25rem',
+                        border: 'none',
+                        backgroundColor: '#2563eb',
+                        color: '#ffffff',
+                        fontSize: '0.75rem',
+                        fontWeight: 600,
+                        cursor: 'pointer'
+                      }}
+                    >
+                      Filter
+                    </button>
+                    {(dailyStartDate || dailyEndDate) && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setDailyStartDate('');
+                          setDailyEndDate('');
+                          setDailyStorageFilter('ALL');
+                          fetchDailyStorage('', '');
+                        }}
+                        style={{
+                          padding: '0.2rem 0.35rem',
+                          borderRadius: '0.25rem',
+                          border: 'none',
+                          backgroundColor: '#e2e8f0',
+                          color: '#475569',
+                          fontSize: '0.75rem',
+                          cursor: 'pointer'
+                        }}
+                        title="Clear Date Filter"
+                      >
+                        <X size={12} />
+                      </button>
+                    )}
+                  </div>
+
+                  {/* Refresh Button */}
+                  <button
+                    type="button"
+                    onClick={() => fetchDailyStorage(dailyStartDate, dailyEndDate)}
+                    disabled={loadingDailyStorage}
+                    style={{
+                      display: 'inline-flex',
+                      alignItems: 'center',
+                      gap: '0.35rem',
+                      padding: '0.4rem 0.75rem',
+                      borderRadius: '0.375rem',
+                      border: '1px solid #cbd5e1',
+                      backgroundColor: '#ffffff',
+                      fontSize: '0.8rem',
+                      fontWeight: 600,
+                      color: '#334155',
+                      cursor: 'pointer'
+                    }}
+                  >
+                    <RefreshCw size={13} className={loadingDailyStorage ? 'animate-spin' : ''} />
+                    Refresh
+                  </button>
+                </div>
+              </div>
+
+              {/* KPI Summary Cards Grid */}
+              <div style={{
+                display: 'grid',
+                gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))',
+                gap: '1rem',
+                marginBottom: '1.5rem'
+              }}>
+                {/* Total Requested Storage */}
+                <div style={{
+                  padding: '1rem 1.15rem',
+                  borderRadius: '0.5rem',
+                  backgroundColor: '#f8fafc',
+                  border: '1px solid #e2e8f0',
+                  display: 'flex',
+                  alignItems: 'flex-start',
+                  justifyContent: 'space-between'
+                }}>
+                  <div>
+                    <div style={{ fontSize: '0.78rem', fontWeight: 600, color: '#64748b', textTransform: 'uppercase', letterSpacing: '0.04em' }}>
+                      Total Requested Storage
+                    </div>
+                    <div style={{ fontSize: '1.45rem', fontWeight: 700, color: '#1e293b', marginTop: '0.35rem' }}>
+                      {dailyStorageData?.summary?.total_request_storage_gb ?? '0.00'} <span style={{ fontSize: '0.9rem', fontWeight: 500, color: '#64748b' }}>GB</span>
+                    </div>
+                    <div style={{ fontSize: '0.75rem', color: '#64748b', marginTop: '0.25rem' }}>
+                      Across {dailyStorageData?.summary?.total_requests ?? 0} user requests
+                    </div>
+                  </div>
+                  <div style={{ padding: '0.6rem', borderRadius: '0.375rem', backgroundColor: '#eff6ff', color: '#2563eb' }}>
+                    <Database size={20} />
+                  </div>
+                </div>
+
+                {/* Physical Storage on NAS */}
+                <div style={{
+                  padding: '1rem 1.15rem',
+                  borderRadius: '0.5rem',
+                  backgroundColor: '#f0fdf4',
+                  border: '1px solid #bbf7d0',
+                  display: 'flex',
+                  alignItems: 'flex-start',
+                  justifyContent: 'space-between'
+                }}>
+                  <div>
+                    <div style={{ fontSize: '0.78rem', fontWeight: 600, color: '#166534', textTransform: 'uppercase', letterSpacing: '0.04em' }}>
+                      Physical Storage on NAS
+                    </div>
+                    <div style={{ fontSize: '1.45rem', fontWeight: 700, color: '#14532d', marginTop: '0.35rem' }}>
+                      {dailyStorageData?.summary?.total_physical_storage_gb ?? '0.00'} <span style={{ fontSize: '0.9rem', fontWeight: 500, color: '#166534' }}>GB</span>
+                    </div>
+                    <div style={{ fontSize: '0.75rem', color: '#166534', marginTop: '0.25rem' }}>
+                      {dailyStorageData?.summary?.total_files?.toLocaleString() ?? 0} verified raster band files
+                    </div>
+                  </div>
+                  <div style={{ padding: '0.6rem', borderRadius: '0.375rem', backgroundColor: '#dcfce7', color: '#16a34a' }}>
+                    <HardDrive size={20} />
+                  </div>
+                </div>
+
+                {/* Average Daily Storage */}
+                <div style={{
+                  padding: '1rem 1.15rem',
+                  borderRadius: '0.5rem',
+                  backgroundColor: '#fffbeb',
+                  border: '1px solid #fef3c7',
+                  display: 'flex',
+                  alignItems: 'flex-start',
+                  justifyContent: 'space-between'
+                }}>
+                  <div>
+                    <div style={{ fontSize: '0.78rem', fontWeight: 600, color: '#92400e', textTransform: 'uppercase', letterSpacing: '0.04em' }}>
+                      Average Daily Ingestion
+                    </div>
+                    <div style={{ fontSize: '1.45rem', fontWeight: 700, color: '#78350f', marginTop: '0.35rem' }}>
+                      {dailyStorageData?.summary?.avg_daily_storage_gb ?? '0.00'} <span style={{ fontSize: '0.9rem', fontWeight: 500, color: '#92400e' }}>GB / day</span>
+                    </div>
+                    <div style={{ fontSize: '0.75rem', color: '#92400e', marginTop: '0.25rem' }}>
+                      Across {dailyStorageData?.summary?.active_days_count ?? 0} active storage days
+                    </div>
+                  </div>
+                  <div style={{ padding: '0.6rem', borderRadius: '0.375rem', backgroundColor: '#fef3c7', color: '#d97706' }}>
+                    <TrendingUp size={20} />
+                  </div>
+                </div>
+
+                {/* Peak Ingestion Day */}
+                <div style={{
+                  padding: '1rem 1.15rem',
+                  borderRadius: '0.5rem',
+                  backgroundColor: '#f5f3ff',
+                  border: '1px solid #ddd6fe',
+                  display: 'flex',
+                  alignItems: 'flex-start',
+                  justifyContent: 'space-between'
+                }}>
+                  <div>
+                    <div style={{ fontSize: '0.78rem', fontWeight: 600, color: '#6b21a8', textTransform: 'uppercase', letterSpacing: '0.04em' }}>
+                      Peak Ingestion Day
+                    </div>
+                    <div style={{ fontSize: '1.45rem', fontWeight: 700, color: '#581c87', marginTop: '0.35rem' }}>
+                      {dailyStorageData?.summary?.peak_day ? `${dailyStorageData.summary.peak_day.storage_gb} GB` : '—'}
+                    </div>
+                    <div style={{ fontSize: '0.75rem', color: '#6b21a8', marginTop: '0.25rem' }}>
+                      {dailyStorageData?.summary?.peak_day ? `${dailyStorageData.summary.peak_day.date} (${dailyStorageData.summary.peak_day.request_count} reqs)` : 'No records yet'}
+                    </div>
+                  </div>
+                  <div style={{ padding: '0.6rem', borderRadius: '0.375rem', backgroundColor: '#ede9fe', color: '#7c3aed' }}>
+                    <Activity size={20} />
+                  </div>
+                </div>
+              </div>
+
+              {/* Visual Daily Storage Bar Chart */}
+              {dailyStorageData?.daily_timeline && dailyStorageData.daily_timeline.length > 0 && (() => {
+                const chronologicalTimeline = [...dailyStorageData.daily_timeline].sort((a, b) => a.date.localeCompare(b.date));
+                const maxDayValue = Math.max(
+                  ...chronologicalTimeline.map(d => Math.max(d.request_storage_gb || 0, d.physical_storage_gb || 0)),
+                  10
+                );
+
+                return (
+                  <div style={{
+                    backgroundColor: '#f8fafc',
+                    borderRadius: '0.5rem',
+                    border: '1px solid #e2e8f0',
+                    padding: '1.25rem',
+                    marginBottom: '1.5rem'
+                  }}>
+                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '1rem', flexWrap: 'wrap', gap: '0.5rem' }}>
+                      <div style={{ fontSize: '0.88rem', fontWeight: 700, color: '#1e293b', display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
+                        <BarChart3 size={16} color="#2563eb" /> Daily Ingestion Velocity Trend
+                      </div>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '1rem', fontSize: '0.78rem' }}>
+                        <span style={{ display: 'flex', alignItems: 'center', gap: '0.35rem', color: '#334155' }}>
+                          <span style={{ width: '10px', height: '10px', backgroundColor: '#3b82f6', borderRadius: '2px', display: 'inline-block' }}></span>
+                          Requested Storage (GB)
+                        </span>
+                        <span style={{ display: 'flex', alignItems: 'center', gap: '0.35rem', color: '#334155' }}>
+                          <span style={{ width: '10px', height: '10px', backgroundColor: '#10b981', borderRadius: '2px', display: 'inline-block' }}></span>
+                          Physical Downloaded (GB)
+                        </span>
+                      </div>
+                    </div>
+
+                    <div style={{
+                      display: 'flex',
+                      alignItems: 'flex-end',
+                      gap: '1rem',
+                      height: '140px',
+                      padding: '0.5rem 0.5rem 0.25rem 0.5rem',
+                      overflowX: 'auto',
+                      borderBottom: '1px solid #cbd5e1'
+                    }}>
+                      {chronologicalTimeline.map((day) => {
+                        const reqPct = Math.min(Math.round(((day.request_storage_gb || 0) / maxDayValue) * 100), 100);
+                        const physPct = Math.min(Math.round(((day.physical_storage_gb || 0) / maxDayValue) * 100), 100);
+                        const isExpanded = expandedDailyDate === day.date;
+
+                        return (
+                          <div
+                            key={day.date}
+                            onClick={() => setExpandedDailyDate(isExpanded ? null : day.date)}
+                            title={`Date: ${day.date}\nRequested: ${day.request_storage_gb} GB (${day.request_count} reqs)\nPhysical: ${day.physical_storage_gb} GB (${day.physical_files_count} files)`}
+                            style={{
+                              flex: '1',
+                              minWidth: '55px',
+                              maxWidth: '85px',
+                              height: '100%',
+                              display: 'flex',
+                              flexDirection: 'column',
+                              justifyContent: 'flex-end',
+                              alignItems: 'center',
+                              cursor: 'pointer',
+                              padding: '0.2rem',
+                              borderRadius: '0.375rem',
+                              backgroundColor: isExpanded ? '#eff6ff' : 'transparent',
+                              transition: 'all 0.15s ease'
+                            }}
+                          >
+                            <div style={{ display: 'flex', alignItems: 'flex-end', gap: '3px', height: '105px', width: '100%', justifyContent: 'center' }}>
+                              {/* Request GB bar */}
+                              <div style={{
+                                width: '40%',
+                                height: `${Math.max(reqPct, 4)}%`,
+                                backgroundColor: '#3b82f6',
+                                borderRadius: '3px 3px 0 0',
+                                transition: 'height 0.3s ease'
+                              }}></div>
+                              {/* Physical GB bar */}
+                              <div style={{
+                                width: '40%',
+                                height: `${Math.max(physPct, 4)}%`,
+                                backgroundColor: '#10b981',
+                                borderRadius: '3px 3px 0 0',
+                                transition: 'height 0.3s ease'
+                              }}></div>
+                            </div>
+                            <div style={{ fontSize: '0.7rem', fontWeight: 600, color: isExpanded ? '#2563eb' : '#64748b', marginTop: '0.4rem', whiteSpace: 'nowrap' }}>
+                              {day.date.slice(5)}
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                );
+              })()}
+
+              {/* Daily Storage Ledger Table */}
+              <div style={{ overflowX: 'auto', border: '1px solid #e2e8f0', borderRadius: '0.5rem' }}>
+                <table style={{ width: '100%', borderCollapse: 'collapse', textAlign: 'left', fontSize: '0.85rem' }}>
+                  <thead>
+                    <tr style={{ backgroundColor: '#f8fafc', borderBottom: '1px solid #e2e8f0', color: '#475569', fontWeight: 600 }}>
+                      <th style={{ padding: '0.75rem 0.85rem' }}>Date</th>
+                      <th style={{ padding: '0.75rem 0.85rem' }}>Requests Submitted</th>
+                      <th style={{ padding: '0.75rem 0.85rem' }}>Daily Requested Storage</th>
+                      <th style={{ padding: '0.75rem 0.85rem' }}>Physical NAS Storage</th>
+                      <th style={{ padding: '0.75rem 0.85rem' }}>Cumulative Storage</th>
+                      <th style={{ padding: '0.75rem 0.85rem' }}>Satellites</th>
+                      <th style={{ padding: '0.75rem 0.85rem' }}>Target Districts</th>
+                      <th style={{ padding: '0.75rem 0.85rem', textAlign: 'right' }}>Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {(!dailyStorageData?.daily_timeline || dailyStorageData.daily_timeline.length === 0) ? (
+                      <tr>
+                        <td colSpan={8} style={{ padding: '2rem', textAlign: 'center', color: '#64748b' }}>
+                          {loadingDailyStorage ? 'Loading daily storage data...' : 'No daily storage records found for selected period.'}
+                        </td>
+                      </tr>
+                    ) : (
+                      dailyStorageData.daily_timeline.map((day) => {
+                        const isExpanded = expandedDailyDate === day.date;
+
+                        return (
+                          <React.Fragment key={day.date}>
+                            <tr
+                              style={{
+                                borderBottom: '1px solid #e2e8f0',
+                                backgroundColor: isExpanded ? '#f8fafc' : '#ffffff',
+                                transition: 'background-color 0.15s ease'
+                              }}
+                            >
+                              <td style={{ padding: '0.75rem 0.85rem', fontWeight: 700, color: '#0f172a' }}>
+                                <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
+                                  <Calendar size={14} color="#64748b" />
+                                  <span>{day.date}</span>
+                                </div>
+                              </td>
+                              <td style={{ padding: '0.75rem 0.85rem' }}>
+                                {day.request_count > 0 ? (
+                                  <span style={{
+                                    padding: '0.2rem 0.55rem',
+                                    borderRadius: '9999px',
+                                    backgroundColor: '#eff6ff',
+                                    color: '#1d4ed8',
+                                    fontWeight: 600,
+                                    fontSize: '0.78rem'
+                                  }}>
+                                    {day.request_count} {day.request_count === 1 ? 'request' : 'requests'}
+                                  </span>
+                                ) : (
+                                  <span style={{ color: '#94a3b8', fontSize: '0.8rem' }}>0 (Download only)</span>
+                                )}
+                              </td>
+                              <td style={{ padding: '0.75rem 0.85rem', fontWeight: 700, color: '#2563eb' }}>
+                                {day.request_storage_gb > 0 ? `${day.request_storage_gb} GB` : '—'}
+                              </td>
+                              <td style={{ padding: '0.75rem 0.85rem', fontWeight: 600, color: '#059669' }}>
+                                {day.physical_storage_gb > 0 ? (
+                                  <span>{day.physical_storage_gb} GB <span style={{ fontSize: '0.72rem', color: '#64748b' }}>({day.physical_files_count} files)</span></span>
+                                ) : (
+                                  <span style={{ color: '#94a3b8' }}>—</span>
+                                )}
+                              </td>
+                              <td style={{ padding: '0.75rem 0.85rem', color: '#334155' }}>
+                                <div style={{ fontSize: '0.8rem', fontWeight: 600 }}>
+                                  Req: {day.cumulative_request_gb} GB
+                                </div>
+                                <div style={{ fontSize: '0.74rem', color: '#059669' }}>
+                                  NAS: {day.cumulative_physical_gb} GB
+                                </div>
+                              </td>
+                              <td style={{ padding: '0.75rem 0.85rem' }}>
+                                <div style={{ display: 'flex', gap: '0.25rem', flexWrap: 'wrap' }}>
+                                  {day.satellites && day.satellites.length > 0 ? (
+                                    day.satellites.map((sat) => (
+                                      <span
+                                        key={sat}
+                                        style={{
+                                          padding: '0.15rem 0.45rem',
+                                          borderRadius: '0.25rem',
+                                          fontSize: '0.72rem',
+                                          fontWeight: 600,
+                                          backgroundColor: '#e0e7ff',
+                                          color: '#3730a3'
+                                        }}
+                                      >
+                                        {sat}
+                                      </span>
+                                    ))
+                                  ) : (
+                                    <span style={{ color: '#94a3b8', fontSize: '0.75rem' }}>—</span>
+                                  )}
+                                </div>
+                              </td>
+                              <td style={{ padding: '0.75rem 0.85rem' }}>
+                                <div style={{ display: 'flex', gap: '0.25rem', flexWrap: 'wrap', maxWidth: '180px' }}>
+                                  {day.districts && day.districts.length > 0 ? (
+                                    day.districts.map((dst) => (
+                                      <span
+                                        key={dst}
+                                        style={{
+                                          padding: '0.15rem 0.4rem',
+                                          borderRadius: '0.25rem',
+                                          fontSize: '0.72rem',
+                                          backgroundColor: '#f1f5f9',
+                                          color: '#334155'
+                                        }}
+                                      >
+                                        {dst}
+                                      </span>
+                                    ))
+                                  ) : (
+                                    <span style={{ color: '#94a3b8', fontSize: '0.75rem' }}>—</span>
+                                  )}
+                                </div>
+                              </td>
+                              <td style={{ padding: '0.75rem 0.85rem', textAlign: 'right' }}>
+                                <button
+                                  type="button"
+                                  onClick={() => setExpandedDailyDate(isExpanded ? null : day.date)}
+                                  style={{
+                                    display: 'inline-flex',
+                                    alignItems: 'center',
+                                    gap: '0.25rem',
+                                    padding: '0.35rem 0.65rem',
+                                    borderRadius: '0.375rem',
+                                    border: '1px solid #cbd5e1',
+                                    backgroundColor: isExpanded ? '#2563eb' : '#ffffff',
+                                    color: isExpanded ? '#ffffff' : '#334155',
+                                    fontSize: '0.78rem',
+                                    fontWeight: 600,
+                                    cursor: 'pointer'
+                                  }}
+                                >
+                                  {isExpanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+                                  {isExpanded ? 'Hide' : 'Details'}
+                                </button>
+                              </td>
+                            </tr>
+
+                            {/* Nested Requests View */}
+                            {isExpanded && (
+                              <tr style={{ backgroundColor: '#f8fafc' }}>
+                                <td colSpan={8} style={{ padding: '1rem 1.25rem', borderBottom: '2px solid #e2e8f0' }}>
+                                  <div style={{ backgroundColor: '#ffffff', border: '1px solid #cbd5e1', borderRadius: '0.5rem', padding: '1rem' }}>
+                                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '0.75rem' }}>
+                                      <h4 style={{ margin: 0, fontSize: '0.9rem', fontWeight: 700, color: '#0f172a' }}>
+                                        Requests Logged on {day.date} ({day.requests?.length || 0})
+                                      </h4>
+                                      <span style={{ fontSize: '0.78rem', color: '#64748b' }}>
+                                        Daily Allocated Storage: <strong style={{ color: '#2563eb' }}>{day.request_storage_gb} GB</strong>
+                                      </span>
+                                    </div>
+
+                                    {(!day.requests || day.requests.length === 0) ? (
+                                      <div style={{ padding: '1rem', textAlign: 'center', color: '#64748b', fontSize: '0.82rem' }}>
+                                        No new request records created on this date. File downloads processed were initiated from previous pipeline jobs.
+                                      </div>
+                                    ) : (
+                                      <div style={{ overflowX: 'auto' }}>
+                                        <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.8rem', textAlign: 'left' }}>
+                                          <thead>
+                                            <tr style={{ backgroundColor: '#f1f5f9', color: '#475569', borderBottom: '1px solid #e2e8f0' }}>
+                                              <th style={{ padding: '0.5rem 0.65rem' }}>ID</th>
+                                              <th style={{ padding: '0.5rem 0.65rem' }}>Title</th>
+                                              <th style={{ padding: '0.5rem 0.65rem' }}>User</th>
+                                              <th style={{ padding: '0.5rem 0.65rem' }}>Region</th>
+                                              <th style={{ padding: '0.5rem 0.65rem' }}>Satellite</th>
+                                              <th style={{ padding: '0.5rem 0.65rem' }}>Est. Storage</th>
+                                              <th style={{ padding: '0.5rem 0.65rem' }}>Status</th>
+                                              <th style={{ padding: '0.5rem 0.65rem', textAlign: 'right' }}>Logs</th>
+                                            </tr>
+                                          </thead>
+                                          <tbody>
+                                            {day.requests.map((r) => (
+                                              <tr key={r.id} style={{ borderBottom: '1px solid #f1f5f9' }}>
+                                                <td style={{ padding: '0.5rem 0.65rem', fontWeight: 700, color: '#2563eb' }}>#{r.id}</td>
+                                                <td style={{ padding: '0.5rem 0.65rem', fontWeight: 600, color: '#0f172a' }}>{r.title}</td>
+                                                <td style={{ padding: '0.5rem 0.65rem', color: '#334155' }}>
+                                                  <div>{r.user_name}</div>
+                                                  <div style={{ fontSize: '0.72rem', color: '#64748b' }}>{r.user_email}</div>
+                                                </td>
+                                                <td style={{ padding: '0.5rem 0.65rem', color: '#334155' }}>
+                                                  {r.district ? `${r.district}, ${r.state}` : r.state || 'All India'}
+                                                </td>
+                                                <td style={{ padding: '0.5rem 0.65rem', fontWeight: 600 }}>{r.satellite}</td>
+                                                <td style={{ padding: '0.5rem 0.65rem', fontWeight: 700, color: '#2563eb' }}>{r.storage_gb} GB</td>
+                                                <td style={{ padding: '0.5rem 0.65rem' }}>
+                                                  {renderStatusBadge(r.status)}
+                                                </td>
+                                                <td style={{ padding: '0.5rem 0.65rem', textAlign: 'right' }}>
+                                                  <button
+                                                    type="button"
+                                                    onClick={() => openLogsModal(r)}
+                                                    style={{
+                                                      display: 'inline-flex',
+                                                      alignItems: 'center',
+                                                      gap: '0.25rem',
+                                                      padding: '0.25rem 0.5rem',
+                                                      borderRadius: '0.25rem',
+                                                      border: '1px solid #cbd5e1',
+                                                      backgroundColor: '#ffffff',
+                                                      fontSize: '0.74rem',
+                                                      fontWeight: 600,
+                                                      color: '#334155',
+                                                      cursor: 'pointer'
+                                                    }}
+                                                  >
+                                                    <Terminal size={11} color="#2563eb" /> Logs
+                                                  </button>
+                                                </td>
+                                              </tr>
+                                            ))}
+                                          </tbody>
+                                        </table>
+                                      </div>
+                                    )}
+                                  </div>
+                                </td>
+                              </tr>
+                            )}
+                          </React.Fragment>
+                        );
+                      })
+                    )}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* ========================================================================= */}
+        {/* TAB 3B: System User Directory & Access Controls (Dedicated Admin Page) */}
+        {/* ========================================================================= */}
+        {activeTab === 'users' && currentUser.role === 'ADMIN' && (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '1.5rem' }}>
+
             {/* User Management & Per-User Requests/Logs Section */}
             <div style={{
               backgroundColor: '#ffffff',
@@ -3054,7 +4180,7 @@ export default function App() {
                   <Users size={18} color="#2563eb" /> System User Directory & Access Controls
                 </h3>
                 <span style={{ fontSize: '0.8rem', color: '#64748b' }}>
-                  Select any user below to view their individual requests and pipeline execution logs.
+                  Add new users, assign roles (USER / ADMIN), manage permissions, delete accounts, or inspect individual user pipelines and logs.
                 </span>
               </div>
 
@@ -3143,7 +4269,7 @@ export default function App() {
                       <th style={{ padding: '0.75rem 0.85rem' }}>Role</th>
                       <th style={{ padding: '0.75rem 0.85rem' }}>Total Requests</th>
                       <th style={{ padding: '0.75rem 0.85rem' }}>Account Status</th>
-                      <th style={{ padding: '0.75rem 0.85rem', textAlign: 'right' }}>User Work & Logs</th>
+                      <th style={{ padding: '0.75rem 0.85rem', textAlign: 'right' }}>Actions</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -3197,25 +4323,50 @@ export default function App() {
                                 <span style={{ color: '#166534', fontWeight: 600, fontSize: '0.75rem' }}>● ACTIVE</span>
                               </td>
                               <td style={{ padding: '0.75rem 0.85rem', textAlign: 'right' }}>
-                                <button
-                                  onClick={() => toggleExpandUser(u.id)}
-                                  style={{
-                                    display: 'inline-flex',
-                                    alignItems: 'center',
-                                    gap: '0.35rem',
-                                    padding: '0.35rem 0.7rem',
-                                    backgroundColor: isExpanded ? '#2563eb' : '#ffffff',
-                                    color: isExpanded ? '#ffffff' : '#2563eb',
-                                    border: '1px solid #2563eb',
-                                    borderRadius: '0.375rem',
-                                    fontSize: '0.78rem',
-                                    fontWeight: 600,
-                                    cursor: 'pointer'
-                                  }}
-                                >
-                                  {isExpanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
-                                  {isExpanded ? 'Hide Requests' : 'View Requests & Logs'}
-                                </button>
+                                <div style={{ display: 'inline-flex', alignItems: 'center', gap: '0.4rem', justifyContent: 'flex-end' }}>
+                                  <button
+                                    type="button"
+                                    onClick={() => toggleExpandUser(u.id)}
+                                    style={{
+                                      display: 'inline-flex',
+                                      alignItems: 'center',
+                                      gap: '0.35rem',
+                                      padding: '0.35rem 0.65rem',
+                                      backgroundColor: isExpanded ? '#2563eb' : '#ffffff',
+                                      color: isExpanded ? '#ffffff' : '#2563eb',
+                                      border: '1px solid #2563eb',
+                                      borderRadius: '0.375rem',
+                                      fontSize: '0.78rem',
+                                      fontWeight: 600,
+                                      cursor: 'pointer'
+                                    }}
+                                  >
+                                    {isExpanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+                                    {isExpanded ? 'Hide' : 'Requests & Logs'}
+                                  </button>
+
+                                  <button
+                                    type="button"
+                                    onClick={() => handleDeleteUser(u.id, u.email)}
+                                    disabled={u.id === currentUser?.id || u.email === currentUser?.email}
+                                    title={u.id === currentUser?.id || u.email === currentUser?.email ? "Cannot delete your own active administrator account" : `Delete user account (${u.email})`}
+                                    style={{
+                                      display: 'inline-flex',
+                                      alignItems: 'center',
+                                      gap: '0.25rem',
+                                      padding: '0.35rem 0.6rem',
+                                      backgroundColor: (u.id === currentUser?.id || u.email === currentUser?.email) ? '#f1f5f9' : '#fee2e2',
+                                      color: (u.id === currentUser?.id || u.email === currentUser?.email) ? '#94a3b8' : '#991b1b',
+                                      border: (u.id === currentUser?.id || u.email === currentUser?.email) ? '1px solid #e2e8f0' : '1px solid #fecaca',
+                                      borderRadius: '0.375rem',
+                                      fontSize: '0.78rem',
+                                      fontWeight: 600,
+                                      cursor: (u.id === currentUser?.id || u.email === currentUser?.email) ? 'not-allowed' : 'pointer'
+                                    }}
+                                  >
+                                    <Trash2 size={13} /> Delete
+                                  </button>
+                                </div>
                               </td>
                             </tr>
 
@@ -4327,6 +5478,8 @@ export default function App() {
                       const st = e.target.value;
                       setStackState(st);
                       setStackDistrict('');
+                      setStackDownloadedBandsData({});
+                      setStackSelectedScenes({});
                       fetchStackHistory('');
                     }}
                     style={{ width: '100%', padding: '0.5rem 0.75rem', borderRadius: '0.375rem', border: '1px solid #cbd5e1', fontSize: '0.875rem', backgroundColor: '#ffffff' }}
@@ -4350,6 +5503,12 @@ export default function App() {
                       const d = e.target.value;
                       setStackDistrict(d);
                       fetchStackHistory(d);
+                      if (d) {
+                        loadBandsAndScenesForRegion(stackState, d, stackSeason, stackStartDate, stackEndDate);
+                      } else {
+                        setStackDownloadedBandsData({});
+                        setStackSelectedScenes({});
+                      }
                     }}
                     style={{ width: '100%', padding: '0.5rem 0.75rem', borderRadius: '0.375rem', border: '1px solid #cbd5e1', fontSize: '0.875rem', backgroundColor: '#ffffff', fontWeight: 600 }}
                   >
@@ -4396,7 +5555,13 @@ export default function App() {
                   <input
                     type="date"
                     value={stackStartDate}
-                    onChange={(e) => setStackStartDate(e.target.value)}
+                    onChange={(e) => {
+                      const val = e.target.value;
+                      setStackStartDate(val);
+                      if (stackDistrict) {
+                        loadBandsAndScenesForRegion(stackState, stackDistrict, stackSeason, val, stackEndDate);
+                      }
+                    }}
                     style={{ width: '100%', padding: '0.5rem 0.75rem', borderRadius: '0.375rem', border: '1px solid #cbd5e1', fontSize: '0.875rem', backgroundColor: '#ffffff', boxSizing: 'border-box' }}
                   />
                 </div>
@@ -4409,11 +5574,36 @@ export default function App() {
                   <input
                     type="date"
                     value={stackEndDate}
-                    onChange={(e) => setStackEndDate(e.target.value)}
+                    onChange={(e) => {
+                      const val = e.target.value;
+                      setStackEndDate(val);
+                      if (stackDistrict) {
+                        loadBandsAndScenesForRegion(stackState, stackDistrict, stackSeason, stackStartDate, val);
+                      }
+                    }}
                     style={{ width: '100%', padding: '0.5rem 0.75rem', borderRadius: '0.375rem', border: '1px solid #cbd5e1', fontSize: '0.875rem', backgroundColor: '#ffffff', boxSizing: 'border-box' }}
                   />
                 </div>
               </div>
+
+              {/* Auto-loading status indicator */}
+              {loadingStackReqFiles && (
+                <div style={{
+                  padding: '0.65rem 1rem',
+                  borderRadius: '0.375rem',
+                  backgroundColor: '#eff6ff',
+                  border: '1px solid #bfdbfe',
+                  color: '#1d4ed8',
+                  fontSize: '0.82rem',
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: '0.5rem',
+                  marginBottom: '1rem'
+                }}>
+                  <RefreshCw size={14} className="spin" />
+                  <span>Auto-loading pre-downloaded spectral bands &amp; scenes from NAS for <strong>{stackDistrict || stackState}</strong>...</span>
+                </div>
+              )}
 
               {/* Order-Preserved Stack Sequence Visualizer */}
               <div style={{
@@ -4519,153 +5709,323 @@ export default function App() {
                 )}
               </div>
 
-              {/* Band and Index Checkbox Groups */}
-              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))', gap: '1.25rem', marginBottom: '1.5rem' }}>
-                
-                {/* 1. Optical Spectral Bands */}
-                <div style={{ border: '1px solid #e2e8f0', borderRadius: '0.5rem', padding: '1rem' }}>
-                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '0.75rem', borderBottom: '1px solid #f1f5f9', paddingBottom: '0.5rem' }}>
-                    <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
-                      <Satellite size={16} color="#059669" />
-                      <span style={{ fontSize: '0.85rem', fontWeight: 700, color: '#0f172a' }}>
-                        Optical Spectral Bands (Sentinel-2 MSI)
-                      </span>
-                    </div>
-                  </div>
-                  <div style={{ display: 'flex', flexDirection: 'column', gap: '0.45rem', maxHeight: '280px', overflowY: 'auto' }}>
-                    {AVAILABLE_OPTICAL_BANDS.map(b => {
-                      const isChecked = stackSelectedLayers.includes(b.id);
-                      const orderIdx = stackSelectedLayers.indexOf(b.id);
-                      return (
-                        <label
-                          key={b.id}
-                          style={{
-                            display: 'flex',
-                            alignItems: 'center',
-                            justifyContent: 'space-between',
-                            padding: '0.45rem 0.65rem',
-                            borderRadius: '0.25rem',
-                            backgroundColor: isChecked ? '#f0fdf4' : 'transparent',
-                            cursor: 'pointer',
-                            fontSize: '0.82rem',
-                            color: isChecked ? '#065f46' : '#334155'
-                          }}
-                        >
-                          <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-                            <input
-                              type="checkbox"
-                              checked={isChecked}
-                              onChange={() => toggleStackLayer(b.id)}
-                            />
-                            <span style={{ fontWeight: isChecked ? 600 : 400 }}>{b.label}</span>
-                          </div>
+              {/* Band and Index Checkbox Groups (1. Indices, 2. SAR, 3. Optical) */}
+              {(() => {
+                const renderLayerCard = (item, groupColor, groupBgLight, groupBorderLight) => {
+                  const isChecked = stackSelectedLayers.includes(item.id);
+                  const orderIdx = stackSelectedLayers.indexOf(item.id);
+                  const scenes = stackDownloadedBandsData[item.id] || [];
+                  const hasScenes = scenes.length > 0;
+                  const bandSelectedSet = stackSelectedScenes[item.id];
+                  const selectedCount = bandSelectedSet !== undefined 
+                    ? scenes.filter(s => bandSelectedSet.has(s.path || s.scene_id)).length 
+                    : scenes.length;
+
+                  return (
+                    <div
+                      key={item.id}
+                      style={{
+                        border: `1px solid ${isChecked ? groupBorderLight : '#e2e8f0'}`,
+                        borderRadius: '0.375rem',
+                        backgroundColor: isChecked ? groupBgLight : '#ffffff',
+                        overflow: 'hidden',
+                        transition: 'all 0.15s ease'
+                      }}
+                    >
+                      <div
+                        onClick={() => toggleStackLayer(item.id)}
+                        style={{
+                          display: 'flex',
+                          alignItems: 'center',
+                          justifyContent: 'space-between',
+                          padding: '0.45rem 0.65rem',
+                          cursor: 'pointer'
+                        }}
+                      >
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', minWidth: 0 }}>
+                          <input
+                            type="checkbox"
+                            checked={isChecked}
+                            readOnly
+                            style={{
+                              pointerEvents: 'none',
+                              cursor: 'pointer',
+                              width: '16px',
+                              height: '16px',
+                              accentColor: groupColor
+                            }}
+                          />
+                          <span style={{ fontWeight: isChecked ? 600 : 400, fontSize: '0.82rem', color: isChecked ? groupColor : '#334155', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                            {item.label}
+                          </span>
+                        </div>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '0.35rem', flexShrink: 0, marginLeft: '0.5rem' }}>
+                          {hasScenes && (
+                            <span style={{ fontSize: '0.68rem', color: '#64748b', backgroundColor: '#f1f5f9', padding: '0.1rem 0.35rem', borderRadius: '0.2rem', fontWeight: 500 }}>
+                              {scenes.length} scene{scenes.length > 1 ? 's' : ''}
+                            </span>
+                          )}
                           {isChecked && (
-                            <span style={{ backgroundColor: '#059669', color: '#ffffff', borderRadius: '0.2rem', padding: '0.05rem 0.35rem', fontSize: '0.7rem', fontWeight: 700 }}>
+                            <span style={{ backgroundColor: groupColor, color: '#ffffff', borderRadius: '0.2rem', padding: '0.05rem 0.35rem', fontSize: '0.7rem', fontWeight: 700 }}>
                               #{orderIdx + 1}
                             </span>
                           )}
-                        </label>
-                      );
-                    })}
-                  </div>
-                </div>
+                        </div>
+                      </div>
 
-                {/* 2. SAR Radar Polarizations */}
-                <div style={{ border: '1px solid #e2e8f0', borderRadius: '0.5rem', padding: '1rem' }}>
-                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '0.75rem', borderBottom: '1px solid #f1f5f9', paddingBottom: '0.5rem' }}>
-                    <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
-                      <Activity size={16} color="#d97706" />
-                      <span style={{ fontSize: '0.85rem', fontWeight: 700, color: '#0f172a' }}>
-                        SAR Radar Polarizations (Sentinel-1 C-Band)
-                      </span>
+                      {/* Downloaded scenes list when band/index is selected */}
+                      {isChecked && (
+                        <div style={{
+                          backgroundColor: '#f8fafc',
+                          borderTop: `1px solid ${groupBorderLight}`,
+                          padding: '0.45rem 0.55rem',
+                          display: 'flex',
+                          flexDirection: 'column',
+                          gap: '0.3rem'
+                        }}>
+                          {hasScenes ? (
+                            <>
+                              <div style={{
+                                fontSize: '0.73rem',
+                                fontWeight: 600,
+                                color: '#475569',
+                                display: 'flex',
+                                justifyContent: 'space-between',
+                                alignItems: 'center',
+                                paddingBottom: '0.35rem',
+                                borderBottom: '1px solid #e2e8f0',
+                                flexWrap: 'wrap',
+                                gap: '0.35rem'
+                              }}>
+                                <span>
+                                  Downloaded Scenes (<strong style={{ color: selectedCount > 0 ? '#16a34a' : '#dc2626' }}>{selectedCount}</strong>/{scenes.length} selected):
+                                </span>
+                                <div style={{ display: 'flex', gap: '0.35rem' }}>
+                                  <button
+                                    type="button"
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      selectAllScenesForBand(item.id);
+                                    }}
+                                    style={{
+                                      fontSize: '0.7rem',
+                                      padding: '0.2rem 0.5rem',
+                                      borderRadius: '0.25rem',
+                                      border: '1px solid #bbf7d0',
+                                      backgroundColor: '#f0fdf4',
+                                      color: '#16a34a',
+                                      fontWeight: 700,
+                                      cursor: 'pointer'
+                                    }}
+                                    title="Select all scenes for this band"
+                                  >
+                                    ✓ Select All
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      deselectAllScenesForBand(item.id);
+                                    }}
+                                    style={{
+                                      fontSize: '0.7rem',
+                                      padding: '0.2rem 0.5rem',
+                                      borderRadius: '0.25rem',
+                                      border: '1px solid #cbd5e1',
+                                      backgroundColor: '#ffffff',
+                                      color: '#64748b',
+                                      fontWeight: 600,
+                                      cursor: 'pointer'
+                                    }}
+                                    title="Deselect all scenes for this band"
+                                  >
+                                    ✕ Clear
+                                  </button>
+                                </div>
+                              </div>
+
+                              <div style={{
+                                maxHeight: '220px',
+                                overflowY: 'auto',
+                                display: 'flex',
+                                flexDirection: 'column',
+                                gap: '0.35rem',
+                                paddingRight: '0.15rem'
+                              }}>
+                                {scenes.map((s, sIdx) => {
+                                  const sceneKey = s.path || s.scene_id;
+                                  const isSceneSelected = bandSelectedSet !== undefined ? bandSelectedSet.has(sceneKey) : true;
+                                  return (
+                                    <div
+                                      key={sceneKey || sIdx}
+                                      onClick={() => toggleSceneSelection(item.id, sceneKey)}
+                                      style={{
+                                        display: 'flex',
+                                        alignItems: 'center',
+                                        justifyContent: 'space-between',
+                                        backgroundColor: isSceneSelected ? '#ffffff' : '#f8fafc',
+                                        border: `1px solid ${isSceneSelected ? groupBorderLight : '#e2e8f0'}`,
+                                        borderRadius: '0.35rem',
+                                        padding: '0.45rem 0.6rem',
+                                        fontSize: '0.75rem',
+                                        cursor: 'pointer',
+                                        userSelect: 'none',
+                                        boxShadow: isSceneSelected ? '0 1px 2px rgba(0,0,0,0.05)' : 'none',
+                                        opacity: isSceneSelected ? 1 : 0.6,
+                                        transition: 'all 0.15s ease'
+                                      }}
+                                    >
+                                      <div style={{ display: 'flex', alignItems: 'center', gap: '0.55rem', minWidth: 0, flex: 1 }}>
+                                        <input
+                                          type="checkbox"
+                                          checked={!!isSceneSelected}
+                                          readOnly
+                                          style={{
+                                            pointerEvents: 'none',
+                                            cursor: 'pointer',
+                                            width: '16px',
+                                            height: '16px',
+                                            accentColor: groupColor
+                                          }}
+                                        />
+                                        <div style={{ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                                          <span style={{ fontWeight: 600, color: isSceneSelected ? '#0f172a' : '#64748b' }}>
+                                            📅 {s.sensing_date ? s.sensing_date.split('T')[0] : 'N/A'}
+                                          </span>
+                                          {s.tile && (
+                                            <span style={{ backgroundColor: isSceneSelected ? '#e2e8f0' : '#f1f5f9', color: isSceneSelected ? '#1e293b' : '#64748b', borderRadius: '0.2rem', padding: '0.05rem 0.35rem', fontSize: '0.68rem', fontWeight: 700, marginLeft: '0.35rem' }}>
+                                              {s.tile}
+                                            </span>
+                                          )}
+                                          <span style={{ color: isSceneSelected ? '#334155' : '#94a3b8', marginLeft: '0.35rem' }}>
+                                            🛰️ {s.scene_id ? (s.scene_id.length > 22 ? s.scene_id.substring(0, 20) + '...' : s.scene_id) : 'Scene'}
+                                          </span>
+                                          {s.filename && (
+                                            <span style={{ color: isSceneSelected ? groupColor : '#94a3b8', marginLeft: '0.45rem', fontFamily: 'monospace', fontSize: '0.7rem' }}>
+                                              ({s.filename})
+                                            </span>
+                                          )}
+                                        </div>
+                                      </div>
+                                      <button
+                                        type="button"
+                                        onClick={(e) => {
+                                          e.stopPropagation();
+                                          deleteSceneFromBand(item.id, sceneKey);
+                                        }}
+                                        title="Exclude / delete this scene"
+                                        style={{
+                                          background: 'none',
+                                          border: 'none',
+                                          color: '#ef4444',
+                                          cursor: 'pointer',
+                                          padding: '0.2rem 0.35rem',
+                                          borderRadius: '0.25rem',
+                                          display: 'flex',
+                                          alignItems: 'center',
+                                          marginLeft: '0.4rem'
+                                        }}
+                                      >
+                                        <X size={14} />
+                                      </button>
+                                    </div>
+                                  );
+                                })}
+                              </div>
+                            </>
+                          ) : (
+                            <div style={{ fontSize: '0.73rem', color: '#94a3b8', fontStyle: 'italic', padding: '0.25rem 0.35rem' }}>
+                              {stackDistrict ? `No pre-downloaded scenes found for ${stackDistrict}.` : 'Select a Target District above to load downloaded scenes.'}
+                            </div>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  );
+                };
+
+                return (
+                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(300px, 1fr))', gap: '1.25rem', marginBottom: '1.5rem' }}>
+                    {/* 1. Derived Spectral Indices (FIRST) */}
+                    <div style={{ border: '1px solid #bfdbfe', borderRadius: '0.5rem', padding: '1rem', backgroundColor: '#fbfcfe' }}>
+                      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '0.75rem', borderBottom: '1px solid #dbeafe', paddingBottom: '0.5rem' }}>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
+                          <Sliders size={16} color="#2563eb" />
+                          <span style={{ fontSize: '0.85rem', fontWeight: 700, color: '#1e40af' }}>
+                            Derived Spectral Indices (Calculated On-The-Fly)
+                          </span>
+                        </div>
+                      </div>
+                      <div style={{ display: 'flex', flexDirection: 'column', gap: '0.65rem' }}>
+                        {AVAILABLE_INDICES.map(idx => renderLayerCard(idx, '#1d4ed8', '#eff6ff', '#bfdbfe'))}
+                      </div>
+                    </div>
+
+                    {/* 2. SAR Radar Polarizations (SECOND) */}
+                    <div style={{ border: '1px solid #fde68a', borderRadius: '0.5rem', padding: '1rem', backgroundColor: '#fffdfa' }}>
+                      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '0.75rem', borderBottom: '1px solid #fef3c7', paddingBottom: '0.5rem' }}>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
+                          <Activity size={16} color="#d97706" />
+                          <span style={{ fontSize: '0.85rem', fontWeight: 700, color: '#92400e' }}>
+                            SAR Radar Polarizations (Sentinel-1 C-Band)
+                          </span>
+                        </div>
+                      </div>
+                      <div style={{ display: 'flex', flexDirection: 'column', gap: '0.65rem' }}>
+                        {AVAILABLE_SAR_BANDS.map(b => renderLayerCard(b, '#92400e', '#fffbeb', '#fde68a'))}
+                      </div>
+                    </div>
+
+                    {/* 3. Optical Spectral Bands (THIRD) */}
+                    <div style={{ border: '1px solid #bbf7d0', borderRadius: '0.5rem', padding: '1rem', backgroundColor: '#fafffd' }}>
+                      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '0.75rem', borderBottom: '1px solid #dcfce7', paddingBottom: '0.5rem' }}>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
+                          <Satellite size={16} color="#059669" />
+                          <span style={{ fontSize: '0.85rem', fontWeight: 700, color: '#065f46' }}>
+                            Optical Spectral Bands (Sentinel-2 MSI)
+                          </span>
+                        </div>
+                      </div>
+                      <div style={{ display: 'flex', flexDirection: 'column', gap: '0.65rem' }}>
+                        {AVAILABLE_OPTICAL_BANDS.map(b => renderLayerCard(b, '#065f46', '#f0fdf4', '#bbf7d0'))}
+                      </div>
                     </div>
                   </div>
-                  <div style={{ display: 'flex', flexDirection: 'column', gap: '0.45rem', maxHeight: '280px', overflowY: 'auto' }}>
-                    {AVAILABLE_SAR_BANDS.map(b => {
-                      const isChecked = stackSelectedLayers.includes(b.id);
-                      const orderIdx = stackSelectedLayers.indexOf(b.id);
-                      return (
-                        <label
-                          key={b.id}
-                          style={{
-                            display: 'flex',
-                            alignItems: 'center',
-                            justifyContent: 'space-between',
-                            padding: '0.45rem 0.65rem',
-                            borderRadius: '0.25rem',
-                            backgroundColor: isChecked ? '#fffbeb' : 'transparent',
-                            cursor: 'pointer',
-                            fontSize: '0.82rem',
-                            color: isChecked ? '#92400e' : '#334155'
-                          }}
-                        >
-                          <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-                            <input
-                              type="checkbox"
-                              checked={isChecked}
-                              onChange={() => toggleStackLayer(b.id)}
-                            />
-                            <span style={{ fontWeight: isChecked ? 600 : 400 }}>{b.label}</span>
-                          </div>
-                          {isChecked && (
-                            <span style={{ backgroundColor: '#d97706', color: '#ffffff', borderRadius: '0.2rem', padding: '0.05rem 0.35rem', fontSize: '0.7rem', fontWeight: 700 }}>
-                              #{orderIdx + 1}
-                            </span>
-                          )}
-                        </label>
-                      );
-                    })}
-                  </div>
-                </div>
+                );
+              })()}
 
-                {/* 3. Derived Spectral Indices */}
-                <div style={{ border: '1px solid #e2e8f0', borderRadius: '0.5rem', padding: '1rem' }}>
-                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '0.75rem', borderBottom: '1px solid #f1f5f9', paddingBottom: '0.5rem' }}>
-                    <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
-                      <Sliders size={16} color="#2563eb" />
-                      <span style={{ fontSize: '0.85rem', fontWeight: 700, color: '#0f172a' }}>
-                        Derived Spectral Indices (Calculated On-The-Fly)
-                      </span>
-                    </div>
-                  </div>
-                  <div style={{ display: 'flex', flexDirection: 'column', gap: '0.45rem', maxHeight: '280px', overflowY: 'auto' }}>
-                    {AVAILABLE_INDICES.map(idx => {
-                      const isChecked = stackSelectedLayers.includes(idx.id);
-                      const orderIdx = stackSelectedLayers.indexOf(idx.id);
-                      return (
-                        <label
-                          key={idx.id}
-                          style={{
-                            display: 'flex',
-                            alignItems: 'center',
-                            justifyContent: 'space-between',
-                            padding: '0.45rem 0.65rem',
-                            borderRadius: '0.25rem',
-                            backgroundColor: isChecked ? '#eff6ff' : 'transparent',
-                            cursor: 'pointer',
-                            fontSize: '0.82rem',
-                            color: isChecked ? '#1d4ed8' : '#334155'
-                          }}
-                        >
-                          <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-                            <input
-                              type="checkbox"
-                              checked={isChecked}
-                              onChange={() => toggleStackLayer(idx.id)}
-                            />
-                            <span style={{ fontWeight: isChecked ? 600 : 400 }}>{idx.label}</span>
-                          </div>
-                          {isChecked && (
-                            <span style={{ backgroundColor: '#2563eb', color: '#ffffff', borderRadius: '0.2rem', padding: '0.05rem 0.35rem', fontSize: '0.7rem', fontWeight: 700 }}>
-                              #{orderIdx + 1}
-                            </span>
-                          )}
-                        </label>
-                      );
-                    })}
-                  </div>
+              {/* Preserved Output Filename Field */}
+              <div style={{
+                marginBottom: '1.5rem',
+                padding: '0.85rem 1.25rem',
+                backgroundColor: '#f8fafc',
+                borderRadius: '0.5rem',
+                border: '1px solid #e2e8f0'
+              }}>
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '0.35rem', flexWrap: 'wrap', gap: '0.5rem' }}>
+                  <label style={{ fontSize: '0.85rem', fontWeight: 600, color: '#334155' }}>
+                    Output Stack Filename (Preserved Filename)
+                  </label>
+                  <span style={{ fontSize: '0.75rem', color: '#64748b' }}>
+                    Keeps exact original filename for downloaded rasters (e.g. <code style={{ backgroundColor: '#e2e8f0', padding: '0.1rem 0.3rem', borderRadius: '0.2rem', color: '#0f172a' }}>NDVI.tif</code>)
+                  </span>
                 </div>
-
+                <input
+                  type="text"
+                  value={stackCustomFilename}
+                  onChange={(e) => setStackCustomFilename(e.target.value)}
+                  placeholder="e.g. NDVI.tif or district_stack.tif"
+                  style={{
+                    width: '100%',
+                    padding: '0.55rem 0.75rem',
+                    borderRadius: '0.375rem',
+                    border: '1px solid #cbd5e1',
+                    fontSize: '0.85rem',
+                    fontFamily: 'monospace',
+                    backgroundColor: '#ffffff',
+                    boxSizing: 'border-box'
+                  }}
+                />
               </div>
 
               {/* Execution Actions & Output Preview */}
