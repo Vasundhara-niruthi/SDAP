@@ -23,6 +23,7 @@ Description:
 """
 
 import os
+import json
 import calendar
 import tempfile
 import shutil
@@ -32,17 +33,17 @@ from typing import List, Dict, Any, Tuple, Optional
 
 import numpy as np
 import rasterio
-from rasterio.mask import mask
-from rasterio.warp import calculate_default_transform, reproject, Resampling
-from rasterio.merge import merge
+import rasterio.features
+import rasterio.windows
+from rasterio.warp import reproject, Resampling, transform_bounds
 from shapely.geometry import shape
 from sqlalchemy.orm import Session
-from sqlalchemy import text
+from sqlalchemy import text, func
 
 from app.core.config import settings
-from app.models.sdap_models import RequestModel, BandFileModel
+from app.models.sdap_models import RequestModel, ProcessJobModel, SceneModel, BandFileModel
 from app.services.delivery_service import get_district_geometry_from_db
-from app.services.downloader_service import verify_raster
+from app.services.downloader_service import verify_raster, resolve_tif_path, is_raster_overlapping_district
 
 logger = logging.getLogger("sdap.compositor")
 
@@ -159,69 +160,131 @@ def find_index_rasters_for_window(
     district_name: str,
     window_start: str,
     window_end: str,
-    index_name: str
+    index_name: str,
+    request_id: Optional[int] = None,
+    district_bbox: Optional[Tuple[float, float, float, float]] = None
 ) -> List[str]:
     """
     Finds all verified spectral index GeoTIFFs (e.g. NDVI, LSWI) downloaded or computed
-    for any tile overlapping district_name within the specified window dates.
+    for tiles covering district_name within the specified window dates.
+    Strictly verifies spatial overlap so out-of-district tiles are never included.
     """
     idx_clean = index_name.upper().strip()
-    idx_filenames = [f"{idx_clean}.tif", f"{idx_clean}.tiff"]
+    clean_d = district_name.split(",")[0].strip().lower()
 
     w_start_dt = datetime.strptime(window_start, "%Y-%m-%d").date()
     w_end_dt = datetime.strptime(window_end, "%Y-%m-%d").date()
 
-    # Step 1: Query band_files table in DB
-    band_rows = db.query(BandFileModel).filter(
-        BandFileModel.band.in_([idx_clean, f"NDVI_{district_name}", f"LSWI_{district_name}"]),
+    candidate_scene_ids = set()
+
+    # 1. Collect candidate scenes from the specific request if provided
+    if request_id:
+        pjs = db.query(ProcessJobModel.scene_id).filter(
+            ProcessJobModel.request_id == request_id,
+            ProcessJobModel.stage == "DOWNLOAD",
+            ProcessJobModel.status == "COMPLETED"
+        ).all()
+        for pj in pjs:
+            if pj[0]:
+                candidate_scene_ids.add(pj[0])
+
+    # 2. Collect candidate tiles mapped to this district
+    tiles_rows = db.execute(
+        text("SELECT DISTINCT tile_id FROM district_tiles_mapping WHERE LOWER(district_name) = :d"),
+        {"d": clean_d}
+    ).fetchall()
+    district_tiles = set(r[0] for r in tiles_rows if r[0] and r[0] != "S1_SAR")
+
+    # If no scenes from request, query completed jobs for this district or scenes matching district tiles
+    if not candidate_scene_ids:
+        pj_query = db.query(ProcessJobModel.scene_id).join(
+            RequestModel, ProcessJobModel.request_id == RequestModel.id
+        ).filter(
+            ProcessJobModel.scene_id.isnot(None),
+            ProcessJobModel.stage == "DOWNLOAD",
+            ProcessJobModel.status == "COMPLETED",
+            func.lower(RequestModel.district) == clean_d
+        )
+        for r in pj_query.distinct().all():
+            if r[0]:
+                candidate_scene_ids.add(r[0])
+
+        if district_tiles:
+            sq = db.query(SceneModel.scene_id).filter(
+                SceneModel.tile.in_(district_tiles),
+                SceneModel.status == "HELD"
+            )
+            for r in sq.all():
+                if r[0]:
+                    candidate_scene_ids.add(r[0])
+
+    # 3. Query BandFileModel records matching index_name and sensing_date
+    band_names_query = [
+        idx_clean,
+        f"{idx_clean}.tif",
+        f"{idx_clean}.tiff",
+        f"{idx_clean}_{district_name}",
+        f"{idx_clean}_{clean_d}"
+    ]
+
+    bf_query = db.query(BandFileModel).filter(
+        func.upper(BandFileModel.band).in_([b.upper() for b in band_names_query]),
         BandFileModel.verified == 1
-    ).all()
+    )
+
+    if candidate_scene_ids:
+        bf_query = bf_query.filter(BandFileModel.scene_id.in_(candidate_scene_ids))
 
     raster_paths = []
     seen_paths = set()
 
-    for row in band_rows:
+    for row in bf_query.all():
         try:
             s_date = datetime.strptime(str(row.sensing_date).split(" ")[0], "%Y-%m-%d").date()
             if w_start_dt <= s_date <= w_end_dt:
-                if row.path and os.path.exists(row.path) and row.path not in seen_paths:
-                    raster_paths.append(row.path)
-                    seen_paths.add(row.path)
+                resolved, exists = resolve_tif_path(row.path)
+                if exists and resolved not in seen_paths:
+                    # Spatial overlap check against district_bbox
+                    if district_bbox and not is_raster_overlapping_district(resolved, district_bbox):
+                        continue
+                    raster_paths.append(resolved)
+                    seen_paths.add(resolved)
         except Exception:
             continue
 
-    # Step 2: Scan NAS raw archive directory for any missing scene index rasters
-    archive_base = settings.RAW_ARCHIVE_DIR
-    if os.path.exists(archive_base):
-        # Scan under Sentinel-2 and tile folders
-        for root, dirs, files in os.walk(archive_base):
-            for fn in files:
-                if fn.upper() in (f"{idx_clean}.TIF", f"{idx_clean}.TIFF") or fn.upper().startswith(f"{idx_clean}_"):
-                    full_p = os.path.join(root, fn)
-                    if full_p in seen_paths:
-                        continue
-                    # Extract date from folder name or filename
-                    parts = root.replace("\\", "/").split("/")
-                    folder_name = parts[-1] if parts else ""
-                    date_match = None
-                    import re
-                    m = re.search(r"(\d{4})(\d{2})(\d{2})", folder_name)
-                    if m:
-                        try:
-                            date_match = date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
-                        except ValueError:
-                            pass
-                    if not date_match:
-                        m2 = re.search(r"(\d{4})-(\d{2})-(\d{2})", fn)
-                        if m2:
+    # 4. Fallback: Check NAS storage ONLY under the specific district tile folders
+    if not raster_paths and district_tiles:
+        import re
+        for tile in district_tiles:
+            tile_dir = os.path.join(settings.RAW_ARCHIVE_DIR, tile)
+            if not os.path.exists(tile_dir):
+                continue
+            for root, _, files in os.walk(tile_dir):
+                for fn in files:
+                    fn_u = fn.upper()
+                    if fn_u in (f"{idx_clean}.TIF", f"{idx_clean}.TIFF") or fn_u.startswith(f"{idx_clean}_"):
+                        full_p = os.path.join(root, fn)
+                        if full_p in seen_paths:
+                            continue
+                        date_match = None
+                        m = re.search(r"(\d{4})(\d{2})(\d{2})", root.replace("\\", "/"))
+                        if m:
                             try:
-                                date_match = date(int(m2.group(1)), int(m2.group(2)), int(m2.group(3)))
+                                date_match = date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
                             except ValueError:
                                 pass
-
-                    if date_match and (w_start_dt <= date_match <= w_end_dt):
-                        raster_paths.append(full_p)
-                        seen_paths.add(full_p)
+                        if not date_match:
+                            m2 = re.search(r"(\d{4})-(\d{2})-(\d{2})", fn)
+                            if m2:
+                                try:
+                                    date_match = date(int(m2.group(1)), int(m2.group(2)), int(m2.group(3)))
+                                except ValueError:
+                                    pass
+                        if date_match and (w_start_dt <= date_match <= w_end_dt):
+                            if district_bbox and not is_raster_overlapping_district(full_p, district_bbox):
+                                continue
+                            raster_paths.append(full_p)
+                            seen_paths.add(full_p)
 
     return raster_paths
 
@@ -235,25 +298,26 @@ def create_temporal_composite_raster(
     output_path: str,
     district_geom: Optional[dict] = None,
     target_crs: str = "EPSG:4326",
-    method: str = "max"
+    method: str = "max",
+    resolution_deg: float = 0.0001
 ) -> Optional[Dict[str, Any]]:
     """
     Computes a single seamless cloud-masked Composite GeoTIFF
     from a list of multi-day index rasters across one or more tiles.
     
-    Supported methods / levels:
+    Supported methods:
       - 'max': Maximum Value Composite (MVC / nanmax)
       - 'min': Minimum Value Composite (nanmin)
       - 'mean': Average Value Composite (pixel-wise sum / count)
-    
-    Steps:
-      1. Reprojects all rasters to unified target CRS (EPSG:4326).
-      2. Mosaics & stacks temporal scenes using requested aggregation method.
-      3. Clips to district polygon boundary if provided.
-      4. Saves compressed GeoTIFF with LZW predictor.
-      5. Calculates clear coverage percentage & mean index value.
+      
+    Memory & Performance Guarantees:
+
+      - Uses district-bounded grid (EPSG:4326) directly to prevent memory explosion.
+      - Employs window-slice reprojection per tile to bound peak RAM.
+      - Applies district administrative boundary mask directly.
+      - Produces tiled, DEFLATE/LZW-compressed GeoTIFF with predictor 3.
     """
-    valid_inputs = [p for p in input_raster_paths if os.path.exists(p) and os.path.getsize(p) > 1024]
+    valid_inputs = [p for p in input_raster_paths if p and os.path.exists(p) and os.path.getsize(p) > 1024]
     if not valid_inputs:
         logger.warning("No valid input rasters provided for compositing.")
         return None
@@ -261,128 +325,179 @@ def create_temporal_composite_raster(
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     method_clean = (method or "max").lower().strip()
 
-    with tempfile.TemporaryDirectory() as tmp_dir:
-        # Step 1: Reproject all candidate rasters to unified target CRS (EPSG:4326)
-        reprojected_paths = []
-        for i, r_path in enumerate(valid_inputs):
+    # 1. Determine Target Extent from District Geometry or Inputs
+    d_shape = None
+    if district_geom:
+        d_shape = shape(district_geom) if isinstance(district_geom, dict) else district_geom
+        minx, miny, maxx, maxy = d_shape.bounds
+    else:
+        minx, miny, maxx, maxy = 180.0, 90.0, -180.0, -90.0
+        for p in valid_inputs:
             try:
-                with rasterio.open(r_path) as src:
-                    # Verify readable
-                    _test = src.read(1, window=rasterio.windows.Window(0, 0, min(64, src.width), min(64, src.height)))
-                    transform, width, height = calculate_default_transform(
-                        src.crs, target_crs, src.width, src.height, *src.bounds
-                    )
-                    profile = src.profile.copy()
-                    profile.update({
-                        "crs": target_crs,
-                        "transform": transform,
-                        "width": width,
-                        "height": height,
-                        "dtype": "float32",
-                        "nodata": np.nan,
-                        "compress": "lzw"
-                    })
+                with rasterio.open(p) as src:
+                    if src.crs:
+                        b_minx, b_miny, b_maxx, b_maxy = transform_bounds(src.crs, target_crs, *src.bounds)
+                        minx, miny = min(minx, b_minx), min(miny, b_miny)
+                        maxx, maxy = max(maxx, b_maxx), max(maxy, b_maxy)
+            except Exception:
+                pass
 
-                    reproj_file = os.path.join(tmp_dir, f"reproj_{i}.tif")
-                    with rasterio.open(reproj_file, "w", **profile) as dst:
-                        reproject(
-                            source=rasterio.band(src, 1),
-                            destination=rasterio.band(dst, 1),
-                            src_transform=src.transform,
-                            src_crs=src.crs,
-                            dst_transform=transform,
-                            dst_crs=target_crs,
-                            resampling=Resampling.bilinear
-                        )
-                    reprojected_paths.append(reproj_file)
-            except Exception as e:
-                logger.warning(f"Skipping unreadable or corrupted raster '{r_path}': {e}")
+    width = max(1, int(np.ceil((maxx - minx) / resolution_deg)))
+    height = max(1, int(np.ceil((maxy - miny) / resolution_deg)))
 
-        if not reprojected_paths:
-            logger.error("Failed to reproject any input rasters for compositing.")
-            return None
+    # Memory Safeguard: Cap canvas size to prevent memory allocation spikes (< 180 MB per float32 layer)
+    max_pixels = 45_000_000  # ~6700 x 6700 pixels (~180 MB float32)
+    if (width * height) > max_pixels:
+        scale_factor = np.sqrt((width * height) / float(max_pixels))
+        resolution_deg *= scale_factor
+        width = max(1, int(np.ceil((maxx - minx) / resolution_deg)))
+        height = max(1, int(np.ceil((maxy - miny) / resolution_deg)))
+        logger.info(f"Adjusted composite raster grid to {width} x {height} (~{resolution_deg*111000:.1f}m) to safeguard RAM.")
 
-        # Step 2: Temporal Merge with selected method ('max', 'min', 'mean')
-        opened_srcs = [rasterio.open(p) for p in reprojected_paths]
-        mosaic_meta = opened_srcs[0].profile.copy()
+    dst_transform = rasterio.transform.from_bounds(minx, miny, maxx, maxy, width, height)
+
+    # 2. District Boundary Mask
+    district_mask = None
+    if d_shape:
+        district_mask = rasterio.features.geometry_mask(
+            [d_shape],
+            out_shape=(height, width),
+            transform=dst_transform,
+            invert=True
+        )
+
+    # 3. Canvas Arrays (Strictly bounded to district)
+    if method_clean == "mean":
+        sum_arr = np.zeros((height, width), dtype="float32")
+        count_arr = np.zeros((height, width), dtype="uint16")
+    elif method_clean == "min":
+        accumulated = np.full((height, width), np.nan, dtype="float32")
+    else:  # "max"
+        accumulated = np.full((height, width), np.nan, dtype="float32")
+
+    # 4. Reproject each tile using window slicing
+    for r_idx, r_path in enumerate(valid_inputs, start=1):
         try:
-            if method_clean == "min":
-                mosaic_arr, mosaic_transform = merge(opened_srcs, method="min", nodata=np.nan)
-            elif method_clean == "mean":
-                sum_arr, mosaic_transform = merge(opened_srcs, method="sum", nodata=np.nan)
-                # Count valid non-nodata pixels across source rasters
-                opened_count_srcs = [rasterio.open(p) for p in reprojected_paths]
-                try:
-                    count_arr, _ = merge(opened_count_srcs, method="count", nodata=np.nan)
-                finally:
-                    for cs in opened_count_srcs:
-                        cs.close()
-                with np.errstate(divide="ignore", invalid="ignore"):
-                    mosaic_arr = np.where(count_arr > 0, sum_arr / count_arr, np.nan).astype("float32")
-            else:
-                # Default to max (Maximum Value Composite)
-                mosaic_arr, mosaic_transform = merge(opened_srcs, method="max", nodata=np.nan)
-        finally:
-            for s in opened_srcs:
-                s.close()
-        mosaic_meta.update({
-            "height": mosaic_arr.shape[1],
-            "width": mosaic_arr.shape[2],
-            "transform": mosaic_transform,
-            "crs": target_crs,
-            "nodata": np.nan,
-            "dtype": "float32",
-            "count": 1,
-            "compress": "lzw",
-            "predictor": 3,
-            "num_threads": "ALL_CPUS"
-        })
+            with rasterio.open(r_path) as src:
+                src_crs = src.crs
+                if src_crs is None:
+                    continue
+                t_minx, t_miny, t_maxx, t_maxy = transform_bounds(src_crs, target_crs, *src.bounds)
 
-        temp_mosaic = os.path.join(tmp_dir, "mosaic.tif")
-        with rasterio.open(temp_mosaic, "w", **mosaic_meta) as dst:
-            dst.write(mosaic_arr.astype("float32"))
+                # Check spatial overlap with target grid
+                if t_maxx < minx or t_minx > maxx or t_maxy < miny or t_miny > maxy:
+                    continue
 
-        # Step 3: Clip to District Polygon Boundary if provided
-        final_arr = mosaic_arr[0]
-        final_meta = mosaic_meta
+                # Compute intersecting window
+                c_minx = max(minx, t_minx)
+                c_miny = max(miny, t_miny)
+                c_maxx = min(maxx, t_maxx)
+                c_maxy = min(maxy, t_maxy)
 
-        if district_geom:
+                win = rasterio.windows.from_bounds(c_minx, c_miny, c_maxx, c_maxy, transform=dst_transform)
+                win = win.round_offsets().round_lengths()
+                col_off = max(0, int(win.col_off))
+                row_off = max(0, int(win.row_off))
+                w_w = min(int(win.width), width - col_off)
+                w_h = min(int(win.height), height - row_off)
+                if w_w <= 0 or w_h <= 0:
+                    continue
+
+                win_adj = rasterio.windows.Window(col_off, row_off, w_w, w_h)
+                win_tf = rasterio.windows.transform(win_adj, dst_transform)
+
+                dest_slice = np.full((w_h, w_w), np.nan, dtype="float32")
+                src_nodata_val = src.nodata if src.nodata is not None else np.nan
+                reproject(
+                    source=rasterio.band(src, 1),
+                    destination=dest_slice,
+                    src_nodata=src_nodata_val,
+                    dst_nodata=np.nan,
+                    src_transform=src.transform,
+                    src_crs=src_crs,
+                    dst_transform=win_tf,
+                    dst_crs=target_crs,
+                    resampling=Resampling.bilinear,
+                    num_threads=4
+                )
+
+                if method_clean == "mean":
+                    valid_m = ~np.isnan(dest_slice)
+                    target_sum = sum_arr[row_off : row_off + w_h, col_off : col_off + w_w]
+                    target_cnt = count_arr[row_off : row_off + w_h, col_off : col_off + w_w]
+                    target_sum[valid_m] += dest_slice[valid_m]
+                    target_cnt[valid_m] += 1
+                elif method_clean == "min":
+                    target_slice = accumulated[row_off : row_off + w_h, col_off : col_off + w_w]
+                    accumulated[row_off : row_off + w_h, col_off : col_off + w_w] = np.where(
+                        np.isnan(target_slice), dest_slice, np.fmin(target_slice, dest_slice)
+                    )
+                else:  # "max"
+                    target_slice = accumulated[row_off : row_off + w_h, col_off : col_off + w_w]
+                    accumulated[row_off : row_off + w_h, col_off : col_off + w_w] = np.where(
+                        np.isnan(target_slice), dest_slice, np.fmax(target_slice, dest_slice)
+                    )
+        except Exception as e:
+            logger.warning(f"Error compositing tile '{r_path}': {e}")
+
+    # 5. Finalize composite array
+    if method_clean == "mean":
+        with np.errstate(divide="ignore", invalid="ignore"):
+            accumulated = np.where(count_arr > 0, sum_arr / count_arr, np.nan).astype("float32")
+
+    if district_mask is not None:
+        accumulated[~district_mask] = np.nan
+
+    # 6. Save compressed single-band GeoTIFF
+    profile = {
+        "driver": "GTiff",
+        "height": height,
+        "width": width,
+        "count": 1,
+        "dtype": "float32",
+        "crs": target_crs,
+        "transform": dst_transform,
+        "nodata": np.nan,
+        "compress": "DEFLATE",
+        "predictor": 3,
+        "zlevel": 1,
+        "tiled": True,
+        "blockxsize": 512,
+        "blockysize": 512,
+        "bigtiff": "IF_SAFER"
+    }
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        temp_file = os.path.join(tmp_dir, os.path.basename(output_path))
+        with rasterio.open(temp_file, "w", **profile) as dst:
+            dst.write(accumulated, 1)
+            dst.set_band_description(1, method_clean.upper())
             try:
-                with rasterio.open(temp_mosaic) as src:
-                    clipped_arr, clipped_transform = mask(src, [district_geom], crop=True, nodata=np.nan)
-                    final_arr = clipped_arr[0]
-                    final_meta = src.profile.copy()
-                    final_meta.update({
-                        "height": clipped_arr.shape[1],
-                        "width": clipped_arr.shape[2],
-                        "transform": clipped_transform,
-                        "nodata": np.nan,
-                        "compress": "lzw",
-                        "predictor": 3,
-                        "num_threads": "ALL_CPUS"
-                    })
-            except Exception as mask_err:
-                logger.warning(f"Boundary clipping failed: {mask_err}. Retaining full mosaic.")
+                dst.update_tags(1, DESCRIPTION=f"{method_clean.upper()} Temporal Composite", METHOD=method_clean)
+            except Exception:
+                pass
 
-        # Step 4: Write Final Composite GeoTIFF to local temp then copy to destination
-        local_target = os.path.join(tmp_dir, "final_composite.tif")
-        with rasterio.open(local_target, "w", **final_meta) as dst:
-            dst.write(final_arr.astype("float32"), 1)
+        temp_target = output_path + ".tmp"
+        shutil.copy2(temp_file, temp_target)
+        if os.path.exists(output_path):
+            try:
+                os.remove(output_path)
+            except Exception:
+                pass
+        os.replace(temp_target, output_path)
 
-        shutil.copy2(local_target, output_path)
-
-    # Step 5: Statistics & Metrics Calculation
-    valid_mask = ~np.isnan(final_arr)
+    # 7. Calculate Statistics
+    valid_mask = ~np.isnan(accumulated)
     valid_pixels = int(np.count_nonzero(valid_mask))
-    total_pixels = final_arr.size
+    total_pixels = accumulated.size
     coverage_pct = float(valid_pixels / total_pixels * 100.0) if total_pixels > 0 else 0.0
 
-    mean_val = float(np.nanmean(final_arr[valid_mask])) if valid_pixels > 0 else 0.0
-    min_val = float(np.nanmin(final_arr[valid_mask])) if valid_pixels > 0 else 0.0
-    max_val = float(np.nanmax(final_arr[valid_mask])) if valid_pixels > 0 else 0.0
+    mean_val = float(np.nanmean(accumulated[valid_mask])) if valid_pixels > 0 else 0.0
+    min_val = float(np.nanmin(accumulated[valid_mask])) if valid_pixels > 0 else 0.0
+    max_val = float(np.nanmax(accumulated[valid_mask])) if valid_pixels > 0 else 0.0
     file_size_mb = os.path.getsize(output_path) / (1024 * 1024)
 
-    stats = {
+    return {
         "output_path": output_path,
         "filename": os.path.basename(output_path),
         "file_size_mb": round(file_size_mb, 2),
@@ -394,8 +509,6 @@ def create_temporal_composite_raster(
         "max_value": round(max_val, 4),
         "input_scenes_count": len(valid_inputs)
     }
-
-    return stats
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -456,8 +569,15 @@ def run_temporal_compositing_for_request(
 
     # 2. Fetch District Geometry from PostgreSQL
     geom_dict, state_name = get_district_geometry_from_db(db, district_name)
+    district_bbox = None
     if geom_dict:
-        append_request_log(db, request_id, f"  • District boundary polygon loaded for '{district_name}' ({state_name or 'Auto'}).")
+        try:
+            d_poly = shape(geom_dict if not isinstance(geom_dict, str) else json.loads(geom_dict))
+            district_bbox = d_poly.bounds
+            append_request_log(db, request_id, f"  • District boundary polygon loaded for '{district_name}' ({state_name or 'Auto'}).")
+        except Exception as e:
+            logger.warning(f"Error parsing district polygon: {e}")
+            append_request_log(db, request_id, f"  • District boundary polygon loaded for '{district_name}' ({state_name or 'Auto'}).")
     else:
         append_request_log(db, request_id, f"  • Note: District geometry not in DB; creating unclipped full-extent composite.")
 
@@ -481,13 +601,15 @@ def run_temporal_compositing_for_request(
         for idx_name in spectral_indices:
             idx_clean = idx_name.upper().strip()
             
-            # Find all scene rasters for this window and index
+            # Find all scene rasters for this window and index (strictly matching district)
             input_rasters = find_index_rasters_for_window(
                 db=db,
                 district_name=district_name,
                 window_start=w_start,
                 window_end=w_end,
-                index_name=idx_clean
+                index_name=idx_clean,
+                request_id=request_id,
+                district_bbox=district_bbox
             )
 
             if not input_rasters:

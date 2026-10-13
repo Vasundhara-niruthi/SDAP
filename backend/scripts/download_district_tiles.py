@@ -173,25 +173,87 @@ def _resolve_scene_dir(sc, fallback_satellite: str = "") -> str:
 
 
 def _list_band_paths(scene_dir: str) -> dict:
-    """Map BAND_NAME -> path for every .tif/.tiff in a scene directory."""
+    """
+    Map BAND_NAME -> path for every .tif/.tiff in a scene directory.
+    Supports both Sentinel-2 (flat root) and Sentinel-1 ESA SAFE format (measurement/ sub-folder).
+    """
     band_paths = {}
-    if os.path.isdir(scene_dir):
-        for f in os.listdir(scene_dir):
+    if not os.path.isdir(scene_dir):
+        return band_paths
+
+    # 1. Check top-level directory
+    for f in os.listdir(scene_dir):
+        low = f.lower()
+        if low.endswith(".tif") or low.endswith(".tiff"):
+            b_name = os.path.splitext(f)[0].upper()
+            band_paths[b_name] = os.path.join(scene_dir, f)
+
+    # 2. Check measurement/ sub-folder (Sentinel-1 SAFE standard layout)
+    meas_dir = os.path.join(scene_dir, "measurement")
+    if os.path.isdir(meas_dir):
+        for f in os.listdir(meas_dir):
             low = f.lower()
             if low.endswith(".tif") or low.endswith(".tiff"):
-                b_name = os.path.splitext(f)[0].upper()
-                band_paths[b_name] = os.path.join(scene_dir, f)
+                f_path = os.path.join(meas_dir, f)
+                b_clean = os.path.splitext(f)[0].upper()
+                if "VV" in b_clean and "VH" not in b_clean:
+                    band_paths["VV"] = f_path
+                elif "VH" in b_clean and "VV" not in b_clean:
+                    band_paths["VH"] = f_path
+                band_paths[b_clean] = f_path
+
     return band_paths
 
 
 def _scene_cached_on_nas(scene_dir: str, is_s1: bool):
     """
     STAGE 2 FAST CHECK (NAS side): are all required bands present and readable?
+    For Sentinel-1, verifies complete SAFE package:
+    - manifest.safe exists and is non-empty
+    - measurement/ folder exists and contains valid .tif/.tiff rasters
+    - annotation/ folder exists and contains files
+    - preview/ folder exists
     Returns (cached: bool, band_paths: dict, problem: str|None).
     """
-    required = REQUIRED_S1_BANDS if is_s1 else REQUIRED_S2_BANDS
-    band_paths = _list_band_paths(scene_dir)
+    if is_s1:
+        if not os.path.isdir(scene_dir):
+            return False, {}, "scene directory does not exist on NAS"
 
+        manifest_p = os.path.join(scene_dir, "manifest.safe")
+        if not os.path.isfile(manifest_p) or os.path.getsize(manifest_p) == 0:
+            return False, {}, "missing manifest.safe on NAS (incomplete S1 SAFE structure)"
+
+        meas_dir = os.path.join(scene_dir, "measurement")
+        if not os.path.isdir(meas_dir):
+            return False, {}, "missing measurement/ folder on NAS"
+        meas_files = [f for f in os.listdir(meas_dir) if f.lower().endswith((".tif", ".tiff"))]
+        if not meas_files:
+            return False, {}, "no rasters found inside measurement/ folder on NAS"
+
+        annot_dir = os.path.join(scene_dir, "annotation")
+        if not os.path.isdir(annot_dir) or not os.listdir(annot_dir):
+            return False, {}, "missing annotation/ folder on NAS"
+
+        prev_dir = os.path.join(scene_dir, "preview")
+        if not os.path.isdir(prev_dir):
+            return False, {}, "missing preview/ folder on NAS"
+
+        band_paths = _list_band_paths(scene_dir)
+        required = REQUIRED_S1_BANDS
+        missing = [b for b in required if b not in band_paths]
+        if missing:
+            return False, band_paths, f"missing bands on NAS: {missing}"
+
+        for b in required:
+            ok, _, err = verify_raster(band_paths[b])
+            if not ok:
+                return False, band_paths, f"band {b} failed verification ({err})"
+
+        return True, band_paths, None
+
+    # Sentinel-2 check
+    required = REQUIRED_S2_BANDS
+    band_paths = _list_band_paths(scene_dir)
     missing = [b for b in required if b not in band_paths]
     if missing:
         return False, band_paths, f"missing bands on NAS: {missing}"
@@ -282,6 +344,63 @@ def _link_scene_to_request(db, request_id: int, scene_id: str):
         db.rollback()
 
 
+def _sync_cached_scene_band_files(db, scene_obj, s_dir: str):
+    """Ensure all .tif/.tiff files in a cached NAS scene folder have BandFileModel records."""
+    if not BandFileModel or not os.path.isdir(s_dir):
+        return
+    try:
+        now = datetime.utcnow()
+        candidate_files = []
+        for fname in os.listdir(s_dir):
+            if fname.lower().endswith((".tif", ".tiff")):
+                candidate_files.append((fname, os.path.join(s_dir, fname)))
+
+        meas_dir = os.path.join(s_dir, "measurement")
+        if os.path.isdir(meas_dir):
+            for fname in os.listdir(meas_dir):
+                if fname.lower().endswith((".tif", ".tiff")):
+                    candidate_files.append((fname, os.path.join(meas_dir, fname)))
+
+        for fname, fpath in candidate_files:
+            if not os.path.isfile(fpath):
+                continue
+            fsize = os.path.getsize(fpath)
+
+            # Map canonical band name for Sentinel-1 (iw-vv -> VV, iw-vh -> VH)
+            f_upper = os.path.splitext(fname)[0].upper()
+            if "VV" in f_upper and "VH" not in f_upper:
+                band_name = "VV"
+            elif "VH" in f_upper and "VV" not in f_upper:
+                band_name = "VH"
+            else:
+                band_name = fname
+
+            existing_bf = db.query(BandFileModel).filter(
+                BandFileModel.scene_id == scene_obj.scene_id,
+                BandFileModel.band == band_name
+            ).first()
+            if existing_bf:
+                existing_bf.path = fpath
+                existing_bf.size_bytes = fsize
+                existing_bf.verified = 1
+            else:
+                db.add(BandFileModel(
+                    scene_id=scene_obj.scene_id,
+                    tile=scene_obj.tile,
+                    sensing_date=scene_obj.sensing_date,
+                    satellite=scene_obj.satellite or "Sentinel-1",
+                    band=band_name,
+                    path=fpath,
+                    size_bytes=fsize,
+                    verified=1,
+                    downloaded_at=now
+                ))
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        logger.warning(f"Could not sync cached band files for {scene_obj.scene_id}: {e}")
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Main Pipeline
 # ─────────────────────────────────────────────────────────────────────────────
@@ -350,13 +469,21 @@ def run_district_acquisition_pipeline(
         gap_job = _get_or_create_job(db, request_id, "GAP_CHECK")
         _update_job(db, gap_job, "RUNNING")
 
-        step1_msg = f"STEP 1: Gap Check & Scene Search for '{district_name}'..."
+        if not state_name and request_id:
+            req_rec_st = db.query(RequestModel.state).filter(RequestModel.id == request_id).first()
+            if req_rec_st and req_rec_st[0]:
+                state_name = req_rec_st[0]
+
+        step1_msg = f"STEP 1: Gap Check & Scene Search for '{district_name}' ({state_name or 'Auto'})..."
         logger.info(step1_msg)
         append_request_log(db, request_id, step1_msg)
         append_request_log(db, request_id, "\n[STAGE 1/4] SCENE DISCOVERY & GAP CHECK")
-        append_request_log(db, request_id, f"  • Querying database for tiles overlapping '{district_name}'...")
+        append_request_log(db, request_id, f"  • Querying database for tiles overlapping '{district_name}' (State: {state_name or 'Auto'})...")
 
-        gap_res = perform_gap_check(db, district_name, start_date, end_date, satellite, max_cloud_cover=max_cloud_cover)
+        gap_res = perform_gap_check(
+            db, district_name, start_date, end_date, satellite,
+            max_cloud_cover=max_cloud_cover, state_name=state_name
+        )
 
         if gap_res.get("status") == "ERROR" or not gap_res.get("tiles"):
             err = gap_res.get("message", f"No mapped tiles found for district '{district_name}'.")
@@ -404,11 +531,33 @@ def run_district_acquisition_pipeline(
         for h_sc in gap_res.get("held_scenes", []):
             dl_time = h_sc.get("downloaded_at", "previously")
             arch_p = h_sc.get("archive_path", "")
+            sc_id_h = h_sc.get("scene_id")
             append_request_log(
                 db, request_id,
-                f"  • [CACHE VERIFIED] Scene '{h_sc['scene_id']}' (Tile {h_sc['tile']}, Date {h_sc['sensing_date']}) "
+                f"  • [CACHE VERIFIED] Scene '{sc_id_h}' (Tile {h_sc.get('tile')}, Date {h_sc.get('sensing_date')}) "
                 f"cached at '{arch_p}' (Downloaded: {dl_time}). Skipping download."
             )
+            # Ensure cached scenes are recorded in ProcessJobModel for this request
+            try:
+                if sc_id_h:
+                    existing_pj = db.query(ProcessJobModel).filter(
+                        ProcessJobModel.request_id == request_id,
+                        ProcessJobModel.scene_id == sc_id_h
+                    ).first()
+                    if not existing_pj:
+                        db.add(ProcessJobModel(
+                            request_id=request_id,
+                            scene_id=sc_id_h,
+                            stage="DOWNLOAD",
+                            status="COMPLETED"
+                        ))
+            except Exception as e_pj:
+                logger.warning(f"Could not record cached job for {sc_id_h}: {e_pj}")
+
+        try:
+            db.commit()
+        except Exception:
+            db.rollback()
 
         append_request_log(db, request_id, "  ✓ Stage 1 Complete: Gap Check verified.")
         _update_job(db, gap_job, "COMPLETED")
@@ -502,6 +651,7 @@ def run_district_acquisition_pipeline(
                 held_scenes.append(scene_obj)
                 tile_downloaded_count[sc_tile] = tile_downloaded_count.get(sc_tile, 0) + 1
                 _link_scene_to_request(db, request_id, s_id)
+                _sync_cached_scene_band_files(db, scene_obj, s_dir)
                 append_request_log(
                     db, request_id,
                     f"     ✓ [NAS VERIFIED - SKIPPED] '{sc['folder']}' already on NAS at '{s_dir}'. Skipping download."
@@ -529,9 +679,10 @@ def run_district_acquisition_pipeline(
                         level="ERROR"
                     )
                 else:
+                    detail_str = f"Incomplete bands: {failed_bands}" if failed_bands else (dl_log or "Download failed")
                     append_request_log(
                         db, request_id,
-                        f"     ⚠ WARN: Scene '{sc['scene_id']}' download failed (Incomplete bands: {failed_bands}) - remains PENDING.",
+                        f"     ⚠ WARN: Scene '{sc['scene_id']}' download failed ({detail_str}) - remains PENDING.",
                         level="WARNING"
                     )
 
@@ -603,24 +754,33 @@ def run_district_acquisition_pipeline(
         indices_skipped = 0
         index_errors = 0
 
-        # Build the unique scene list: scenes completed in Stage 2 + scenes already held per Gap Check.
-        # Re-load from the DB so every scene has folder/prefix/satellite populated
-        # (gap-check "held" entries are dicts that may not carry all fields).
-        candidate_ids = []
-        for sc_item in list(held_scenes) + list(gap_res.get("held_scenes", [])):
-            sc_id = _scene_attr(sc_item, "scene_id", "")
-            if sc_id and sc_id not in candidate_ids:
-                candidate_ids.append(sc_id)
+        if not indices or len(indices) == 0:
+            skip_msg = "  ✓ [STAGE 3/4 SKIPPED] No spectral or SAR indices selected in request (2-Step Raw Band Acquisition Mode)."
+            logger.info(skip_msg)
+            append_request_log(db, request_id, "\n" + "=" * 78)
+            append_request_log(db, request_id, skip_msg)
+            _update_job(db, proc_job, "COMPLETED")
+            unique_scenes = []
+            total_sc = 0
+        else:
+            # Build the unique scene list: scenes completed in Stage 2 + scenes already held per Gap Check.
+            # Re-load from the DB so every scene has folder/prefix/satellite populated
+            # (gap-check "held" entries are dicts that may not carry all fields).
+            candidate_ids = []
+            for sc_item in list(held_scenes) + list(gap_res.get("held_scenes", [])):
+                sc_id = _scene_attr(sc_item, "scene_id", "")
+                if sc_id and sc_id not in candidate_ids:
+                    candidate_ids.append(sc_id)
 
-        unique_scenes = []
-        for sc_id in candidate_ids:
-            scene_row = db.query(SceneModel).filter(SceneModel.scene_id == sc_id).first()
-            if scene_row:
-                unique_scenes.append(scene_row)
-            else:
-                logger.warning(f"Scene '{sc_id}' not found in DB; skipping index processing.")
+            unique_scenes = []
+            for sc_id in candidate_ids:
+                scene_row = db.query(SceneModel).filter(SceneModel.scene_id == sc_id).first()
+                if scene_row:
+                    unique_scenes.append(scene_row)
+                else:
+                    logger.warning(f"Scene '{sc_id}' not found in DB; skipping index processing.")
 
-        total_sc = len(unique_scenes)
+            total_sc = len(unique_scenes)
         for n, sc_item in enumerate(unique_scenes, start=1):
             if _is_request_stopped(db, request_id):
                 append_request_log(db, request_id, f"[STOPPED] Processing halted at scene [{n}/{total_sc}] because request was cancelled.", level="WARNING")

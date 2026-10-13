@@ -22,6 +22,7 @@ from typing import List, Dict, Any, Optional
 from concurrent.futures import ThreadPoolExecutor
 
 import boto3
+import requests
 from botocore import UNSIGNED
 from botocore.config import Config
 from sqlalchemy.orm import Session
@@ -284,55 +285,212 @@ def search_aws_scenes_for_tile(tile_id: str, start_date: str, end_date: str) -> 
     return available_scenes
 
 
-def search_aws_scenes_for_s1(start_date: str, end_date: str) -> List[Dict[str, Any]]:
+def search_aws_scenes_for_s1(
+    start_date: str,
+    end_date: str,
+    district_name: Optional[str] = None,
+    state_name: Optional[str] = None,
+    db: Optional[Session] = None
+) -> List[Dict[str, Any]]:
     """
-    Searches AWS S3 (sentinel-s1-l1c in eu-central-1) for available Sentinel-1 GRD SAR products
-    between start_date and end_date (YYYY-MM-DD format).
-    Layout: GRD/[year]/[month]/[day]/[mode]/[polarization]/[product]/
+    Searches AWS S3 for Sentinel-1 GRD SAR scenes that geographically intersect the requested district.
+    Supports all states and districts across India using spatial STAC and DAAC services.
+    Primary: Earth Search STAC API with district bounding box.
+    Secondary: Alaska Satellite Facility (ASF) DAAC API with district centroid point.
+    Guarantees only genuine intersecting radar scenes are returned; never returns out-of-bounds scenes.
     """
-    try:
-        start_dt = datetime.strptime(start_date.split("T")[0], "%Y-%m-%d")
-        end_dt = datetime.strptime(end_date.split("T")[0], "%Y-%m-%d")
-    except ValueError as e:
-        logger.error(f"Invalid date format for S1 search: {e}")
-        return []
+    s_clean = start_date.split("T")[0]
+    e_clean = end_date.split("T")[0]
 
-    available_scenes = []
-    delta_days = max(1, (end_dt - start_dt).days)
-    step_days = 12 if delta_days > 60 else (6 if delta_days > 20 else 1)
+    centroid_pt = None
+    district_bbox = None
 
-    cur_dt = start_dt
-    while cur_dt <= end_dt:
-        y = cur_dt.year
-        m = cur_dt.month
-        d = cur_dt.day
-        date_str = cur_dt.strftime("%Y-%m-%d")
+    if district_name and db:
+        try:
+            from app.services.delivery_service import get_district_geometry_from_db
+            from shapely.geometry import shape
+            geom, found_state = get_district_geometry_from_db(db, district_name, state_name=state_name)
+            if geom:
+                poly = shape(geom)
+                minx, miny, maxx, maxy = poly.bounds
+                district_bbox = [round(minx, 5), round(miny, 5), round(maxx, 5), round(maxy, 5)]
+                c = poly.centroid
+                centroid_pt = (round(c.x, 5), round(c.y, 5))
+                logger.info(f"Resolved geometry for district '{district_name}' (State: {found_state or state_name}): BoundingBox={district_bbox}, Centroid={centroid_pt}")
+        except Exception as e:
+            logger.warning(f"Could not compute geometry bounds for district '{district_name}': {e}")
 
-        for mode_pol in ["S1/DV", "IW/DV"]:
-            s3_prefix = f"GRD/{y}/{m}/{d}/{mode_pol}/"
-            try:
-                resp = s3_s1_client.list_objects_v2(Bucket=S1_BUCKET, Prefix=s3_prefix, Delimiter="/", MaxKeys=2)
-                for sc in resp.get("CommonPrefixes", []):
-                    sc_prefix = sc.get("Prefix")
-                    folder = sc_prefix.strip("/").split("/")[-1]
-                    available_scenes.append({
-                        "scene_id": folder,
+    # Strategy 1: Earth Search STAC API (fast, authoritative AWS S3 GRD catalog covering all of India)
+    if district_bbox:
+        try:
+            stac_url = "https://earth-search.aws.element84.com/v1/search"
+            payload = {
+                "collections": ["sentinel-1-grd"],
+                "bbox": district_bbox,
+                "datetime": f"{s_clean}T00:00:00Z/{e_clean}T23:59:59Z",
+                "limit": 100
+            }
+            resp = requests.post(stac_url, json=payload, timeout=12)
+            if resp.status_code == 200:
+                features = resp.json().get("features", [])
+                stac_scenes = []
+                seen_granules = set()
+                for feat in features:
+                    g_name = feat.get("id")
+                    if not g_name or g_name in seen_granules:
+                        continue
+                    seen_granules.add(g_name)
+
+                    # Extract sensing date
+                    props = feat.get("properties", {})
+                    dt_str = props.get("datetime", "")[:10] or s_clean
+
+                    # Extract S3 prefix from asset URLs or construct canonical path
+                    vh_asset = feat.get("assets", {}).get("vh", {})
+                    vh_href = vh_asset.get("href", "")
+                    s3_prefix = ""
+                    if vh_href.startswith("s3://sentinel-s1-l1c/"):
+                        raw_key = vh_href[len("s3://sentinel-s1-l1c/"):]
+                        idx = raw_key.find("measurement/")
+                        s3_prefix = raw_key[:idx] if idx != -1 else raw_key
+                    elif "sentinel-s1-l1c.s3.amazonaws.com/" in vh_href:
+                        raw_key = vh_href.split("sentinel-s1-l1c.s3.amazonaws.com/")[-1]
+                        idx = raw_key.find("measurement/")
+                        s3_prefix = raw_key[:idx] if idx != -1 else raw_key
+
+                    if not s3_prefix:
+                        parts = g_name.split("_")
+                        mode = parts[1] if len(parts) > 1 else "IW"
+                        pol_code = parts[3] if len(parts) > 3 else "1SDV"
+                        pol = "DV" if "DV" in pol_code else ("DH" if "DH" in pol_code else "SV")
+                        date_part = parts[4] if len(parts) > 4 else ""
+                        yr = int(date_part[:4]) if len(date_part) >= 4 else int(dt_str[:4])
+                        mo = int(date_part[4:6]) if len(date_part) >= 6 else int(dt_str[5:7])
+                        dy = int(date_part[6:8]) if len(date_part) >= 8 else int(dt_str[8:10])
+                        s3_prefix = f"GRD/{yr}/{mo}/{dy}/{mode}/{pol}/{g_name}/"
+
+                    stac_scenes.append({
+                        "scene_id": g_name,
                         "tile": "S1_SAR",
-                        "sensing_date": date_str,
+                        "sensing_date": dt_str,
                         "satellite": "Sentinel-1",
-                        "folder": folder,
-                        "prefix": sc_prefix,
+                        "folder": g_name,
+                        "prefix": s3_prefix,
                         "cloud_cover": 0.0
                     })
-                    break
-                if any(s["sensing_date"] == date_str for s in available_scenes):
-                    break
-            except Exception as err:
-                logger.debug(f"Error querying S1 prefix {s3_prefix}: {err}")
 
-        cur_dt += timedelta(days=step_days)
+                if stac_scenes:
+                    logger.info(f"Earth Search STAC resolved {len(stac_scenes)} Sentinel-1 scene(s) covering district '{district_name}' ({state_name}).")
+                    return stac_scenes
+        except Exception as err:
+            logger.warning(f"Earth Search STAC query for Sentinel-1 failed: {err}")
 
-    return available_scenes
+    # Strategy 2: Alaska Satellite Facility (ASF) DAAC API (Secondary spatial fallback)
+    if centroid_pt:
+        try:
+            asf_url = "https://api.daac.asf.alaska.edu/services/search/param"
+            params = {
+                "platform": "SENTINEL-1",
+                "processingLevel": "GRD_HD",
+                "beamMode": "IW",
+                "intersectsWith": f"POINT({centroid_pt[0]:.5f} {centroid_pt[1]:.5f})",
+                "start": s_clean,
+                "end": e_clean,
+                "output": "json"
+            }
+            resp = requests.get(asf_url, params=params, timeout=25)
+            if resp.status_code == 200:
+                data = resp.json()
+                results = data[0] if data and isinstance(data, list) else []
+                scenes = []
+                for sc in results:
+                    g_name = sc.get("granuleName")
+                    if not g_name:
+                        continue
+                    st_str = sc.get("startTime", "")[:10]
+                    parts = g_name.split("_")
+                    mode = parts[1] if len(parts) > 1 else "IW"
+                    pol_code = parts[3] if len(parts) > 3 else "1SDV"
+                    pol = "DV" if "DV" in pol_code else ("DH" if "DH" in pol_code else "SV")
+                    date_part = parts[4] if len(parts) > 4 else ""
+                    yr = int(date_part[:4]) if len(date_part) >= 4 else int(st_str[:4])
+                    mo = int(date_part[4:6]) if len(date_part) >= 6 else int(st_str[5:7])
+                    dy = int(date_part[6:8]) if len(date_part) >= 8 else int(st_str[8:10])
+                    s3_prefix = f"GRD/{yr}/{mo}/{dy}/{mode}/{pol}/{g_name}/"
+                    scenes.append({
+                        "scene_id": g_name,
+                        "tile": "S1_SAR",
+                        "sensing_date": st_str,
+                        "satellite": "Sentinel-1",
+                        "folder": g_name,
+                        "prefix": s3_prefix,
+                        "cloud_cover": 0.0
+                    })
+                if scenes:
+                    logger.info(f"ASF resolved {len(scenes)} Sentinel-1 scene(s) covering district '{district_name}' ({state_name}).")
+                    return scenes
+        except Exception as err:
+            logger.warning(f"ASF Spatial Search query for S1 failed: {err}")
+
+    logger.info(
+        f"No Sentinel-1 satellite passes intersected district '{district_name}' (State: {state_name}) "
+        f"between {s_clean} and {e_clean}."
+    )
+    return []
+
+
+def _band_files_exist_on_disk(scene_dir: str, bands: List[str]) -> bool:
+    """
+    Returns True only if ALL required band TIF files physically exist in
+    scene_dir with size > 0 bytes. Checks .tif and .tiff extensions only.
+    An empty or partial folder → False → triggers re-download.
+    """
+    if not os.path.isdir(scene_dir):
+        return False
+    for b in bands:
+        found = False
+        for ext in (".tif", ".tiff"):
+            candidate = os.path.join(scene_dir, f"{b}{ext}")
+            if os.path.isfile(candidate) and os.path.getsize(candidate) > 0:
+                found = True
+                break
+        if not found:
+            return False
+    return True
+
+
+def _is_s1_scene_complete_on_disk(scene_dir: str) -> bool:
+    """
+    Returns True only if the complete Sentinel-1 ESA SAFE product hierarchy physically exists on disk:
+    1. manifest.safe exists and is non-empty (>0 bytes)
+    2. measurement/ folder exists and contains valid .tif/.tiff rasters
+    3. annotation/ folder exists and contains files
+    4. preview/ folder exists
+    An empty, legacy, or partial folder (e.g. only root VV.tiff/VH.tiff) -> False -> triggers full re-download.
+    """
+    if not os.path.isdir(scene_dir):
+        return False
+
+    manifest_p = os.path.join(scene_dir, "manifest.safe")
+    if not (os.path.isfile(manifest_p) and os.path.getsize(manifest_p) > 0):
+        return False
+
+    meas_dir = os.path.join(scene_dir, "measurement")
+    if not os.path.isdir(meas_dir):
+        return False
+    meas_files = [f for f in os.listdir(meas_dir) if f.lower().endswith((".tif", ".tiff"))]
+    if not meas_files:
+        return False
+
+    annot_dir = os.path.join(scene_dir, "annotation")
+    if not os.path.isdir(annot_dir) or not os.listdir(annot_dir):
+        return False
+
+    prev_dir = os.path.join(scene_dir, "preview")
+    if not os.path.isdir(prev_dir):
+        return False
+
+    return True
 
 
 def perform_gap_check(
@@ -342,11 +500,12 @@ def perform_gap_check(
     end_date: str,
     satellite: str = "Sentinel-2",
     required_bands: List[str] = None,
-    max_cloud_cover: float = 100.0
+    max_cloud_cover: float = 100.0,
+    state_name: Optional[str] = None
 ) -> Dict[str, Any]:
     """
     SRS M2 Gap Check:
-    1. Resolves tiles for district.
+    1. Resolves tiles for district and state.
     2. Queries AWS Open Data S3 for available scenes (Sentinel-2 COGs and/or Sentinel-1 GRD).
     3. Filters scenes by max_cloud_cover threshold before downloading.
     4. Cross-references PostgreSQL database AND physically verifies NAS band files on disk.
@@ -365,12 +524,12 @@ def perform_gap_check(
     raw_aws_scenes = []
 
     if is_s2:
-        s2_tiles = get_tiles_for_district(db, district_name)
+        s2_tiles = get_tiles_for_district(db, district_name, state_name=state_name)
         if not s2_tiles and not is_s1:
             return {
                 "district": district_name,
                 "status": "ERROR",
-                "message": f"No tile mapping found for district '{district_name}'.",
+                "message": f"No tile mapping found for district '{district_name}' (State: {state_name or 'Unspecified'}).",
                 "tiles": [],
                 "scenes_available": 0,
                 "scenes_held": 0,
@@ -385,7 +544,13 @@ def perform_gap_check(
             raw_aws_scenes.extend(s2_scenes)
 
     if is_s1:
-        s1_scenes = search_aws_scenes_for_s1(start_date, end_date)
+        s1_scenes = search_aws_scenes_for_s1(
+            start_date=start_date,
+            end_date=end_date,
+            district_name=district_name,
+            state_name=state_name,
+            db=db
+        )
         raw_aws_scenes.extend(s1_scenes)
         if "S1_SAR" not in tiles:
             tiles.append("S1_SAR")
@@ -431,25 +596,6 @@ def perform_gap_check(
         ).all() if r[0]
     )
 
-    def _band_files_exist_on_disk(scene_dir: str, bands: List[str]) -> bool:
-        """
-        Returns True only if ALL required band TIF files physically exist in
-        scene_dir with size > 0 bytes. Checks .tif and .tiff extensions only.
-        An empty or partial folder → False → triggers re-download.
-        """
-        if not os.path.isdir(scene_dir):
-            return False
-        for b in bands:
-            found = False
-            for ext in (".tif", ".tiff"):
-                candidate = os.path.join(scene_dir, f"{b}{ext}")
-                if os.path.isfile(candidate) and os.path.getsize(candidate) > 0:
-                    found = True
-                    break
-            if not found:
-                return False
-        return True
-
     def audit_scene_on_nas_and_db(sc: Dict[str, Any]) -> tuple:
         s_id = sc["scene_id"]
         folder = sc["folder"]
@@ -458,26 +604,56 @@ def perform_gap_check(
         sc_sat = sc.get("satellite", "Sentinel-2")
         year = s_date[0:4]
         month = str(int(s_date[5:7]))
+        sat_subfolder = "Sentinel-1" if sc_sat == "Sentinel-1" else "Sentinel-2"
 
-        # Resolve NAS path first, fallback to local archive
-        scene_archive_dir_nas = os.path.join(settings.RAW_ARCHIVE_DIR, tile, year, month, folder)
+        # Resolve NAS path first (both subfolder and legacy layouts), fallback to local archive
+        scene_archive_dir_nas = os.path.join(settings.RAW_ARCHIVE_DIR, sat_subfolder, tile, year, month, folder)
+        if not os.path.isdir(scene_archive_dir_nas):
+            legacy_nas = os.path.join(settings.RAW_ARCHIVE_DIR, tile, year, month, folder)
+            if os.path.isdir(legacy_nas):
+                scene_archive_dir_nas = legacy_nas
+            else:
+                parent_nas = os.path.join(settings.RAW_ARCHIVE_DIR, sat_subfolder, tile, year, month)
+                if not os.path.isdir(parent_nas):
+                    parent_nas = os.path.join(settings.RAW_ARCHIVE_DIR, tile, year, month)
+                if os.path.isdir(parent_nas):
+                    try:
+                        for cand in os.listdir(parent_nas):
+                            if cand.startswith(folder) or folder.startswith(cand):
+                                scene_archive_dir_nas = os.path.join(parent_nas, cand)
+                                break
+                    except Exception:
+                        pass
+
         backend_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
         scene_archive_dir_local = os.path.abspath(
-            os.path.join(backend_root, "data", "archive", tile, year, month, folder)
+            os.path.join(backend_root, "data", "archive", sat_subfolder, tile, year, month, folder)
         )
+        if not os.path.isdir(scene_archive_dir_local):
+            legacy_local = os.path.abspath(os.path.join(backend_root, "data", "archive", tile, year, month, folder))
+            if os.path.isdir(legacy_local):
+                scene_archive_dir_local = legacy_local
+            else:
+                parent_loc = os.path.abspath(os.path.join(backend_root, "data", "archive", tile, year, month))
+                if os.path.isdir(parent_loc):
+                    try:
+                        for cand in os.listdir(parent_loc):
+                            if cand.startswith(folder) or folder.startswith(cand):
+                                scene_archive_dir_local = os.path.join(parent_loc, cand)
+                                break
+                    except Exception:
+                        pass
+
         scene_archive_dir = scene_archive_dir_nas
         if not os.path.isdir(scene_archive_dir_nas) and os.path.isdir(scene_archive_dir_local):
             scene_archive_dir = scene_archive_dir_local
 
-        bands_to_verify = (
-            ["VV", "VH"] if sc_sat == "Sentinel-1"
-            else (required_bands if required_bands else ["B02", "B03", "B04", "B08", "TCI", "B8A", "B11", "SCL"])
-        )
-
-        # ── FIX: Physically verify ALL band files exist on NAS/disk ────────
-        # This is the ground truth. DB record alone is NOT sufficient.
-        # If someone deleted files from NAS, has_disk_bands → False → MISSING.
-        has_disk_bands = _band_files_exist_on_disk(scene_archive_dir, bands_to_verify)
+        if sc_sat == "Sentinel-1":
+            # For Sentinel-1, physically verify full ESA SAFE product hierarchy on NAS
+            has_disk_bands = _is_s1_scene_complete_on_disk(scene_archive_dir)
+        else:
+            bands_to_verify = required_bands if required_bands else ["B02", "B03", "B04", "B08", "TCI", "B8A", "B11", "SCL"]
+            has_disk_bands = _band_files_exist_on_disk(scene_archive_dir, bands_to_verify)
 
         # ── FIX: DB check uses scene_id and product_name (correct fields) ──
         is_held_in_db = (

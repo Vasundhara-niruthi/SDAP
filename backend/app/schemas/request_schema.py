@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field, field_validator
-from typing import List, Optional
+from typing import List, Optional, Dict
 from datetime import datetime, timezone
 
 # Earliest date available from AWS Open Data (SRS Section 10)
@@ -131,7 +131,14 @@ class LayerStackCreate(BaseModel):
     clip_to_district: Optional[bool] = Field(True, description="Clip multi-band stack to district boundary")
     output_filename: Optional[str] = Field(None, description="Preserve exact original filename or custom name")
     selected_files: Optional[List[str]] = Field(None, description="Specific file paths to stack")
+    selected_files_by_band: Optional[Dict[str, List[str]]] = Field(None, description="Mapping of band name to specific file paths to stack")
     request_id: Optional[int] = Field(None, description="Associated request ID")
+
+
+class LayerStackTaskResponse(BaseModel):
+    status: str
+    task_id: str
+    message: str
 
 
 class LayerStackResponse(BaseModel):

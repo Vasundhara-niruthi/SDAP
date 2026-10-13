@@ -49,44 +49,42 @@ html, body, #root {
 
 /* Terminal Log View styling */
 .log-terminal {
-  background-color: #0f172a;
-  color: #38bdf8;
-  background-color: #ffffff;
+  background-color: #f8fafc;
   color: #0f172a;
   font-family: var(--mono);
-  font-size: 0.85rem;
+  font-size: 0.8rem;
   line-height: 1.55;
-  padding: 1.25rem;
+  padding: 1rem 1.25rem;
   border-radius: 0.5rem;
   max-height: 520px;
   overflow-y: auto;
   white-space: pre-wrap;
   word-break: break-all;
-  border: 1px solid #1e293b;
-  box-shadow: inset 0 2px 4px rgba(0, 0, 0, 0.4);
   border: 1px solid #e2e8f0;
-  box-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.05);
+  box-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.04);
 }
 
 .log-line {
   margin-bottom: 2px;
 }
 .log-line-info {
-  color: #38bdf8;
-  color: #0f172a;
+  color: #334155;
+}
+.log-line-download {
+  color: #1d4ed8;
+  font-weight: 600;
 }
 .log-line-warn {
-  color: #fbbf24;
-  color: #d97706;
+  color: #b45309;
+  font-weight: 600;
 }
 .log-line-error {
-  color: #f87171;
   color: #dc2626;
+  font-weight: 600;
 }
 .log-line-header {
-  color: #a7f3d0;
-  color: #2563eb;
-  font-weight: 600;
+  color: #0f172a;
+  font-weight: 700;
 }
 
 /* Modal Overlay */

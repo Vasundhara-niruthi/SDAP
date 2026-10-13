@@ -7,7 +7,8 @@ from app.models.sdap_models import (
     ProcessJobModel,
     DistrictTileMappingModel,
     TileSceneMetadataModel,
-    Sentinel1SceneMetadataModel
+    Sentinel1SceneMetadataModel,
+    LayerStackJobModel
 )
 
 # Alias for backwards compatibility
@@ -23,6 +24,7 @@ __all__ = [
     "ProcessJobModel",
     "DistrictTileMappingModel",
     "TileSceneMetadataModel",
-    "Sentinel1SceneMetadataModel"
+    "Sentinel1SceneMetadataModel",
+    "LayerStackJobModel"
 ]
 

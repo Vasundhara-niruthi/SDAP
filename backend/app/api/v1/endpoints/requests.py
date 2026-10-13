@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks, 
 from fastapi.responses import FileResponse
 import os
 import logging
-from sqlalchemy.orm import Session, joinedload
+from sqlalchemy.orm import Session, joinedload, defer
 from sqlalchemy import text
 from typing import List, Optional
 from datetime import datetime
@@ -12,7 +12,7 @@ from app.core.security import get_current_user, get_current_admin
 from app.models.sdap_models import RequestModel, UserModel, ProcessJobModel
 from app.schemas.request_schema import (
     RequestCreate, RequestResponse, RequestEstimateResponse,
-    LayerStackCreate, LayerStackResponse
+    LayerStackCreate, LayerStackResponse, LayerStackTaskResponse
 )
 from app.core.config import settings
 
@@ -166,7 +166,7 @@ def run_pipeline_background(request_id: int):
             raise ValueError(f"Request #{request_id} does not specify a valid district or state.")
         start_str = req.start_date.strftime("%Y-%m-%d")
         end_str = req.end_date.strftime("%Y-%m-%d")
-        indices = req.indices if isinstance(req.indices, list) and req.indices else ["NDVI", "LSWI"]
+        indices = req.indices if isinstance(req.indices, list) else ["NDVI", "LSWI"]
 
         max_cloud_cover = float(getattr(req, "max_cloud_cover", 100.0) or 100.0)
         req_level = (getattr(req, "level", "max") or "max").lower().strip()
@@ -206,7 +206,7 @@ def run_pipeline_background(request_id: int):
         db.close()
 
 
-def build_request_response(req: RequestModel) -> RequestResponse:
+def build_request_response(req: RequestModel, include_logs: bool = True) -> RequestResponse:
     """Helper to attach user metadata to request response."""
     return RequestResponse(
         id=req.id,
@@ -228,7 +228,7 @@ def build_request_response(req: RequestModel) -> RequestResponse:
         level=getattr(req, "level", "max") or "max",
         status=req.status,
         storage_estimated_gb=req.storage_estimated_gb,
-        execution_logs=req.execution_logs,
+        execution_logs=(req.execution_logs[-200000:] if req.execution_logs else None) if include_logs else None,
         created_at=req.created_at
     )
 
@@ -370,7 +370,10 @@ def list_requests(
       - if user_id is provided: sees only that user's requests.
       - otherwise: sees all requests.
     """
-    query = db.query(RequestModel).options(joinedload(RequestModel.user))
+    query = db.query(RequestModel).options(
+        joinedload(RequestModel.user),
+        defer(RequestModel.execution_logs)
+    )
     is_admin = (current_user.role or "").strip().upper() == "ADMIN"
     if not is_admin or scope == "mine":
         query = query.filter(RequestModel.user_id == current_user.id)
@@ -378,7 +381,7 @@ def list_requests(
         query = query.filter(RequestModel.user_id == user_id)
 
     requests_list = query.order_by(RequestModel.id.desc()).offset(skip).limit(limit).all()
-    return [build_request_response(r) for r in requests_list]
+    return [build_request_response(r, include_logs=False) for r in requests_list]
 
 
 @router.get("/{request_id}", response_model=RequestResponse, summary="Get Request by ID")
@@ -788,40 +791,79 @@ def download_request_composite(
     )
 
 
-@router.post("/layer-stack", response_model=LayerStackResponse, summary="Execute multi-band layer stacking across bands and indices")
+@router.post("/layer-stack", response_model=LayerStackTaskResponse, summary="Execute multi-band layer stacking across bands and indices")
 def create_layer_stack(
     payload: LayerStackCreate,
     db: Session = Depends(get_db),
     current_user: UserModel = Depends(get_current_user)
 ):
     """
-    Executes multi-band layer stacking in user's exact chosen selection order:
+    Initiates asynchronous multi-band layer stacking with live progress and log tracking:
     Saves to: {RAW_ARCHIVE_DIR}/Composites/stack/{district}/
-    Filename: {district}_{season}_{start_date}-{end_date}_{bands}.tif
+    Filename: {district}_{season}_{start_date}_{end_date}_{bands}.tif
     """
-    from app.services.stacker_service import execute_layer_stacking
+    from app.services.stacker_service import launch_layer_stack_task
     try:
-        res = execute_layer_stacking(
-            db=db,
+        task_id = launch_layer_stack_task(
             district=payload.district,
             state=payload.state,
-            season=payload.season or "Custom",
+            season=payload.season or "Kharif",
             start_date=payload.start_date,
             end_date=payload.end_date,
             layers=payload.layers,
             clip_to_district=payload.clip_to_district if payload.clip_to_district is not None else True,
             output_filename=getattr(payload, "output_filename", None),
-            selected_files=getattr(payload, "selected_files", None)
+            selected_files=getattr(payload, "selected_files", None),
+            selected_files_by_band=getattr(payload, "selected_files_by_band", None),
+            request_id=payload.request_id,
+            user_id=current_user.id if current_user else None
         )
-        res["download_url"] = f"/api/v1/requests/layer-stack/download?file_path={res['output_path']}"
-        return res
-    except FileNotFoundError as fnf_err:
-        raise HTTPException(status_code=404, detail=str(fnf_err))
-    except ValueError as val_err:
-        raise HTTPException(status_code=400, detail=str(val_err))
+        return {
+            "status": "RUNNING",
+            "task_id": task_id,
+            "message": f"Layer stacking background task initiated for {payload.district}."
+        }
     except Exception as exc:
-        logger.error(f"Layer stacking failed: {exc}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Layer stacking execution failed: {exc}")
+        logger.error(f"Failed to initiate layer stack task: {exc}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Layer stacking launch failed: {exc}")
+
+
+@router.get("/layer-stack/status/{task_id}", summary="Get live status, progress and execution logs for a layer stacking task")
+def get_layer_stack_task_status(
+    task_id: str,
+    db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_user)
+):
+    """Poll live progress percentage and real-time execution logs for a layer stacking task (checks in-memory & PostgreSQL)."""
+    from app.services.stacker_service import get_stack_job
+    job = get_stack_job(task_id, db=db)
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Layer stacking task '{task_id}' not found.")
+    return job
+
+
+@router.get("/layer-stack/latest-active", summary="Get most recent or active layer stacking task for persistence across page refresh")
+def get_latest_layer_stack_task(
+    district: Optional[str] = Query(None, description="Optional district filter"),
+    db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_user)
+):
+    """Retrieves the latest running or completed layer stack job from PostgreSQL."""
+    from app.services.stacker_service import get_latest_stack_job
+    job = get_latest_stack_job(district=district, db=db)
+    return job or {}
+
+
+@router.get("/layer-stack/jobs", summary="List layer stacking jobs history directly from PostgreSQL")
+def get_layer_stack_jobs(
+    district: Optional[str] = Query(None, description="Filter by district"),
+    limit: int = Query(20, ge=1, le=100),
+    db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_user)
+):
+    """Lists history of layer stacking executions with their logs and outputs."""
+    from app.services.stacker_service import list_db_stack_jobs
+    return list_db_stack_jobs(district=district, limit=limit, db=db)
 
 
 @router.get("/layer-stack/download", summary="Download a generated layer-stacked GeoTIFF")
@@ -847,11 +889,21 @@ def download_layer_stack(
 @router.get("/layer-stack/history", summary="List previously generated layer-stacked GeoTIFFs")
 def list_layer_stacks(
     district: Optional[str] = Query(None, description="Filter by district"),
+    state: Optional[str] = Query(None, description="Filter by state"),
+    season: Optional[str] = Query(None, description="Filter by season"),
+    start_date: Optional[str] = Query(None, description="Filter by start date"),
+    end_date: Optional[str] = Query(None, description="Filter by end date"),
     db: Session = Depends(get_db),
     current_user: UserModel = Depends(get_current_user)
 ):
     from app.services.stacker_service import list_existing_layer_stacks
-    return list_existing_layer_stacks(district=district)
+    return list_existing_layer_stacks(
+        district=district,
+        state=state,
+        season=season,
+        start_date=start_date,
+        end_date=end_date
+    )
 
 
 @router.get("/admin/daily-storage", summary="Admin Daily Storage Overview")

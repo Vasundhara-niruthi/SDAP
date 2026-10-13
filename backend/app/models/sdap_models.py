@@ -197,3 +197,40 @@ class Sentinel1SceneMetadataModel(Base):
     downloaded_by_user = relationship("UserModel")
 
 
+class LayerStackJobModel(Base):
+    """
+    Model for tracking layer stacking jobs, execution logs, and output metadata.
+    Persists across server restarts and hot reloads to avoid 404 errors during client polling.
+    """
+    __tablename__ = "layer_stack_jobs"
+
+    id = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    task_id = Column(String(100), unique=True, nullable=False, index=True)
+    request_id = Column(Integer, ForeignKey("requests.id", ondelete="SET NULL"), nullable=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    district = Column(String(100), nullable=False, index=True)
+    state = Column(String(100), nullable=True)
+    season = Column(String(50), nullable=True)
+    start_date = Column(String(30), nullable=True)
+    end_date = Column(String(30), nullable=True)
+    layers = Column(JSON, nullable=True)
+    clip_to_district = Column(Boolean, default=True)
+    status = Column(String(50), default="RUNNING", index=True) # 'RUNNING', 'SUCCESS', 'FAILED'
+    progress = Column(Integer, default=0)
+    step = Column(String(100), default="INITIALIZING")
+    execution_logs = Column(Text, nullable=True)
+    logs_json = Column(JSON, nullable=True)
+    output_path = Column(Text, nullable=True)
+    filename = Column(String(255), nullable=True)
+    file_size_mb = Column(Float, nullable=True)
+    total_bands = Column(Integer, nullable=True)
+    result_metadata = Column(JSON, nullable=True)
+    error = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    user = relationship("UserModel")
+    request = relationship("RequestModel")
+
+
+

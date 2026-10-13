@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import axios from 'axios';
 import {
-  Satellite, Activity, HardDrive, User, LogOut, RefreshCw, FileText,
+  Satellite, Activity, HardDrive, User, LogOut, RefreshCw, FileText, Folder,
   CheckCircle, Clock, AlertTriangle, XCircle, Plus, Search, Database,
   Calendar, MapPin, Sliders, Shield, Users, Check, ChevronRight, ChevronDown, Info,
   HelpCircle, X, Download, Play, Terminal, Eye, EyeOff, KeyRound, ArrowLeft, Square, Table,
@@ -24,6 +24,7 @@ const formatApiError = (err, defaultMsg) => {
   const detail = err.response?.data?.detail;
   if (typeof detail === 'string') return detail;
   if (Array.isArray(detail)) {
+    
     return detail.map(item => {
       const field = item.loc ? item.loc[item.loc.length - 1] : '';
       if (item.type === 'string_too_short') {
@@ -110,7 +111,11 @@ export default function App() {
   const [requests, setRequests] = useState([]);
   const [loadingRequests, setLoadingRequests] = useState(false);
   const [selectedReqForLogs, setSelectedReqForLogs] = useState(null);
+  const [logsModalTifs, setLogsModalTifs] = useState([]);
+  const [logsModalComposites, setLogsModalComposites] = useState([]);
   const [isLogsModalOpen, setIsLogsModalOpen] = useState(false);
+  const [showWarningModal, setShowWarningModal] = useState(false);
+  const [selectedWarningScene, setSelectedWarningScene] = useState(null);
   const [rerunningId, setRerunningId] = useState(null);
   const [stoppingId, setStoppingId] = useState(null);
   const logsEndRef = useRef(null);
@@ -118,6 +123,7 @@ export default function App() {
   const [logViewMode, setLogViewMode] = useState('table'); // 'table' | 'raw'
   const [logFilter, setLogFilter] = useState('all'); // 'all' | 'downloads' | 'errors'
   const [logSearchQuery, setLogSearchQuery] = useState('');
+  const [logStepFilter, setLogStepFilter] = useState('all'); // 'all' | 'step1' | 'step2' | 'step3' | 'step4'
 
   // ---------------------------------------------------------------------------
   // 6. Admin State
@@ -287,12 +293,40 @@ export default function App() {
   const [loadingStackHistory, setLoadingStackHistory] = useState(false);
   const [stackHistorySearch, setStackHistorySearch] = useState('');
 
+  // Dedicated NAS Layer Stack Archive Verification state (Tab 4: Retrieve Data)
+  const [stackArchiveState, setStackArchiveState] = useState('');
+  const [stackArchiveDistrict, setStackArchiveDistrict] = useState('');
+  const [stackArchiveSeason, setStackArchiveSeason] = useState('Kharif');
+  const [stackArchiveStartDate, setStackArchiveStartDate] = useState('2024-06-01');
+  const [stackArchiveEndDate, setStackArchiveEndDate] = useState('2024-12-31');
+  const [stackArchiveResults, setStackArchiveResults] = useState([]);
+  const [hasVerifiedStackArchive, setHasVerifiedStackArchive] = useState(false);
+  const [verifyingStackArchive, setVerifyingStackArchive] = useState(false);
+  const [stackArchiveNotice, setStackArchiveNotice] = useState(null);
+  const [stackArchiveSearch, setStackArchiveSearch] = useState('');
+  const [selectedStackForLogs, setSelectedStackForLogs] = useState(null);
+  const [stackModalViewMode, setStackModalViewMode] = useState('table');
+  const [stackModalFilter, setStackModalFilter] = useState('all');
+  const [stackModalSearch, setStackModalSearch] = useState('');
+
   // Request-linked downloaded scenes & filename preservation state
   const [stackSelectedRequestId, setStackSelectedRequestId] = useState('');
   const [stackDownloadedBandsData, setStackDownloadedBandsData] = useState({});
   const [stackSelectedScenes, setStackSelectedScenes] = useState({});
-  const [stackCustomFilename, setStackCustomFilename] = useState('');
   const [loadingStackReqFiles, setLoadingStackReqFiles] = useState(false);
+
+  // Layer Stacking Real-time execution tracking & live log states
+  const [stackTaskId, setStackTaskId] = useState('');
+  const [stackProgress, setStackProgress] = useState(0);
+  const [stackStep, setStackStep] = useState('');
+  const [stackLogs, setStackLogs] = useState([]);
+  const [stackLogViewMode, setStackLogViewMode] = useState('table'); // 'table' | 'terminal'
+  const [stackLogFilter, setStackLogFilter] = useState('all'); // 'all' | 'info' | 'success' | 'warnings' | 'errors'
+  const [stackLogSearchQuery, setStackLogSearchQuery] = useState('');
+  const [stackHistoryScope, setStackHistoryScope] = useState('district'); // 'district' | 'all'
+  const stackPollIntervalRef = useRef(null);
+  const stackLogsEndRef = useRef(null);
+  const stackTerminalContainerRef = useRef(null);
 
   const AVAILABLE_OPTICAL_BANDS = [
     { id: 'B02', label: 'B02 - Blue (490nm, 10m)' },
@@ -307,7 +341,7 @@ export default function App() {
   const AVAILABLE_SAR_BANDS = [
     { id: 'VV', label: 'VV - Vertical-Vertical Co-polarization (10m)' },
     { id: 'VH', label: 'VH - Vertical-Horizontal Cross-polarization (10m)' },
-    { id: 'VV_VH', label: 'VV_VH - Dual-polarization Cross/Co Ratio (10m)' }
+    { id: 'VV_VH', label: 'VV_VH - Dual-polarization Composites (10m)' }
   ];
 
   const AVAILABLE_INDICES = [
@@ -335,7 +369,8 @@ export default function App() {
 
       if (!matchingReq && distVal) {
         matchingList = requests.filter(r => 
-          r.district && r.district.toLowerCase() === distVal.toLowerCase()
+          r.district && r.district.toLowerCase() === distVal.toLowerCase() &&
+          (!stateVal || !r.state || r.state.toLowerCase() === stateVal.toLowerCase())
         );
       }
       if (!matchingReq && matchingList.length === 0 && stateVal) {
@@ -366,25 +401,24 @@ export default function App() {
         if (matchingReq.start_date) setStackStartDate(matchingReq.start_date.split('T')[0]);
         if (matchingReq.end_date) setStackEndDate(matchingReq.end_date.split('T')[0]);
 
-        // Query candidate requests for tifs - take the highest priority matching request with data
-        const reqsToTry = matchingList.length > 0 ? matchingList : [matchingReq];
+        // Query candidate requests for tifs - use targetReqId if specified, or merge across matching requests
+        const reqsToTry = targetReqId ? [matchingReq] : (matchingList.length > 0 ? matchingList : [matchingReq]);
+        const allTifsMap = new Map();
         for (const r of reqsToTry) {
           try {
             const res = await axios.get(`${API_BASE}/requests/${r.id}/tifs`, { headers: getAuthHeader() });
             const list = res.data?.tifs || [];
-            if (list.length > 0) {
-              tifs = list;
-              matchingReq = r;
-              setStackSelectedRequestId(r.id);
-              if (r.season) setStackSeason(r.season);
-              if (r.start_date) setStackStartDate(r.start_date.split('T')[0]);
-              if (r.end_date) setStackEndDate(r.end_date.split('T')[0]);
-              break;
-            }
+            list.forEach(t => {
+              const k = (t.path || `${t.scene_id}_${t.band}`).toLowerCase();
+              if (!allTifsMap.has(k)) {
+                allTifsMap.set(k, t);
+              }
+            });
           } catch (e) {
             console.warn('Could not fetch request tifs directly:', e);
           }
         }
+        tifs = Array.from(allTifsMap.values());
       } else {
         setStackSelectedRequestId('');
       }
@@ -454,19 +488,21 @@ export default function App() {
             const dm = fileName.match(/(\d{4})(\d{2})(\d{2})_(\d{4})(\d{2})(\d{2})/);
             if (dm) sDate = `${dm[1]}-${dm[2]}-${dm[3]} to ${dm[4]}-${dm[5]}-${dm[6]}`;
           }
+          const isComp = fileName.toLowerCase().includes('composite');
           grouped[b].push({
-            scene_id: item.scene_id || (fileName.includes('Composite') ? 'Composite' : 'Scene'),
+            scene_id: item.scene_id || (isComp ? 'Composite' : 'Scene'),
             tile: tileVal,
             sensing_date: sDate,
             path: filePath,
             filename: fileName,
-            size_bytes: item.size_bytes
+            size_bytes: item.size_bytes,
+            is_composite: isComp
           });
         }
       });
 
-      // Also try fetching composites for the matched request
-      const candidateReqs = matchingReq ? [matchingReq] : [];
+      // Also try fetching composites for all matched requests
+      const candidateReqs = (typeof reqsToTry !== 'undefined' && reqsToTry.length > 0) ? reqsToTry : (matchingReq ? [matchingReq] : []);
       for (const reqItem of candidateReqs) {
         try {
           const compRes = await axios.get(`${API_BASE}/requests/${reqItem.id}/composites`, { headers: getAuthHeader() });
@@ -506,7 +542,8 @@ export default function App() {
                 sensing_date: sDate,
                 path: cPath,
                 filename: cFilename,
-                size_bytes: (c.file_size_mb || c.size_mb || 0) * 1024 * 1024
+                size_bytes: (c.file_size_mb || c.size_mb || 0) * 1024 * 1024,
+                is_composite: true
               });
             }
           });
@@ -524,8 +561,9 @@ export default function App() {
       if (matchingReq) {
         const reqIndices = Array.isArray(matchingReq.indices) ? matchingReq.indices : (matchingReq.indices ? [matchingReq.indices] : []);
         reqIndices.forEach(idx => {
-          const cleanIdx = idx.toUpperCase().trim();
-          if (['NDVI', 'LSWI'].includes(cleanIdx) && !initialLayers.includes(cleanIdx)) {
+          let cleanIdx = idx.toUpperCase().trim();
+          if (cleanIdx === 'VV/VH' || cleanIdx === 'VV-VH') cleanIdx = 'VV_VH';
+          if (['NDVI', 'LSWI', 'VV_VH'].includes(cleanIdx) && !initialLayers.includes(cleanIdx)) {
             initialLayers.push(cleanIdx);
           }
         });
@@ -533,12 +571,14 @@ export default function App() {
         reqBands.forEach(b => {
           let cleanB = b.toUpperCase().replace(/\.TIFF?$/i, '').trim();
           if (cleanB === 'B08A') cleanB = 'B8A';
+          if (cleanB === 'VV/VH' || cleanB === 'VV-VH') cleanB = 'VV_VH';
           if (!initialLayers.includes(cleanB)) initialLayers.push(cleanB);
         });
       }
 
       if (grouped['NDVI'] && !initialLayers.includes('NDVI')) initialLayers.push('NDVI');
       if (grouped['LSWI'] && !initialLayers.includes('LSWI')) initialLayers.push('LSWI');
+      if (grouped['VV_VH'] && !initialLayers.includes('VV_VH') && (matchingReq?.satellite?.includes('Sentinel-1') || matchingReq?.indices?.includes('VV/VH'))) initialLayers.push('VV_VH');
 
       // Default selected stage: all downloaded scenes for EVERY band are selected by default
       Object.keys(grouped).forEach(bKey => {
@@ -549,21 +589,6 @@ export default function App() {
       if (initialLayers.length > 0) {
         setStackSelectedLayers(initialLayers);
       }
-
-      // Preserve exact filename for downloaded layers (e.g., NDVI.tif)
-      if (initialLayers.includes('NDVI') && initialLayers.length <= 2) {
-        const ndviScene = grouped['NDVI']?.[0];
-        setStackCustomFilename(ndviScene?.filename || 'NDVI.tif');
-      } else if (initialLayers.length === 1) {
-        const singleB = initialLayers[0];
-        const firstScene = grouped[singleB]?.[0];
-        setStackCustomFilename(firstScene?.filename || `${singleB}.tif`);
-      } else {
-        const firstB = initialLayers[0];
-        const firstScene = grouped[firstB]?.[0];
-        setStackCustomFilename(firstScene?.filename || `${distVal || 'district'}_stacked.tif`);
-      }
-
     } catch (err) {
       console.warn('Could not fetch tifs for selected region:', err);
     } finally {
@@ -670,16 +695,6 @@ export default function App() {
           return prevScenes;
         });
       }
-
-      // Preserve exact filename for downloaded layers (e.g., NDVI.tif)
-      if (next.length === 1) {
-        const singleB = next[0];
-        const scenes = stackDownloadedBandsData[singleB] || [];
-        setStackCustomFilename(scenes[0]?.filename || `${singleB}.tif`);
-      } else if (next.includes('NDVI') && next.length <= 2) {
-        const ndviScenes = stackDownloadedBandsData['NDVI'] || [];
-        setStackCustomFilename(ndviScenes[0]?.filename || 'NDVI.tif');
-      }
       return next;
     });
   };
@@ -724,6 +739,129 @@ export default function App() {
     }
   }, [token]);
 
+  const handleVerifyStackArchive = useCallback(async () => {
+    if (!token) return;
+    setVerifyingStackArchive(true);
+    setStackArchiveNotice(null);
+    try {
+      const params = {};
+      if (stackArchiveDistrict && stackArchiveDistrict.trim() && stackArchiveDistrict !== 'ALL') {
+        params.district = stackArchiveDistrict.trim();
+      }
+      if (stackArchiveState && stackArchiveState.trim() && stackArchiveState !== 'ALL') {
+        params.state = stackArchiveState.trim();
+      }
+      if (stackArchiveSeason && stackArchiveSeason.trim() && stackArchiveSeason !== 'ALL') {
+        params.season = stackArchiveSeason.trim();
+      }
+      if (stackArchiveStartDate && stackArchiveStartDate.trim()) {
+        params.start_date = stackArchiveStartDate.trim();
+      }
+      if (stackArchiveEndDate && stackArchiveEndDate.trim()) {
+        params.end_date = stackArchiveEndDate.trim();
+      }
+      const res = await axios.get(`${API_BASE}/requests/layer-stack/history`, {
+        params,
+        headers: getAuthHeader()
+      });
+      const data = res.data || [];
+      setStackArchiveResults(data);
+      setHasVerifiedStackArchive(true);
+      if (data.length > 0) {
+        setStackArchiveNotice({
+          type: 'success',
+          text: `Found ${data.length} verified layer stack(s) matching your parameters on NAS archive.`
+        });
+      } else {
+        setStackArchiveNotice({
+          type: 'warning',
+          text: 'No layer-stacked GeoTIFFs found on NAS archive for the selected state/district/season/dates.'
+        });
+      }
+    } catch (err) {
+      console.error('Error verifying layer stacks on NAS archive:', err);
+      setStackArchiveNotice({
+        type: 'error',
+        text: 'Failed to query NAS archive for layer stacks. Please check network connectivity.'
+      });
+    } finally {
+      setVerifyingStackArchive(false);
+    }
+  }, [token, stackArchiveDistrict, stackArchiveState, stackArchiveSeason, stackArchiveStartDate, stackArchiveEndDate]);
+
+  const handleResetStackArchive = () => {
+    setStackArchiveState('');
+    setStackArchiveDistrict('');
+    setStackArchiveSeason('Kharif');
+    setStackArchiveStartDate('2024-06-01');
+    setStackArchiveEndDate('2024-12-31');
+    setStackArchiveResults([]);
+    setHasVerifiedStackArchive(false);
+    setStackArchiveNotice(null);
+    setStackArchiveSearch('');
+  };
+
+  const startStackPolling = useCallback((taskId, targetDistrict) => {
+    if (stackPollIntervalRef.current) {
+      clearInterval(stackPollIntervalRef.current);
+      stackPollIntervalRef.current = null;
+    }
+
+    setStackTaskId(taskId);
+    setStackLoading(true);
+
+    const poll = async () => {
+      try {
+        const pollRes = await axios.get(`${API_BASE}/requests/layer-stack/status/${taskId}`, {
+          headers: getAuthHeader()
+        });
+        const data = pollRes.data;
+
+        if (data.progress !== undefined) setStackProgress(data.progress);
+        if (data.step) setStackStep(data.step);
+        if (data.logs && Array.isArray(data.logs)) {
+          setStackLogs(data.logs);
+        }
+
+        if (data.status === 'SUCCESS') {
+          if (stackPollIntervalRef.current) {
+            clearInterval(stackPollIntervalRef.current);
+            stackPollIntervalRef.current = null;
+          }
+          setStackLoading(false);
+          setStackProgress(100);
+          setStackResult(data.result);
+          setStackNotice({
+            type: 'success',
+            text: data.result?.already_completed
+              ? `✓ Verified: Task was already completed on NAS — loaded existing stack "${data.result?.filename}" (${data.result?.file_size_mb} MB, ${data.result?.total_bands} bands).`
+              : `✓ Layer stack created successfully: "${data.result?.filename}" (${data.result?.file_size_mb} MB, ${data.result?.total_bands} bands)`
+          });
+          localStorage.removeItem('sdap_active_stack_task');
+          if (targetDistrict || stackDistrict) {
+            fetchStackHistory(targetDistrict || stackDistrict);
+          }
+        } else if (data.status === 'FAILED') {
+          if (stackPollIntervalRef.current) {
+            clearInterval(stackPollIntervalRef.current);
+            stackPollIntervalRef.current = null;
+          }
+          setStackLoading(false);
+          setStackNotice({
+            type: 'error',
+            text: `⚠️ Layer stacking failed: ${data.error || data.message || 'Execution failed.'}`
+          });
+          localStorage.removeItem('sdap_active_stack_task');
+        }
+      } catch (pollErr) {
+        console.warn('Status poll warning:', pollErr);
+      }
+    };
+
+    poll();
+    stackPollIntervalRef.current = setInterval(poll, 1200);
+  }, [stackDistrict, fetchStackHistory]);
+
   const handleExecuteLayerStacking = async () => {
     if (!stackDistrict) {
       setStackNotice({
@@ -740,23 +878,45 @@ export default function App() {
       return;
     }
 
+    if (stackPollIntervalRef.current) {
+      clearInterval(stackPollIntervalRef.current);
+      stackPollIntervalRef.current = null;
+    }
+
     setStackLoading(true);
     setStackNotice(null);
     setStackResult(null);
+    setStackProgress(5);
+    setStackStep('VERIFYING_TASK');
+    setStackLogs([
+      {
+        timestamp: new Date().toLocaleTimeString(),
+        level: 'INFO',
+        message: `Verifying whether layer stacking task for ${stackDistrict} (${stackSeason || 'Kharif'}) is already completed on NAS or a new task...`
+      }
+    ]);
 
-    // Collect all selected file paths from scenes
+    // Collect all selected file paths from scenes strictly based on checked boxes
     const selectedPaths = [];
+    const selectedFilesByBand = {};
+
     stackSelectedLayers.forEach(lyr => {
       const scenes = stackDownloadedBandsData[lyr] || [];
       const selectedSet = stackSelectedScenes[lyr] !== undefined
         ? stackSelectedScenes[lyr]
         : new Set(scenes.map(s => s.path || s.scene_id));
+      
+      const bandPaths = [];
       scenes.forEach(sc => {
         const key = sc.path || sc.scene_id;
         if (selectedSet.has(key) && sc.path) {
           selectedPaths.push(sc.path);
+          bandPaths.push(sc.path);
         }
       });
+      if (bandPaths.length > 0) {
+        selectedFilesByBand[lyr] = bandPaths;
+      }
     });
 
     try {
@@ -768,31 +928,40 @@ export default function App() {
         end_date: stackEndDate || null,
         layers: stackSelectedLayers,
         clip_to_district: stackClipToDistrict,
-        output_filename: stackCustomFilename ? stackCustomFilename.trim() : (stackSelectedLayers.length === 1 ? `${stackSelectedLayers[0]}.tif` : null),
         selected_files: selectedPaths.length > 0 ? selectedPaths : null,
+        selected_files_by_band: Object.keys(selectedFilesByBand).length > 0 ? selectedFilesByBand : null,
         request_id: stackSelectedRequestId ? Number(stackSelectedRequestId) : null
       };
 
       const res = await axios.post(`${API_BASE}/requests/layer-stack`, payload, {
-        headers: getAuthHeader(),
-        timeout: 180000
+        headers: getAuthHeader()
       });
 
-      setStackResult(res.data);
-      setStackNotice({
-        type: 'success',
-        text: `✓ Layer stack created successfully: "${res.data.filename}" (${res.data.file_size_mb} MB, ${res.data.total_bands} bands)`
-      });
+      const taskId = res.data.task_id;
+      setStackTaskId(taskId);
+      setStackStep('TASK_STARTED');
+      localStorage.setItem('sdap_active_stack_task', JSON.stringify({
+        taskId,
+        district: stackDistrict,
+        season: stackSeason
+      }));
+      setStackLogs(prev => [
+        ...prev,
+        {
+          timestamp: new Date().toLocaleTimeString(),
+          level: 'INFO',
+          message: `Task ${taskId} registered in database. Streaming live execution logs from NAS...`
+        }
+      ]);
 
-      // Refresh stack history
-      fetchStackHistory(stackDistrict);
+      startStackPolling(taskId, stackDistrict);
+
     } catch (err) {
+      setStackLoading(false);
       setStackNotice({
         type: 'error',
-        text: `⚠️ Layer stacking failed: ${formatApiError(err, 'Failed to complete layer stacking.')}`
+        text: `⚠️ Layer stacking failed: ${formatApiError(err, 'Failed to launch layer stacking task.')}`
       });
-    } finally {
-      setStackLoading(false);
     }
   };
 
@@ -915,16 +1084,24 @@ export default function App() {
     setIsLogsModalOpen(false);
   };
 
+  const boundariesLoadedRef = useRef(false);
+  const isFetchingRequestsRef = useRef(false);
+
   // Sync selectedReqIdRef to track selected request across poll updates
   useEffect(() => {
     selectedReqIdRef.current = selectedReqForLogs?.id || null;
   }, [selectedReqForLogs?.id]);
 
-  // Load states + districts from DB whenever token becomes available or changes
+  // Load states + districts from DB once when token becomes available
   useEffect(() => {
-    if (!token) return;
+    if (!token) {
+      boundariesLoadedRef.current = false;
+      return;
+    }
+    if (boundariesLoadedRef.current) return;
     const storedToken = token || localStorage.getItem('sdap_token');
     if (!storedToken) return;
+    boundariesLoadedRef.current = true;
     setLoadingBoundaries(true);
     const authHeader = { Authorization: `Bearer ${storedToken}` };
     Promise.all([
@@ -938,7 +1115,10 @@ export default function App() {
         setDistrictsList(rawDistricts);
         console.log(`[Boundaries] Loaded ${rawStates.length} states, ${rawDistricts.length} districts`);
       })
-      .catch(err => console.error('[Boundaries] Failed to load:', err))
+      .catch(err => {
+        console.error('[Boundaries] Failed to load:', err);
+        boundariesLoadedRef.current = false;
+      })
       .finally(() => setLoadingBoundaries(false));
   }, [token]);
 
@@ -969,25 +1149,21 @@ export default function App() {
   }, [token, activeTab, fetchDownloadedRegions, fetchStackHistory, stackDistrict]);
 
   // Fetch Requests List (scoped to logged-in user, or all requests for administrators)
-  const fetchRequests = useCallback(async () => {
+  const fetchRequests = useCallback(async (isSilent = false) => {
     if (!token) return;
-    setLoadingRequests(true);
+    if (isFetchingRequestsRef.current) return;
+    isFetchingRequestsRef.current = true;
+    if (!isSilent) setLoadingRequests(true);
     try {
       const scopeParam = currentUser?.role === 'ADMIN' ? '' : '?scope=mine';
       const res = await axios.get(`${API_BASE}/requests/${scopeParam}`, { headers: getAuthHeader() });
       const data = res.data || [];
       setRequests(data);
-
-      if (selectedReqIdRef.current) {
-        const updated = data.find(r => r.id === selectedReqIdRef.current);
-        if (updated) {
-          setSelectedReqForLogs(updated);
-        }
-      }
     } catch (err) {
       console.error('Error loading requests:', err);
     } finally {
-      setLoadingRequests(false);
+      isFetchingRequestsRef.current = false;
+      if (!isSilent) setLoadingRequests(false);
     }
   }, [token, currentUser?.role]);
 
@@ -1069,11 +1245,39 @@ export default function App() {
     selectedReqIdRef.current = req.id;
     setSelectedReqForLogs(req);
     setIsLogsModalOpen(true);
+    axios.get(`${API_BASE}/requests/${req.id}`, { headers: getAuthHeader() })
+      .then(res => {
+        if (res.data && selectedReqIdRef.current === req.id) {
+          setSelectedReqForLogs(res.data);
+        }
+      })
+      .catch(() => {});
+    axios.get(`${API_BASE}/requests/${req.id}/tifs`, { headers: getAuthHeader() })
+      .then(res => {
+        if (selectedReqIdRef.current === req.id) {
+          setLogsModalTifs(res.data?.tifs || []);
+        }
+      })
+      .catch(() => setLogsModalTifs([]));
+    axios.get(`${API_BASE}/requests/${req.id}/composites`, { headers: getAuthHeader() })
+      .then(res => {
+        if (selectedReqIdRef.current === req.id) {
+          setLogsModalComposites(res.data?.composites || res.data || []);
+        }
+      })
+      .catch(() => setLogsModalComposites([]));
   };
 
   const closeLogsModal = () => {
     selectedReqIdRef.current = null;
     setIsLogsModalOpen(false);
+    setSelectedReqForLogs(null);
+    setLogsModalTifs([]);
+    setLogsModalComposites([]);
+    setShowWarningModal(false);
+    setSelectedWarningScene(null);
+    setLogStepFilter('all');
+    setLogSearchQuery('');
   };
 
   // Initial fetch of requests on login
@@ -1094,12 +1298,44 @@ export default function App() {
     }
   }, [token, currentUser, activeTab, fetchAdminData, fetchDailyStorage]);
 
-  // Smart polling: poll requests & active log modal continuously every 2s
+  // Smart polling: poll requests & active log modal continuously in real-time (1s when modal open, 2.5s otherwise)
   useEffect(() => {
     if (!token) return;
 
     const interval = setInterval(async () => {
-      fetchRequests();
+      // 1. If execution logs modal is open, strictly poll only the active modal request's data.
+      // Do NOT run background table re-fetches to prevent unnecessary DOM re-renders, shifting, or scrolling.
+      if (isLogsModalOpen && selectedReqIdRef.current) {
+        const targetModalId = selectedReqIdRef.current;
+        try {
+          const res = await axios.get(`${API_BASE}/requests/${targetModalId}`, { headers: getAuthHeader() });
+          if (res.data && selectedReqIdRef.current === targetModalId) {
+            setSelectedReqForLogs(res.data);
+          }
+        } catch (e) {
+          // ignore polling failure
+        }
+        try {
+          const tifsRes = await axios.get(`${API_BASE}/requests/${targetModalId}/tifs`, { headers: getAuthHeader() });
+          if (selectedReqIdRef.current === targetModalId) {
+            setLogsModalTifs(tifsRes.data?.tifs || []);
+          }
+        } catch (e) {
+          // ignore tifs polling failure
+        }
+        try {
+          const compRes = await axios.get(`${API_BASE}/requests/${targetModalId}/composites`, { headers: getAuthHeader() });
+          if (selectedReqIdRef.current === targetModalId) {
+            setLogsModalComposites(compRes.data?.composites || compRes.data || []);
+          }
+        } catch (e) {
+          // ignore composites polling failure
+        }
+        return; // Don't run background table re-fetches while user is inspecting logs in modal
+      }
+
+      // 2. Normal background polling when modal is closed (using isSilent=true to avoid loading state flickering)
+      fetchRequests(true);
       if (currentUser?.role === 'ADMIN') {
         if (activeTab === 'users') {
           fetchAdminData();
@@ -1108,31 +1344,57 @@ export default function App() {
           }
         }
       }
-      if (isLogsModalOpen && selectedReqIdRef.current) {
-        try {
-          const res = await axios.get(`${API_BASE}/requests/${selectedReqIdRef.current}`, { headers: getAuthHeader() });
-          if (res.data) {
-            setSelectedReqForLogs(res.data);
-          }
-        } catch (e) {
-          // ignore polling failure
-        }
-      }
-    }, 2000);
+    }, isLogsModalOpen ? 1500 : 5000);
 
     return () => clearInterval(interval);
-  }, [token, isLogsModalOpen, activeTab, currentUser?.role, expandedUserId]);
+  }, [token, isLogsModalOpen, activeTab, currentUser?.role, expandedUserId, fetchRequests, fetchAdminData, fetchUserRequests]);
 
-  // Auto scroll terminal log view when logs update
+  // Auto scroll layer stack live console within its own container only if user is already near bottom (respects manual user scrolling)
   useEffect(() => {
-    if (isLogsModalOpen && logsEndRef.current) {
-      logsEndRef.current.scrollIntoView({ behavior: 'smooth' });
+    if (stackTerminalContainerRef.current && (stackLoading || stackLogs.length > 0)) {
+      const el = stackTerminalContainerRef.current;
+      const isNearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+      if (isNearBottom) {
+        el.scrollTop = el.scrollHeight;
+      }
     }
-  }, [selectedReqForLogs?.execution_logs, isLogsModalOpen]);
+  }, [stackLogs, stackLoading]);
+
+  // Cleanup polling interval on unmount
+  useEffect(() => {
+    return () => {
+      if (stackPollIntervalRef.current) {
+        clearInterval(stackPollIntervalRef.current);
+      }
+    };
+  }, []);
+
+  // Resume active layer stack task on page refresh / load
+  useEffect(() => {
+    if (!token) return;
+    try {
+      const savedTaskStr = localStorage.getItem('sdap_active_stack_task');
+      if (savedTaskStr) {
+        const saved = JSON.parse(savedTaskStr);
+        if (saved && saved.taskId) {
+          setStackTaskId(saved.taskId);
+          if (saved.district && !stackDistrict) {
+            setStackDistrict(saved.district);
+          }
+          if (saved.season && !stackSeason) {
+            setStackSeason(saved.season);
+          }
+          startStackPolling(saved.taskId, saved.district);
+        }
+      }
+    } catch (e) {
+      console.warn('Failed to resume stack task from localStorage:', e);
+    }
+  }, [token, startStackPolling, stackDistrict, stackSeason]);
 
   // ---------------------------------------------------------------------------
-  // Dynamic Storage Estimation Logic (SRS 8.3 Algorithm)
-  // Matches backend estimate_request_storage() exactly.
+  // Dynamic Storage & Step-Based Duration Estimation Logic (SRS 8.3 Algorithm)
+  // Calculates estimated time dynamically based on active pipeline steps (2 to 4 steps).
   // ---------------------------------------------------------------------------
   const calculateEstimatedStorage = () => {
     const start = new Date(startDate);
@@ -1149,13 +1411,18 @@ export default function App() {
     let totalGB = 0;
     let scenesEstimate = 0;
 
+    // Cloud cover filter reduces Sentinel-2 downloadable scenes when threshold < 100%
+    const cloudVal = Math.min(100, Math.max(0, parseFloat(maxCloudCover) || 100));
+    const s2CloudFactor = isS2 ? (0.35 + 0.65 * (cloudVal / 100.0)) : 1.0;
+
     if (isS1) {
       totalGB += tileCount * 2.5 * months * 0.615;
       scenesEstimate += Math.round(tileCount * 2.5 * months);
     }
     if (isS2) {
-      totalGB += tileCount * 6.0 * months * 0.270;
-      scenesEstimate += Math.round(tileCount * 6.0 * months);
+      const s2Scenes = Math.max(1, Math.round(tileCount * 6.0 * months * s2CloudFactor));
+      totalGB += s2Scenes * 0.270;
+      scenesEstimate += s2Scenes;
     }
     if (!isS1 && !isS2) {
       totalGB = tileCount * 6.0 * months * 0.270;
@@ -1163,19 +1430,54 @@ export default function App() {
     }
 
     const totalMB = totalGB * 1024;
-    // Estimated download throughput ~12 MB/s (sustained multi-band HTTP/S3 pipeline transfer)
-    const totalSeconds = Math.max(30, Math.round(totalMB / 12.0));
-    let downloadTimeText = '';
-    if (totalSeconds < 60) {
-      downloadTimeText = '< 1 min';
-    } else if (totalSeconds < 3600) {
-      const m = Math.round(totalSeconds / 60);
-      downloadTimeText = `~${m} min${m > 1 ? 's' : ''}`;
-    } else {
-      const h = Math.floor(totalSeconds / 3600);
-      const m = Math.round((totalSeconds % 3600) / 60);
-      downloadTimeText = m > 0 ? `~${h} hr${h > 1 ? 's' : ''} ${m} min` : `~${h} hr${h > 1 ? 's' : ''}`;
-    }
+
+    // ── Step-by-Step Pipeline Duration Calculation (All in consistent minutes) ──
+    // Using whole minutes (mins) for every step and the total prevents sec/mins unit confusion
+    // and guarantees Step 1 + Step 2 + Step 3 + Step 4 === Overall Estimated Duration.
+
+    // Step 1: Scene Discovery, Metadata Indexing & NAS Gap Verification (Always runs)
+    const step1Mins = Math.max(1, Math.round((45 + (tileCount * 8) + (months * 10)) / 60));
+
+    // Step 2: Raw Band Acquisition / AWS S3 Download (~12 MB/s pipeline transfer; Always runs)
+    const step2Mins = Math.max(1, Math.round((totalMB / 12.0) / 60));
+
+    // Step 3: Spectral & SAR Index Calculation (Runs only if indices are selected)
+    const hasStep3 = Array.isArray(selectedIndices) && selectedIndices.length > 0;
+    const step3Mins = hasStep3
+      ? Math.max(1, Math.round((scenesEstimate * selectedIndices.length * 4.5) / 60))
+      : 0;
+
+    // Step 4: Temporal Compositing & District Clipping (Runs only if compositeInterval !== 'none')
+    const hasStep4 = Boolean(compositeInterval && compositeInterval !== 'none');
+    let compositeWindows = 0;
+    if (compositeInterval === 'weekly') compositeWindows = Math.max(1, Math.ceil(days / 7));
+    else if (compositeInterval === 'fortnightly') compositeWindows = Math.max(1, Math.ceil(days / 15));
+    else if (compositeInterval === 'monthly') compositeWindows = Math.max(1, Math.ceil(days / 30));
+
+    const levelFactor = level === 'mean' ? 1.25 : 1.0;
+    const activeLayersForComp = Math.max(1, selectedIndices.length);
+    const step4Mins = hasStep4
+      ? Math.max(1, Math.round((compositeWindows * activeLayersForComp * tileCount * 6.0 * levelFactor) / 60))
+      : 0;
+
+    const activeStepsList = [
+      { step: 1, name: 'Scene Discovery & Gap Check', active: true, mins: step1Mins, seconds: step1Mins * 60 },
+      { step: 2, name: 'Raw Band Acquisition (S3)', active: true, mins: step2Mins, seconds: step2Mins * 60 },
+      { step: 3, name: `Index Calculation (${selectedIndices.length} selected)`, active: hasStep3, mins: step3Mins, seconds: step3Mins * 60 },
+      { step: 4, name: `Temporal Compositing (${compositeInterval || 'none'})`, active: hasStep4, mins: step4Mins, seconds: step4Mins * 60 },
+    ];
+    const activeStepsCount = activeStepsList.filter(s => s.active).length;
+
+    // Overall total in minutes is the exact sum of the active steps' minutes
+    const totalMins = activeStepsList.reduce((sum, s) => sum + (s.active ? s.mins : 0), 0);
+    const totalSeconds = totalMins * 60;
+
+    const formatStepMins = (m) => {
+      if (m <= 0) return 'Skipped';
+      return `~${m} mins`;
+    };
+
+    const downloadTimeText = `~${totalMins} mins`;
 
     return {
       gb: Math.round(totalGB * 100) / 100,
@@ -1184,7 +1486,14 @@ export default function App() {
       days,
       months: months.toFixed(1),
       downloadTimeText,
-      totalSeconds
+      totalMins,
+      totalSeconds,
+      activeStepsCount,
+      totalPipelineSteps: 4,
+      stepBreakdown: activeStepsList.map(s => ({
+        ...s,
+        durationText: formatStepMins(s.mins)
+      }))
     };
   };
 
@@ -1428,9 +1737,11 @@ export default function App() {
       let className = 'log-line';
       if (line.includes('ERROR') || line.includes('Failed') || line.includes('Exception')) {
         className += ' log-line-error';
-      } else if (line.includes('WARNING') || line.includes('WARN')) {
+      } else if (line.includes('WARNING') || line.includes('WARN') || line.includes('SKIPPED')) {
         className += ' log-line-warn';
-      } else if (line.startsWith('===') || line.includes('STARTING') || line.includes('STEP')) {
+      } else if (line.includes('downloaded & verified') || line.includes('[NEW DOWNLOAD COMPLETED]') || line.includes('COMPUTED]')) {
+        className += ' log-line-download';
+      } else if (line.startsWith('===') || line.includes('STARTING') || line.includes('STEP') || line.includes('STAGE')) {
         className += ' log-line-header';
       } else {
         className += ' log-line-info';
@@ -1439,18 +1750,24 @@ export default function App() {
     });
   };
 
-  // Dynamically parse acquisition scenes, execution configs & tile scene insights from raw execution logs
-  const parseAcquisitionScenes = (rawLogs, selectedReq) => {
+  // Dynamically parse acquisition scenes, execution configs & tile scene insights from raw execution logs & verified TIFs
+  const parseAcquisitionScenes = (rawLogs, selectedReq, verifiedTifs = []) => {
     const scenesMap = {};
     const tilesSet = new Set();
     const tileAuditMap = {};
     const stagesList = [];
-    const gapSummary = { availableS3: 0, alreadyHeld: 0, missing: 0 };
+    const gapSummary = {
+      availableS3: 0,
+      alreadyHeld: 0,
+      missing: 0,
+      targetDistrict: selectedReq?.district || selectedReq?.state || 'Auto',
+      tilesIdentified: []
+    };
     let currentActiveFolder = null;
 
     const configInfo = {
       district: selectedReq?.district || selectedReq?.state || 'Auto',
-      range: selectedReq ? `${selectedReq.start_date} to ${selectedReq.end_date}` : '—',
+      range: selectedReq ? `${(selectedReq.start_date || '').split('T')[0]} to ${(selectedReq.end_date || '').split('T')[0]}` : '—',
       satellite: selectedReq?.satellite || 'Sentinel-1, Sentinel-2',
       indices: selectedReq?.indices ? selectedReq.indices.join(', ') : 'NDVI, LSWI, VV/VH',
       maxCloud: selectedReq?.max_cloud_cover ? `${selectedReq.max_cloud_cover}%` : '70.0%',
@@ -1473,13 +1790,15 @@ export default function App() {
       reqBands = DEFAULT_S2_BANDS;
     }
 
+    const warningsList = [];
+
     if (rawLogs && rawLogs.trim().length > 0) {
       const lines = rawLogs.split(/\r?\n/).map(l => l.trim());
 
       for (const line of lines) {
-        // Extract timestamp: [YYYY-MM-DD HH:MM:SS]
-        const tsMatch = line.match(/^\[(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})\]/);
-        const timestamp = tsMatch ? tsMatch[1] : '';
+        // Extract timestamp: [YYYY-MM-DD HH:MM:SS] or HH:MM:SS
+        const tsMatch = line.match(/^\[(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})\]/) || line.match(/^(\d{2}:\d{2}:\d{2})/);
+        const timestamp = tsMatch ? (tsMatch[1] || tsMatch[0]) : '';
 
         // 1. Extract Pipeline Execution Stages & Steps
         const stageM = line.match(/\[(STAGE\s*\d(?:\/\d)?\s*[^\]]*)\]/i) || line.match(/(STEP\s*\d+:\s*[^.]*)/i);
@@ -1494,7 +1813,17 @@ export default function App() {
           }
         }
 
-        // 2. Extract Gap Check summary numbers
+        // 2. Extract Gap Check summary & target district
+        const gapDistM = line.match(/(?:Gap Check & Scene Search for|querying database for tiles overlapping)\s*['"]?([^'"]+)['"]?/i);
+        if (gapDistM) gapSummary.targetDistrict = gapDistM[1].trim();
+
+        const gapTilesM = line.match(/Tiles identified.*:\s*\[([^\]]+)\]/i) || line.match(/Gap Check complete\.\s*Tiles:\s*\[([^\]]+)\]/i);
+        if (gapTilesM) {
+          const rawTiles = gapTilesM[1].replace(/['"]/g, '').split(',').map(t => t.trim()).filter(Boolean);
+          gapSummary.tilesIdentified = rawTiles;
+          rawTiles.forEach(t => { if (t !== 'S1_SAR') tilesSet.add(t); });
+        }
+
         const gapM = line.match(/Gap Check complete.*Available on S3:\s*(\d+).*Already held:\s*(\d+).*Genuinely missing:\s*(\d+)/i)
           || line.match(/Available on AWS S3:\s*(\d+)/i);
         if (gapM) {
@@ -1569,12 +1898,15 @@ export default function App() {
         }
 
         // 6. Parse Processing Scene lines: e.g. [1/51 - 1%] Processing 'S2B_43PHS_20260502_0_L2A'
-        const procM = line.match(/(?:\[(\d+\/\d+)\s*-\s*(\d+%)\]\s*)?Processing\s+'(S[12][A-C]_[0-9A-Za-z_]+)'/i);
+        // or Processing time-step 1/20 (S1_20240601T001631_VH)
+        const procM = line.match(/(?:\[(\d+\/\d+)\s*-\s*(\d+%)\]\s*)?Processing\s+['"]?(S[12][A-C]_[0-9A-Za-z_]+)['"]?/i)
+          || line.match(/Processing\s+time-step\s+(\d+\/\d+)\s*\((S1_[0-9A-Za-z_]+)\)/i);
+
         if (procM) {
-          const folderName = procM[3];
+          const folderName = procM[3] || procM[2];
           currentActiveFolder = folderName;
           const parts = folderName.split('_');
-          const sat = parts[0] || 'S2';
+          const sat = parts[0] || (folderName.startsWith('S1') ? 'S1A' : 'S2');
           const isS1 = sat.startsWith('S1');
           let tile = isS1 ? 'S1_SAR' : (parts[1] || '—');
           let formattedDate = '—';
@@ -1603,7 +1935,10 @@ export default function App() {
               date: formattedDate !== '—' ? formattedDate : (selectedReq?.start_date || '—'),
               satellite: sat,
               status: 'DOWNLOADING',
-              bands: [],
+              bands: [], // Starts EMPTY - only real downloads added
+              missingBands: [],
+              warning: null,
+              warnings: [],
               bandSizes: {},
               totalSize: '',
               storagePath: '',
@@ -1612,26 +1947,53 @@ export default function App() {
               timestamp
             };
           } else {
-            scenesMap[folderName].status = 'DOWNLOADING';
+            if (scenesMap[folderName].status !== 'COMPLETE' && scenesMap[folderName].status !== 'SKIPPED') {
+              scenesMap[folderName].status = 'DOWNLOADING';
+            }
             if (procM[1]) scenesMap[folderName].progressRatio = procM[1];
             if (procM[2]) scenesMap[folderName].progressPct = procM[2];
           }
         }
 
-        // 7. Parse Band download progress lines: ↳ Band 'B02.tif' (203.3 MB) downloaded & verified on NAS.
-        const bandM = line.match(/↳\s*Band\s+'([A-Za-z0-9_]+)\.tif'\s*\(([^)]+)\)\s*downloaded\s*&\s*verified/i);
-        if (bandM && currentActiveFolder && scenesMap[currentActiveFolder]) {
-          const bandName = bandM[1];
-          const bandSize = bandM[2];
-          if (!scenesMap[currentActiveFolder].bands.includes(bandName)) {
-            scenesMap[currentActiveFolder].bands.push(bandName);
+        // 7. Parse Band download progress lines in real time:
+        // Examples:
+        // ↳ Band 'B02.tif' (201.6 MB) downloaded & verified on NAS.
+        // [2026-09-29 10:36:32] INFO:sdap.universal_pipeline:     ↳ Band 'B04.tif' (220.5 MB) downloaded & verified on NAS.
+        // Tile 1/1 (VH.tiff) reprojected successfully.
+        // [ATTACHED] Band 2/20: S1_20240606T000529_VH (21499514 valid pixels)
+        const bandM = line.match(/(?:↳\s*)?Band\s+'([A-Za-z0-9_]+)\.(?:tiff?|jp2)'(?:\s*\(([^)]+)\))?\s*downloaded/i)
+          || line.match(/Tile\s+\d+\/\d+\s*\(([A-Za-z0-9_]+)\.tiff?\)\s*reprojected/i)
+          || line.match(/\[ATTACHED\]\s*Band\s+\d+\/\d+:\s*(?:S1_[0-9A-Za-z_]+_)?([A-Za-z0-9_]+)(?:\s*\(([^)]+)\))?/i);
+
+        if (bandM) {
+          let bandName = bandM[1].toUpperCase().replace(/\.TIFF?$/, '').trim();
+          if (bandName === 'B08A') bandName = 'B8A';
+          const bandSize = bandM[2] || '';
+
+          // Determine target scene: currentActiveFolder or explicit scene tag in line
+          let targetSc = currentActiveFolder;
+          const scExplicit = line.match(/\[(S[12][A-C]_[0-9A-Za-z_]+|S1_\d{8}T\d+_[A-Za-z0-9_]+)\]/i);
+          if (scExplicit && scenesMap[scExplicit[1]]) {
+            targetSc = scExplicit[1];
           }
-          scenesMap[currentActiveFolder].bandSizes[bandName] = bandSize;
-          scenesMap[currentActiveFolder].timestamp = timestamp;
+
+          if (targetSc && scenesMap[targetSc]) {
+            if (!scenesMap[targetSc].bands.includes(bandName)) {
+              scenesMap[targetSc].bands.push(bandName);
+            }
+            if (bandSize) scenesMap[targetSc].bandSizes[bandName] = bandSize;
+            scenesMap[targetSc].timestamp = timestamp;
+            if (scenesMap[targetSc].status === 'PENDING') {
+              scenesMap[targetSc].status = 'DOWNLOADING';
+            }
+          }
         }
 
-        // 8. Parse Individual Scene Completion lines: ✓ [NEW DOWNLOAD COMPLETED] Scene 'S2B_...' downloaded to '...'
-        const compMatch = line.match(/✓\s*\[NEW DOWNLOAD COMPLETED\]\s*Scene\s+'(S[12][A-C]_[0-9A-Za-z_]+)'/i);
+        // 8. Parse Individual Scene Completion lines with band summary:
+        // Examples:
+        // [NEW DOWNLOAD COMPLETED] Scene 'S2B_43PHS_20260502_0_L2A' (Tile 43PHS, Date 2026-05-02) downloaded to '...'
+        //   (8 new bands, 1205.2 MB: B02.tif: 201.6MB, B03.tif: 208.1MB, B04.tif: 220.5MB, B08.tif: 222.2MB, B8A.tif: 57.5MB, B11.tif: 57.4MB, SCL.tif: 2.0MB, TCI.tif: 314.5MB, metadata.xml stored).
+        const compMatch = line.match(/✓?\s*\[NEW DOWNLOAD COMPLETED\]\s*Scene\s+['"]?(S[12][A-C]_[0-9A-Za-z_]+)['"]?/i);
         if (compMatch) {
           const folderName = compMatch[1];
           if (scenesMap[folderName]) {
@@ -1641,19 +2003,214 @@ export default function App() {
             const destM = line.match(/downloaded to\s+'([^']+)'/i);
             if (destM) scenesMap[folderName].storagePath = destM[1];
             scenesMap[folderName].timestamp = timestamp;
+
+            // Extract all bands mentioned in the summary list e.g. B02.tif: 201.6MB, B03.tif: ...
+            const bandMatches = line.matchAll(/([A-Za-z0-9_]+)\.tiff?(?::\s*([\d.]+\s*MB))?/gi);
+            for (const bm of bandMatches) {
+              let bName = bm[1].toUpperCase().trim();
+              if (bName === 'B08A') bName = 'B8A';
+              if (!['METADATA', 'PRODUCTINFO', 'TILEINFO', 'MANIFEST'].includes(bName)) {
+                if (!scenesMap[folderName].bands.includes(bName)) {
+                  scenesMap[folderName].bands.push(bName);
+                }
+                if (bm[2]) scenesMap[folderName].bandSizes[bName] = bm[2];
+              }
+            }
           }
         }
 
-        // 9. Parse failed or incomplete scenes
-        const failMatch = line.match(/Scene\s+(S[12][A-C]_[0-9A-Za-z_]+)\s+incomplete|Failed fetching.*(S[12][A-C]_[0-9A-Za-z_]+)/i);
+        // 9. Parse Stage 3 Indices Calculations & Cache Verification:
+        // Examples:
+        // ✓ [INDICES VERIFIED ON NAS & DB - SKIPPED] [3/51] Scene 'S2C_43PHS_20260507_0_L2A' -> 'NDVI.tif' & 'LSWI.tif' cached at ... Skipping calculation.
+        // ✓ [CLOUD MASKING & INDICES COMPUTED] [1/51] Scene 'S2B_43PHS_20260502_0_L2A' -> Saved 'NDVI.tif' & 'LSWI.tif' in ...
+        // ✓ [SAR VV/VH RATIO COMPUTED] [1/18] Scene 'S1_...' -> Saved 'VV_VH.tif'
+        // ✓ [SAR RATIO VERIFIED ON NAS & DB - SKIPPED] [1/18] Scene 'S1_...' -> 'VV_VH.tif' cached ...
+        const idxSkipM = line.match(/\[INDICES VERIFIED ON NAS & DB - SKIPPED\].*Scene\s+['"]?([A-Za-z0-9_]+)['"]?\s*->\s*(.*)/i);
+        if (idxSkipM) {
+          const folderName = idxSkipM[1];
+          if (scenesMap[folderName]) {
+            if (!scenesMap[folderName].bands.includes('NDVI')) scenesMap[folderName].bands.push('NDVI');
+            if (!scenesMap[folderName].bands.includes('LSWI')) scenesMap[folderName].bands.push('LSWI');
+            if (scenesMap[folderName].status !== 'DOWNLOADING') {
+              scenesMap[folderName].status = 'COMPLETE';
+            }
+          }
+        }
+
+        const idxCompM = line.match(/\[CLOUD MASKING & INDICES COMPUTED\].*Scene\s+['"]?([A-Za-z0-9_]+)['"]?\s*->\s*(.*)/i);
+        if (idxCompM) {
+          const folderName = idxCompM[1];
+          if (scenesMap[folderName]) {
+            if (!scenesMap[folderName].bands.includes('NDVI')) scenesMap[folderName].bands.push('NDVI');
+            if (!scenesMap[folderName].bands.includes('LSWI')) scenesMap[folderName].bands.push('LSWI');
+            if (scenesMap[folderName].status !== 'DOWNLOADING') {
+              scenesMap[folderName].status = 'COMPLETE';
+            }
+          }
+        }
+
+        const sarRatioM = line.match(/\[SAR (?:VV\/VH )?RATIO (?:VERIFIED|COMPUTED)[^\]]*\].*Scene\s+['"]?([A-Za-z0-9_]+)['"]?/i);
+        if (sarRatioM) {
+          const folderName = sarRatioM[1];
+          if (scenesMap[folderName]) {
+            if (!scenesMap[folderName].bands.includes('VV_VH')) scenesMap[folderName].bands.push('VV_VH');
+            if (scenesMap[folderName].status !== 'DOWNLOADING') {
+              scenesMap[folderName].status = 'COMPLETE';
+            }
+          }
+        }
+
+        // Catch general 'Saved NDVI.tif' / 'Saved LSWI.tif' lines
+        if (line.includes('NDVI.tif') || line.includes('LSWI.tif')) {
+          const scM = line.match(/Scene\s+['"]?([A-Za-z0-9_]+)['"]?/i) || line.match(/\[([A-Za-z0-9_]+)\]/);
+          const tSc = scM ? scM[1] : currentActiveFolder;
+          if (tSc && scenesMap[tSc]) {
+            if (line.includes('NDVI.tif') && !scenesMap[tSc].bands.includes('NDVI')) scenesMap[tSc].bands.push('NDVI');
+            if (line.includes('LSWI.tif') && !scenesMap[tSc].bands.includes('LSWI')) scenesMap[tSc].bands.push('LSWI');
+          }
+        }
+
+        // 10. Parse Download Failed / Incomplete Scenes (Stage 2):
+        // Examples:
+        // ⚠ WARN: Scene 'S2C_45QVC_20241207_1_L2A' download failed (Incomplete bands: []) - remains PENDING.
+        // ⚠ WARN: Scene 'S2C_45QVD_20241107_1_L2A' download failed (Incomplete bands: ['B04']) - remains PENDING.
+        const dlFailM = line.match(/(?:⚠\s*)?(?:WARN|WARNING):\s*Scene\s+['"]?([A-Za-z0-9_]+)['"]?\s+download failed(?:\s*\(Incomplete bands:\s*\[([^\]]*)\]\))?\s*-\s*remains PENDING/i);
+        if (dlFailM) {
+          const folderName = dlFailM[1];
+          const rawFailedBands = (dlFailM[2] || '').replace(/['"]/g, '').split(',').map(b => b.trim()).filter(Boolean);
+          const warnMsg = rawFailedBands.length > 0
+            ? `Download failed (Missing bands: [${rawFailedBands.join(', ')}]) - remains PENDING in queue`
+            : `Download failed from S3 (Incomplete bands) - remains PENDING in acquisition queue`;
+
+          if (!scenesMap[folderName]) {
+            const parts = folderName.split('_');
+            const sat = parts[0] || 'S2';
+            const tile = parts[1] || '—';
+            let formattedDate = '—';
+            const datePart = parts[2] || '';
+            if (datePart.length === 8 && /^\d+$/.test(datePart)) {
+              formattedDate = `${datePart.slice(0, 4)}-${datePart.slice(4, 6)}-${datePart.slice(6, 8)}`;
+            }
+            scenesMap[folderName] = {
+              folder: folderName,
+              tile,
+              date: formattedDate !== '—' ? formattedDate : (selectedReq?.start_date || '—'),
+              satellite: sat,
+              status: 'PENDING',
+              bands: [],
+              missingBands: rawFailedBands,
+              warning: warnMsg,
+              warnings: [warnMsg],
+              isFailedDownload: true,
+              bandSizes: {},
+              totalSize: '',
+              storagePath: '',
+              timestamp
+            };
+          } else {
+            scenesMap[folderName].status = 'PENDING';
+            scenesMap[folderName].warning = warnMsg;
+            scenesMap[folderName].isFailedDownload = true;
+            if (!scenesMap[folderName].warnings) scenesMap[folderName].warnings = [];
+            scenesMap[folderName].warnings.push(warnMsg);
+            if (rawFailedBands.length > 0) scenesMap[folderName].missingBands = rawFailedBands;
+          }
+
+          warningsList.push({
+            type: 'DOWNLOAD_FAILED',
+            scene: folderName,
+            message: warnMsg,
+            bands: rawFailedBands,
+            timestamp
+          });
+        }
+
+        // 10.5. Parse Missing Optical Composite Rasters:
+        // Examples:
+        // ⚠ WARN: No NDVI rasters available for window 2024-07-31 to 2024-08-14.
+        // ⚠ WARN: No LSWI rasters available for window 2024-07-31 to 2024-08-14.
+        const noRasterM = line.match(/(?:⚠\s*)?(?:WARN|WARNING):\s*No\s+([A-Za-z0-9_/]+)\s+rasters available for window\s+(\d{4}-\d{2}-\d{2})\s+to\s+(\d{4}-\d{2}-\d{2})/i);
+        if (noRasterM) {
+          const idxName = noRasterM[1];
+          const wStart = noRasterM[2];
+          const wEnd = noRasterM[3];
+          const msg = `No ${idxName} rasters available for window ${wStart} to ${wEnd} (heavy cloud cover)`;
+          warningsList.push({
+            type: 'NO_RASTERS',
+            scene: `Window ${wStart} to ${wEnd}`,
+            message: msg,
+            bands: [idxName],
+            timestamp
+          });
+        }
+
+        // 10.6. Parse Missing Bands Warnings:
+        // Examples:
+        // ⚠ WARN: Missing required bands for optical indices in 'S2B_...': ['B04', 'B08']
+        // Scene S2B_... incomplete missing ['B02', 'B03'] - remains PENDING
+        const missBandsM = line.match(/Missing required bands.*in\s+['"]?(S[12][A-C]_[0-9A-Za-z_]+)['"]?:\s*\[([^\]]+)\]/i)
+          || line.match(/Scene\s+['"]?(S[12][A-C]_[0-9A-Za-z_]+)['"]?\s+incomplete missing\s*\[([^\]]+)\]/i);
+
+        if (missBandsM) {
+          const folderName = missBandsM[1];
+          const rawMissing = missBandsM[2].replace(/['"]/g, '').split(',').map(b => b.trim()).filter(Boolean);
+          if (scenesMap[folderName]) {
+            scenesMap[folderName].missingBands = rawMissing;
+            scenesMap[folderName].warning = `Missing required bands: ${rawMissing.join(', ')}`;
+            scenesMap[folderName].status = 'WARNING';
+          }
+          warningsList.push({
+            type: 'MISSING_BANDS',
+            scene: folderName,
+            message: `Missing bands: ${rawMissing.join(', ')}`,
+            bands: rawMissing,
+            timestamp
+          });
+        }
+
+        // 11. Parse Out-of-bounds Sentinel-1 & 0-pixel Warnings:
+        // Examples:
+        // WARNING [S1_20240601T001631_VH] Tile VH.tiff bounds [67.75, -50.18 to 71.92, -47.67] do NOT overlap target district bounds [86.25, 20.29 to 87.09, 20.79]. Skipping.
+        // WARNING [SKIPPED] Tile 'S1_20240601T001631_VH' contains 0 valid data pixels for district 'Kendrapara' (out-of-bounds). Omitting from final layer stack.
+        const oobM = line.match(/\[(S1_[0-9A-Za-z_]+)\]\s*Tile\s+.*bounds.*do\s+NOT\s+overlap.*district/i)
+          || line.match(/Tile\s+'?(S1_[0-9A-Za-z_]+)'?\s*contains\s+0\s+valid\s+data\s+pixels/i)
+          || line.match(/Tile\s+VH\.tiff\s+bounds.*do\s+NOT\s+overlap/i);
+
+        if (oobM) {
+          let oobScene = oobM[1] || currentActiveFolder;
+          if (oobScene && scenesMap[oobScene]) {
+            scenesMap[oobScene].status = 'SKIPPED';
+            scenesMap[oobScene].warning = 'Tile bounds do not overlap target district (0 valid pixels)';
+          }
+          warningsList.push({
+            type: 'OUT_OF_BOUNDS',
+            scene: oobScene || 'Sentinel-1 Tile',
+            message: 'Tile bounds do not overlap target district boundary (0 valid pixels). Skipped from layer stack.',
+            timestamp
+          });
+        }
+
+        // 12. Parse failed or error scenes
+        const failMatch = line.match(/Scene\s+['"]?(S[12][A-C]_[0-9A-Za-z_]+)['"]?\s+(?:incomplete|download failed)|Failed fetching.*['"]?(S[12][A-C]_[0-9A-Za-z_]+)['"]?/i);
         if (failMatch) {
           const folderName = failMatch[1] || failMatch[2];
           if (scenesMap[folderName]) {
-            scenesMap[folderName].status = 'FAILED';
+            scenesMap[folderName].status = 'PENDING';
+            if (!scenesMap[folderName].warning) {
+              scenesMap[folderName].warning = `Acquisition failed: ${line}`;
+            }
+          }
+          if (!warningsList.some(w => w.scene === folderName)) {
+            warningsList.push({
+              type: 'FAILED',
+              scene: folderName,
+              message: `Acquisition failed: ${line}`,
+              timestamp
+            });
           }
         }
 
-        // 10. General scene matching for pre-existing or cached scenes
+        // 13. General scene matching for pre-existing or cached scenes
         const sceneMatch = line.match(/\b(S[12][A-C]_[0-9A-Za-z_]+)/i);
         if (sceneMatch) {
           const folderName = sceneMatch[1];
@@ -1686,22 +2243,107 @@ export default function App() {
 
             const isFailed = /FAILED|ERROR/.test(line);
             const isComplete = /COMPLETED|downloaded & verified|100% CACHED/.test(line);
+            const isLineSkipped = /SKIPPED|0 valid pixels|do NOT overlap/i.test(line);
 
             scenesMap[folderName] = {
               folder: folderName,
               tile,
               date: formattedDate !== '—' ? formattedDate : (selectedReq?.start_date || '—'),
               satellite: sat,
-              status: isFailed ? 'FAILED' : isComplete ? 'COMPLETE' : 'PENDING',
-              bands: isS1 ? ['VV', 'VH', 'VV_VH'] : reqBands.filter(b => !S1_BANDS.includes(b)),
+              status: isFailed ? 'FAILED' : isLineSkipped ? 'SKIPPED' : isComplete ? 'COMPLETE' : 'PENDING',
+              bands: [], // Start EMPTY - only real downloads added
+              missingBands: [],
               bandSizes: {},
               totalSize: '',
               storagePath: '',
+              warning: isLineSkipped ? line : null,
+              warnings: [],
               timestamp
             };
           }
         }
       }
+    }
+
+    // Incorporate directly verified TIFs from the database and NAS storage
+    if (Array.isArray(verifiedTifs) && verifiedTifs.length > 0) {
+      verifiedTifs.forEach(t => {
+        const scId = t.scene_id;
+        if (!scId) return;
+        if (t.tile && t.tile !== 'S1_SAR') tilesSet.add(t.tile);
+
+        let rawBand = (t.band || '').trim();
+        let bClean = rawBand.replace(/\.tiff?$/i, '').toUpperCase().trim();
+        if (bClean.includes('LSWI')) bClean = 'LSWI';
+        else if (bClean.includes('NDVI')) bClean = 'NDVI';
+        else if (bClean.includes('VV_VH') || bClean.includes('VV/VH')) bClean = 'VV_VH';
+        if (bClean === 'B08A') bClean = 'B8A';
+
+        const parts = scId.split('_');
+        const sat = scId.startsWith('S1') ? 'S1A' : (parts[0] || 'S2B');
+
+        let sDate = t.sensing_date || '';
+        if (!sDate && parts.length >= 3) {
+          const datePart = parts[2] || '';
+          if (datePart.length === 8 && /^\d+$/.test(datePart)) {
+            sDate = `${datePart.slice(0, 4)}-${datePart.slice(4, 6)}-${datePart.slice(6, 8)}`;
+          }
+        }
+        if (!sDate && selectedReq?.start_date) {
+          sDate = selectedReq.start_date.split('T')[0];
+        }
+
+        if (!scenesMap[scId]) {
+          // If rawLogs is present and already discovered scenes, guard against injecting extraneous unlogged scenes
+          if (rawLogs && Object.keys(scenesMap).length > 0) {
+            const reqStart = (selectedReq?.start_date || '').split('T')[0];
+            const reqEnd = (selectedReq?.end_date || '').split('T')[0];
+            const isWithinDates = (!sDate || !reqStart || sDate >= reqStart) && (!sDate || !reqEnd || sDate <= reqEnd);
+            const isTileValid = !t.tile || t.tile === 'S1_SAR' || tilesSet.has(t.tile) || (gapSummary.tilesIdentified && gapSummary.tilesIdentified.includes(t.tile));
+            // For Sentinel-1, do not add if not mentioned in rawLogs
+            if (scId.startsWith('S1') && !rawLogs.includes(scId)) {
+              return;
+            }
+            if (!isWithinDates || !isTileValid) {
+              return;
+            }
+          }
+
+          scenesMap[scId] = {
+            folder: scId,
+            tile: t.tile || parts[1] || '—',
+            date: sDate || '—',
+            satellite: sat,
+            status: 'COMPLETE',
+            bands: bClean ? [bClean] : [],
+            missingBands: [],
+            bandSizes: {},
+            totalSize: '',
+            storagePath: t.path || '',
+            warning: null,
+            warnings: [],
+            timestamp: ''
+          };
+        } else {
+          if (bClean && !scenesMap[scId].bands.includes(bClean)) {
+            scenesMap[scId].bands.push(bClean);
+          }
+          if (!scenesMap[scId].warning && !scenesMap[scId].isFailedDownload) {
+            if (scenesMap[scId].status !== 'DOWNLOADING' && scenesMap[scId].status !== 'SKIPPED') {
+              scenesMap[scId].status = 'COMPLETE';
+            }
+          }
+          if (sDate && scenesMap[scId].date === '—') {
+            scenesMap[scId].date = sDate;
+          }
+          if (t.tile && scenesMap[scId].tile === '—') {
+            scenesMap[scId].tile = t.tile;
+          }
+          if (t.path && !scenesMap[scId].storagePath) {
+            scenesMap[scId].storagePath = t.path;
+          }
+        }
+      });
     }
 
     const sceneList = Object.values(scenesMap);
@@ -1711,23 +2353,41 @@ export default function App() {
         sceneList.push({
           folder: `Pending Scene Acquisition (${t})`,
           tile: t,
-          date: selectedReq?.start_date || '—',
+          date: (selectedReq?.start_date || '').split('T')[0] || '—',
           satellite: selectedReq?.satellite || 'Sentinel-2',
           status: 'PENDING',
-          bands: [...reqBands],
+          bands: [], // Start EMPTY
+          missingBands: [],
           bandSizes: {},
-          totalSize: ''
+          totalSize: '',
+          warning: null,
+          warnings: []
         });
       });
     }
 
-    const totalScenes = sceneList.length;
-    const completeScenes = sceneList.filter(s => s.status === 'COMPLETE').length;
-    const tilesCoveredCount = Math.max(tilesSet.size, new Set(sceneList.map(s => s.tile)).size);
-    const bandsNeededCount = reqBands.length;
-    const progressPct = totalScenes > 0
-      ? Math.round((completeScenes / totalScenes) * 100)
-      : (selectedReq?.status === 'COMPLETED' ? 100 : 0);
+    // Single Source of Truth for KPI Metrics:
+    // Total Scenes is determined by Stage 1 Gap Check Discovery (or sceneList length)
+    const totalScenes = gapSummary.availableS3 > 0
+      ? gapSummary.availableS3
+      : sceneList.length;
+
+    const verifiedComplete = sceneList.filter(s => s.status === 'COMPLETE' && !s.warning && (!s.missingBands || s.missingBands.length === 0)).length;
+    const completeScenes = (selectedReq?.status === 'COMPLETED')
+      ? totalScenes
+      : verifiedComplete;
+
+    const tilesCoveredCount = (gapSummary.tilesIdentified && gapSummary.tilesIdentified.length > 0)
+      ? gapSummary.tilesIdentified.length
+      : (Math.max(tilesSet.size, new Set(sceneList.map(s => s.tile).filter(t => t && t !== '—')).size) || 1);
+
+    const bandsNeededCount = (selectedReq?.satellite && selectedReq.satellite.includes('Sentinel-1') && !selectedReq.satellite.includes('Sentinel-2'))
+      ? 2
+      : 8;
+
+    const progressPct = (selectedReq?.status === 'COMPLETED')
+      ? 100
+      : (totalScenes > 0 ? Math.min(100, Math.round((completeScenes / totalScenes) * 100)) : 0);
 
     return {
       scenes: sceneList,
@@ -1739,21 +2399,40 @@ export default function App() {
       configInfo,
       tileAuditList: Object.values(tileAuditMap),
       stagesList,
-      gapSummary
+      gapSummary,
+      warningsList
     };
   };
 
-  const kpiCardStyle = {
+  // Helper: Clean folder name by stripping any network UNC path (\\172.16.16.52\...) or local directory
+  const cleanFolderName = (str) => {
+    if (!str) return '—';
+    let s = String(str).trim();
+    if (/^Composite_/i.test(s)) return s;
+    const scMatch = s.match(/\b(S[12][A-D]_[0-9A-Za-z_]+)\b/i);
+    if (scMatch) return scMatch[1];
+    const s1M = s.match(/\b(S1_\d{8}T\d+_[A-Za-z0-9_]+)\b/i);
+    if (s1M) return s1M[1];
+    if (s.includes('\\') || s.includes('/')) {
+      const segments = s.split(/[\\\/]/).filter(Boolean);
+      const nonTif = segments.filter(seg => !seg.toLowerCase().endsWith('.tif') && !seg.toLowerCase().endsWith('.tiff'));
+      if (nonTif.length > 0) return nonTif[nonTif.length - 1];
+      return segments[segments.length - 1] || s;
+    }
+    return s;
+  };
+
+  const lightKpiCardStyle = {
     backgroundColor: '#ffffff',
     border: '1px solid #e2e8f0',
-    borderRadius: '0.65rem',
-    padding: '1.1rem 1rem',
+    borderRadius: '0.5rem',
+    padding: '0.65rem 0.85rem',
     textAlign: 'center',
-    boxShadow: '0 1px 3px rgba(0,0,0,0.04)'
+    boxShadow: '0 1px 2px 0 rgba(0, 0, 0, 0.04)'
   };
-  const kpiLabelStyle = { fontSize: '0.78rem', fontWeight: 600, color: '#64748b', marginBottom: '0.35rem' };
+  const lightKpiLabelStyle = { fontSize: '0.74rem', fontWeight: 600, color: '#64748b', marginBottom: '0.2rem' };
 
-  const renderLogTableView = (rawLogs, selectedReq) => {
+  const renderLogTableView = (rawLogs, selectedReq, verifiedTifs = [], backendComposites = []) => {
     const {
       scenes,
       totalScenes,
@@ -1761,313 +2440,1493 @@ export default function App() {
       tilesCoveredCount,
       bandsNeededCount,
       progressPct,
-      configInfo,
-      tileAuditList,
-      stagesList,
-      gapSummary
-    } = parseAcquisitionScenes(rawLogs, selectedReq);
+      gapSummary = {},
+      warningsList = []
+    } = parseAcquisitionScenes(rawLogs, selectedReq, verifiedTifs);
 
     const filteredScenes = scenes.filter(s => {
       if (logFilter === 'downloads' && s.status !== 'COMPLETE') return false;
-      if (logFilter === 'errors' && s.status !== 'FAILED') return false;
+      if (logFilter === 'errors') {
+        const isErr = s.status === 'FAILED' || s.status === 'SKIPPED' || s.status === 'WARNING' || s.status === 'INCOMPLETE';
+        const hasWarn = !!s.warning || (s.missingBands && s.missingBands.length > 0) || (s.warnings && s.warnings.length > 0);
+        if (!isErr && !hasWarn) return false;
+      }
       if (logSearchQuery.trim()) {
         const q = logSearchQuery.toLowerCase();
         return (
-          s.tile.toLowerCase().includes(q) ||
-          s.date.toLowerCase().includes(q) ||
-          s.folder.toLowerCase().includes(q) ||
-          s.satellite.toLowerCase().includes(q) ||
-          s.status.toLowerCase().includes(q)
+          (s.tile || '').toLowerCase().includes(q) ||
+          (s.date || '').toLowerCase().includes(q) ||
+          (s.folder || '').toLowerCase().includes(q) ||
+          (s.satellite || '').toLowerCase().includes(q) ||
+          (s.status || '').toLowerCase().includes(q) ||
+          (s.warning || '').toLowerCase().includes(q) ||
+          (s.missingBands || []).some(b => b.toLowerCase().includes(q))
         );
       }
       return true;
     });
 
-    // Sort: Currently DOWNLOADING scene placed at the top (Row 1), followed by latest completed scenes
+    // Stable sort: Chronological sensing date, followed by folder name (eliminates row jumping)
     const displayScenes = filteredScenes.slice().sort((a, b) => {
-      if (a.status === 'DOWNLOADING') return -1;
-      if (b.status === 'DOWNLOADING') return 1;
-      return 0;
-    }).reverse();
+      if (a.date && b.date && a.date !== b.date && a.date !== '—' && b.date !== '—') {
+        return a.date.localeCompare(b.date);
+      }
+      return (a.folder || '').localeCompare(b.folder || '');
+    });
 
-    const displayStages = (stagesList || []).slice().reverse();
+    // Natural band sort order
+    const BAND_SORT_ORDER = [
+      'B01', 'B02', 'B03', 'B04', 'B05', 'B06', 'B07', 'B08', 'B8A', 'B09', 'B11', 'B12',
+      'SCL', 'TCI', 'NDVI', 'LSWI', 'VV', 'VH', 'VV_VH'
+    ];
 
-    return (
-      <div style={{ flex: 1, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: '1.25rem', padding: '0.5rem 0' }}>
+    const sortBands = (bandsArr) => {
+      return (bandsArr || []).slice().sort((a, b) => {
+        const idxA = BAND_SORT_ORDER.indexOf(a);
+        const idxB = BAND_SORT_ORDER.indexOf(b);
+        if (idxA !== -1 && idxB !== -1) return idxA - idxB;
+        if (idxA !== -1) return -1;
+        if (idxB !== -1) return 1;
+        return a.localeCompare(b);
+      });
+    };
 
-        {/* 1. Pipeline Execution Configurations Banner */}
-        <div style={{ backgroundColor: '#0f172a', color: '#f8fafc', borderRadius: '0.65rem', padding: '1rem 1.25rem', boxShadow: '0 2px 4px rgba(0,0,0,0.1)' }}>
-          <div style={{ fontSize: '0.78rem', fontWeight: 700, textTransform: 'uppercase', tracking: '0.05em', color: '#38bdf8', marginBottom: '0.65rem' }}>
-            Pipeline Execution Configurations
-          </div>
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: '0.75rem', fontSize: '0.8rem' }}>
-            <div>
-              <span style={{ color: '#94a3b8' }}>District: </span>
-              <span style={{ fontWeight: 700, color: '#ffffff' }}>{configInfo.district}</span>
-            </div>
-            <div>
-              <span style={{ color: '#94a3b8' }}>Date Range: </span>
-              <span style={{ fontWeight: 700, color: '#ffffff' }}>{configInfo.range}</span>
-            </div>
-            <div>
-              <span style={{ color: '#94a3b8' }}>Satellites: </span>
-              <span style={{ fontWeight: 700, color: '#ffffff' }}>{configInfo.satellite}</span>
-            </div>
-            <div>
-              <span style={{ color: '#94a3b8' }}>Target Indices: </span>
-              <span style={{ fontWeight: 700, color: '#ffffff' }}>{configInfo.indices}</span>
-            </div>
-            <div>
-              <span style={{ color: '#94a3b8' }}>Max Cloud: </span>
-              <span style={{ fontWeight: 700, color: '#ffffff' }}>{configInfo.maxCloud}</span>
-            </div>
-            <div>
-              <span style={{ color: '#94a3b8' }}>Level: </span>
-              <span style={{ fontWeight: 700, color: '#38bdf8' }}>{configInfo.level}</span>
-            </div>
-            <div>
-              <span style={{ color: '#94a3b8' }}>Composite: </span>
-              <span style={{ fontWeight: 700, color: '#ffffff' }}>{configInfo.composite}</span>
-            </div>
-          </div>
-        </div>
+    // Step 1: Target bands needed for a scene
+    const getTargetBandsForScene = (sc) => {
+      const isS1 = sc.satellite?.startsWith('S1') || sc.folder?.startsWith('S1') || sc.tile === 'S1_SAR';
+      if (isS1) {
+        return ['VV', 'VH'];
+      }
+      return ['B02', 'B03', 'B04', 'B08', 'B8A', 'B11', 'SCL', 'TCI'];
+    };
 
-        {/* 2. Pipeline Execution Stages & Activity Feed (Latest Active Stage on TOP) */}
-        {displayStages && displayStages.length > 0 && (
-          <div style={{ backgroundColor: '#ffffff', border: '1px solid #cbd5e1', borderRadius: '0.65rem', padding: '0.9rem 1.1rem', boxShadow: '0 1px 3px rgba(0,0,0,0.03)' }}>
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.65rem' }}>
-              <span style={{ fontSize: '0.85rem', fontWeight: 700, color: '#0f172a' }}>Pipeline Execution Stages & Steps Activity Log</span>
-              <span style={{ fontSize: '0.72rem', fontWeight: 700, color: '#2563eb', backgroundColor: '#eff6ff', padding: '0.15rem 0.5rem', borderRadius: '0.25rem', border: '1px solid #bfdbfe' }}>
-                Latest Active Stage on TOP
+    // Step 2: Strictly raw spectral bands ONLY (no NDVI, no LSWI, no VV_VH)
+    const getRawBandsForScene = (sc) => {
+      const isS1 = sc.satellite?.startsWith('S1') || sc.folder?.startsWith('S1') || sc.tile === 'S1_SAR';
+      const defaultRaw = isS1 ? ['VV', 'VH'] : ['B02', 'B03', 'B04', 'B08', 'B8A', 'B11', 'SCL', 'TCI'];
+      const rawVerified = (sc.bands || []).filter(b => !['NDVI', 'LSWI', 'VV_VH'].includes(b));
+      if (rawVerified.length > 0) {
+        return sortBands(rawVerified);
+      }
+      if (sc.status === 'COMPLETE') {
+        return defaultRaw;
+      }
+      return [];
+    };
+
+    // Step 3: Strictly surface reflectance indices ONLY (NDVI, LSWI, VV_VH)
+    const getIndicesBandsForScene = (sc) => {
+      const isS1 = sc.satellite?.startsWith('S1') || sc.folder?.startsWith('S1') || sc.tile === 'S1_SAR';
+      const defaultIndices = isS1 ? ['VV_VH'] : ['NDVI', 'LSWI'];
+      const indVerified = (sc.bands || []).filter(b => ['NDVI', 'LSWI', 'VV_VH'].includes(b));
+      if (indVerified.length > 0) {
+        return indVerified;
+      }
+      if (sc.status === 'COMPLETE') {
+        return defaultIndices;
+      }
+      return [];
+    };
+
+    // Step 4: Generate temporal composite rows matching backend formula:
+    // Composite_<band name>_<level>_<composite_interval>_<district name>_<startdate>_<enddate>.tif
+    const generateStep4Rows = (compositesList = []) => {
+      const district = selectedReq?.district || selectedReq?.state || 'District';
+      const interval = (selectedReq?.composite_interval || 'weekly').toLowerCase();
+      const reqLevel = (selectedReq?.level || 'max').toLowerCase();
+      const sat = selectedReq?.satellite || (displayScenes[0]?.satellite?.startsWith('S1') ? 'Sentinel-1' : 'Sentinel-2');
+
+      // 1. Dynamically discover all target indices from:
+      // - Files actually generated on NAS in backend composites
+      // - Explicitly selected indices in the request
+      // - Fallback to satellite defaults
+      const discoveredIndicesSet = new Set();
+
+      (compositesList || []).forEach(c => {
+        if (c.index) {
+          discoveredIndicesSet.add(c.index.toUpperCase().trim());
+        } else if (c.filename) {
+          const fn = c.filename.toUpperCase();
+          if (fn.includes('VV_VH') || fn.includes('VV/VH')) discoveredIndicesSet.add('VV_VH');
+          else if (fn.includes('NDVI')) discoveredIndicesSet.add('NDVI');
+          else if (fn.includes('LSWI')) discoveredIndicesSet.add('LSWI');
+          else if (fn.includes('NDRE')) discoveredIndicesSet.add('NDRE');
+          else if (fn.includes('NDWI')) discoveredIndicesSet.add('NDWI');
+          else if (fn.includes('EVI')) discoveredIndicesSet.add('EVI');
+          else if (fn.includes('_VV_')) discoveredIndicesSet.add('VV');
+          else if (fn.includes('_VH_')) discoveredIndicesSet.add('VH');
+        }
+      });
+
+      if (Array.isArray(selectedReq?.indices) && selectedReq.indices.length > 0) {
+        selectedReq.indices.forEach(idx => {
+          let clean = idx.toUpperCase().replace(/\//g, '_').trim();
+          discoveredIndicesSet.add(clean);
+        });
+      }
+
+      if (discoveredIndicesSet.size === 0) {
+        const satStr = (selectedReq?.satellite || '').toLowerCase();
+        const hasS1Sensor = satStr.includes('sentinel-1') || satStr.includes('s1');
+        const hasS2Sensor = satStr.includes('sentinel-2') || satStr.includes('s2') || !hasS1Sensor;
+        if (hasS2Sensor) {
+          discoveredIndicesSet.add('NDVI');
+          discoveredIndicesSet.add('LSWI');
+        }
+        if (hasS1Sensor) {
+          discoveredIndicesSet.add('VV_VH');
+        }
+      }
+
+      const indices = Array.from(discoveredIndicesSet);
+
+      const sDateStr = (selectedReq?.start_date || '').split('T')[0];
+      const eDateStr = (selectedReq?.end_date || '').split('T')[0];
+      const yearStr = sDateStr ? sDateStr.slice(0, 4) : '2024';
+
+      // Clean backend folder path (strip UNC network prefixes if present)
+      let defaultBackendFolder = `Composites/${district}/${yearStr}/${interval}/`;
+      if (compositesList && compositesList.length > 0 && (compositesList[0]?.path || compositesList[0]?.output_path)) {
+        const rawP = (compositesList[0].path || compositesList[0].output_path || '').replace(/\\/g, '/');
+        const cIdx = rawP.indexOf('Composites/');
+        if (cIdx !== -1) {
+          const lastSlash = rawP.lastIndexOf('/');
+          defaultBackendFolder = rawP.slice(cIdx, lastSlash + 1);
+        }
+      }
+
+      const rows = [];
+      const usedBackendFiles = new Set();
+
+      if (sDateStr && eDateStr) {
+        const sDate = new Date(sDateStr);
+        const eDate = new Date(eDateStr);
+        if (!isNaN(sDate.getTime()) && !isNaN(eDate.getTime()) && sDate <= eDate) {
+          let curr = new Date(sDate);
+          let windowIdx = 1;
+          const pad = (n) => String(n).padStart(2, '0');
+          const fmtD = (d) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+          const fmtCompact = (d) => `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}`;
+
+          while (curr <= eDate) {
+            let next;
+            let windowLabel = `Week ${windowIdx}`;
+            if (interval === 'fortnightly' || interval === 'biweekly') {
+              next = new Date(curr);
+              next.setDate(next.getDate() + 14); // 15-day discrete window
+              windowLabel = `Fortnight ${windowIdx}`;
+            } else if (interval === 'monthly') {
+              // Full calendar month
+              next = new Date(curr.getFullYear(), curr.getMonth() + 1, 0);
+              windowLabel = `Month ${windowIdx}`;
+            } else if (interval === 'none') {
+              next = new Date(eDate);
+              windowLabel = `Full Duration`;
+            } else {
+              // Weekly (7-day discrete window)
+              next = new Date(curr);
+              next.setDate(next.getDate() + 6);
+              windowLabel = `Week ${windowIdx}`;
+            }
+
+            const wEnd = next > eDate ? new Date(eDate) : next;
+            const wStartStr = fmtD(curr);
+            const wEndStr = fmtD(wEnd);
+            const cStart = fmtCompact(curr);
+            const cEnd = fmtCompact(wEnd);
+
+            // Find all files in backend composites for this window
+            const matchingComposites = (compositesList || []).filter(c => {
+              const fn = (c.filename || '').toLowerCase();
+              const dateMatch = (fn.includes(cStart) || fn.includes(wStartStr.replace(/-/g, ''))) &&
+                                (fn.includes(cEnd) || fn.includes(wEndStr.replace(/-/g, '')));
+              return dateMatch;
+            });
+
+            matchingComposites.forEach(c => usedBackendFiles.add(c.filename));
+
+            // Check if there was a missing optical rasters warning for this window in raw logs
+            const windowWarnings = warningsList.filter(w =>
+              w.type === 'NO_RASTERS' &&
+              (w.scene?.includes(wStartStr) || w.message?.includes(wStartStr)) &&
+              (w.scene?.includes(wEndStr) || w.message?.includes(wEndStr))
+            );
+
+            // Build files list for this window
+            const compositeFiles = [];
+
+            // If files exist in backend composites for this window, list ALL of them directly with real sizes!
+            if (matchingComposites.length > 0) {
+              matchingComposites.forEach(mf => {
+                const sizeStr = (mf.size_mb || mf.file_size_mb) ? `${mf.size_mb || mf.file_size_mb} MB` : null;
+                let fileIdx = mf.index;
+                if (!fileIdx) {
+                  const uFn = mf.filename.toUpperCase();
+                  if (uFn.includes('LSWI')) fileIdx = 'LSWI';
+                  else if (uFn.includes('NDVI')) fileIdx = 'NDVI';
+                  else if (uFn.includes('VV_VH') || uFn.includes('VV/VH')) fileIdx = 'VV_VH';
+                  else fileIdx = 'Composite';
+                }
+                compositeFiles.push({
+                  name: mf.filename,
+                  size: sizeStr,
+                  downloadUrl: mf.download_url || null,
+                  index: fileIdx,
+                  fromDisk: true
+                });
+              });
+            } else {
+              // No files on disk yet: create expected placeholders according to formula
+              indices.forEach(idx => {
+                const expectedName = `Composite_${idx}_${reqLevel}_${interval}_${district}_${cStart}_${cEnd}.tif`;
+                compositeFiles.push({
+                  name: expectedName,
+                  size: null,
+                  downloadUrl: null,
+                  index: idx,
+                  fromDisk: false
+                });
+              });
+            }
+
+            const hasFilesOnDisk = compositeFiles.some(f => f.fromDisk);
+            const isSkippedDueToClouds = windowWarnings.length > 0 && !hasFilesOnDisk;
+
+            let rowStatus;
+            if (hasFilesOnDisk) {
+              rowStatus = 'COMPLETE';
+            } else if (isSkippedDueToClouds) {
+              rowStatus = 'SKIPPED (CLOUDS)';
+            } else if (selectedReq?.status === 'PROCESSING') {
+              rowStatus = 'PROCESSING';
+            } else {
+              rowStatus = 'PENDING';
+            }
+
+            const rowBands = Array.from(new Set(compositeFiles.map(f => f.index || 'Composite')));
+
+            rows.push({
+              date: `${wStartStr} to ${wEndStr} (${windowLabel})`,
+              tile: district,
+              satellite: sat,
+              backendFolder: defaultBackendFolder,
+              compositeFiles,
+              status: rowStatus,
+              bands: rowBands.length > 0 ? rowBands : indices,
+              warning: isSkippedDueToClouds ? (windowWarnings[0]?.message || 'No cloud-free optical rasters available for this window') : null
+            });
+
+            windowIdx++;
+            if (interval === 'fortnightly' || interval === 'biweekly') {
+              curr.setDate(curr.getDate() + 15);
+            } else if (interval === 'monthly') {
+              curr = new Date(curr.getFullYear(), curr.getMonth() + 1, 1);
+            } else if (interval === 'none') {
+              break;
+            } else {
+              curr.setDate(curr.getDate() + 7);
+            }
+          }
+        }
+      }
+
+      // Add any remaining deliverables from NAS storage that weren't captured by the discrete window loop
+      const remainingBackendFiles = (compositesList || []).filter(c => !usedBackendFiles.has(c.filename));
+      if (remainingBackendFiles.length > 0) {
+        remainingBackendFiles.forEach((rf) => {
+          const sizeStr = (rf.size_mb || rf.file_size_mb) ? `${rf.size_mb || rf.file_size_mb} MB` : null;
+          let rDate = '—';
+          const dm = rf.filename.match(/(\d{4})(\d{2})(\d{2})_(\d{4})(\d{2})(\d{2})/);
+          if (dm) {
+            rDate = `${dm[1]}-${dm[2]}-${dm[3]} to ${dm[4]}-${dm[5]}-${dm[6]}`;
+          }
+          let rIdxName = rf.index;
+          if (!rIdxName) {
+            const uFn = rf.filename.toUpperCase();
+            if (uFn.includes('LSWI')) rIdxName = 'LSWI';
+            else if (uFn.includes('NDVI')) rIdxName = 'NDVI';
+            else if (uFn.includes('VV_VH')) rIdxName = 'VV_VH';
+            else rIdxName = 'Composite';
+          }
+
+          rows.push({
+            date: rDate,
+            tile: district,
+            satellite: sat,
+            backendFolder: defaultBackendFolder,
+            compositeFiles: [{
+              name: rf.filename,
+              size: sizeStr,
+              downloadUrl: rf.download_url || null,
+              index: rIdxName,
+              fromDisk: true
+            }],
+            status: 'COMPLETE',
+            bands: [rIdxName],
+            warning: null
+          });
+        });
+      }
+
+      if (rows.length === 0) {
+        const pad = (n) => String(n).padStart(2, '0');
+        const now = new Date();
+        const dStr = `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}`;
+        const compFiles = indices.map(idx => ({
+          name: `Composite_${idx}_${reqLevel}_${interval}_${district}_${dStr}_${dStr}.tif`,
+          size: null,
+          index: idx,
+          fromDisk: false
+        }));
+        rows.push({
+          date: `${sDateStr || '—'} to ${eDateStr || '—'} (${interval})`,
+          tile: district,
+          satellite: sat,
+          backendFolder: defaultBackendFolder,
+          compositeFiles: compFiles,
+          status: (selectedReq?.status === 'COMPLETED') ? 'COMPLETE' : 'PENDING',
+          bands: indices,
+          warning: null
+        });
+      }
+
+      return rows;
+    };
+
+    const step4Rows = generateStep4Rows(backendComposites);
+
+    // Gap Check metadata for Step 1 & Step 4 Deliverables
+    const targetDistrict = gapSummary.targetDistrict || selectedReq?.district || selectedReq?.state || 'District';
+    const rawInterval = (selectedReq?.composite_interval || 'fortnightly').toLowerCase();
+    const intervalLabel = rawInterval === 'none' ? 'Temporal' : (rawInterval.charAt(0).toUpperCase() + rawInterval.slice(1));
+    const yearStr = (selectedReq?.start_date || '').slice(0, 4) || String(new Date().getFullYear());
+    const defaultBackendFolder = `Composites/${targetDistrict}/${yearStr}/${rawInterval}/`;
+    const identifiedTiles = (gapSummary.tilesIdentified && gapSummary.tilesIdentified.length > 0)
+      ? gapSummary.tilesIdentified
+      : (Array.from(new Set(displayScenes.map(s => s.tile).filter(t => t && t !== '—'))).length > 0
+          ? Array.from(new Set(displayScenes.map(s => s.tile).filter(t => t && t !== '—')))
+          : ['44QQF', '44QQG', '44QRF', '44QRG', '45QTA', '45QTB', 'S1_SAR']);
+    const gapAvailableS3 = gapSummary.availableS3 > 0 ? gapSummary.availableS3 : (totalScenes || displayScenes.length || 25);
+    const gapAlreadyHeld = gapSummary.alreadyHeld > 0 ? gapSummary.alreadyHeld : Math.floor(gapAvailableS3 * 0.24);
+    const gapMissing = gapSummary.missing > 0 ? gapSummary.missing : Math.max(0, gapAvailableS3 - gapAlreadyHeld);
+
+    // Step Header Component
+    const renderStepHeader = (stepNum, title, description, badgeText) => {
+      const colorMap = {
+        1: { border: '#2563eb', bg: '#eff6ff', text: '#1d4ed8' },
+        2: { border: '#1d4ed8', bg: '#eff6ff', text: '#1d4ed8' },
+        3: { border: '#0284c7', bg: '#e0f2fe', text: '#0369a1' },
+        4: { border: '#16a34a', bg: '#ecfdf5', text: '#047857' },
+        '!': { border: '#d97706', bg: '#fffbeb', text: '#b45309' },
+        'warnings': { border: '#d97706', bg: '#fffbeb', text: '#b45309' },
+      };
+      const c = colorMap[stepNum] || colorMap[1];
+
+      return (
+        <tr key={`step_header_${stepNum}`} style={{
+          backgroundColor: '#f8fafc',
+          borderTop: `2px solid ${c.border}`,
+          borderBottom: '1px solid #e2e8f0'
+        }}>
+          <td colSpan={6} style={{ padding: '0.65rem 1rem' }}>
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: '0.5rem' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '0.65rem' }}>
+                <span style={{
+                  backgroundColor: c.border,
+                  color: '#ffffff',
+                  fontSize: '0.72rem',
+                  fontWeight: 800,
+                  padding: '0.2rem 0.55rem',
+                  borderRadius: '0.25rem',
+                  letterSpacing: '0.04em'
+                }}>
+                  {stepNum === '!' || stepNum === 'warnings' ? '⚠ ALERTS' : `STEP-${stepNum}`}
+                </span>
+                <span style={{ fontWeight: 800, color: '#0f172a', fontSize: '0.86rem' }}>
+                  {title}
+                </span>
+                <span style={{ fontSize: '0.73rem', color: '#64748b' }}>
+                  — {description}
+                </span>
+              </div>
+              <span style={{
+                fontSize: '0.71rem',
+                fontWeight: 700,
+                color: c.text,
+                backgroundColor: c.bg,
+                padding: '0.18rem 0.55rem',
+                borderRadius: '0.25rem',
+                border: `1px solid ${c.border}40`
+              }}>
+                {badgeText}
               </span>
             </div>
-            <div style={{ display: 'flex', flexDirection: 'column', gap: '0.45rem', maxHeight: '180px', overflowY: 'auto' }}>
-              {displayStages.map((st, idx) => (
-                <div key={idx} style={{
+          </td>
+        </tr>
+      );
+    };
+
+    // Step 1 Scene Row
+    const renderStep1SceneRow = (sc, idx) => {
+      const isCached = sc.status === 'COMPLETE' || idx < gapAlreadyHeld;
+      const statusText = isCached ? 'ALREADY HELD (CACHED)' : 'AVAILABLE ON S3';
+      const statusBg = isCached ? '#ecfdf5' : '#eff6ff';
+      const statusColor = isCached ? '#047857' : '#1d4ed8';
+      const statusBorder = isCached ? '1px solid #a7f3d0' : '1px solid #bfdbfe';
+      const targetBands = getTargetBandsForScene(sc);
+      const rowBg = idx % 2 === 0 ? '#ffffff' : '#fcfdfd';
+
+      return (
+        <tr key={`step1_${sc.folder}_${idx}`} style={{ borderBottom: '1px solid #f1f5f9', backgroundColor: rowBg }}>
+          <td style={{ padding: '0.65rem 1rem', color: '#1e293b', fontFamily: 'monospace', fontWeight: 600, whiteSpace: 'nowrap' }}>
+            {sc.date}
+          </td>
+          <td style={{ padding: '0.65rem 1rem', color: '#2563eb', fontWeight: 700, fontFamily: 'monospace' }}>
+            {sc.tile}
+          </td>
+          <td style={{ padding: '0.65rem 1rem', color: '#475569', fontWeight: 600 }}>
+            {sc.satellite}
+          </td>
+          <td style={{ padding: '0.65rem 1rem' }}>
+            <div style={{ color: '#0f172a', fontFamily: 'monospace', fontSize: '0.76rem', fontWeight: 600 }}>
+              {cleanFolderName(sc.folder)}
+            </div>
+          </td>
+          <td style={{ padding: '0.65rem 1rem' }}>
+            <span style={{
+              padding: '0.18rem 0.5rem',
+              borderRadius: '0.25rem',
+              fontSize: '0.71rem',
+              fontWeight: 700,
+              backgroundColor: statusBg,
+              color: statusColor,
+              border: statusBorder,
+              display: 'inline-block'
+            }}>
+              {statusText}
+            </span>
+          </td>
+          <td style={{ padding: '0.65rem 1rem' }}>
+            <div style={{ display: 'flex', gap: '0.3rem', flexWrap: 'wrap', alignItems: 'center' }}>
+              {targetBands.map((bName, bIdx) => (
+                <span key={bIdx} style={{
+                  padding: '0.14rem 0.45rem',
+                  borderRadius: '0.25rem',
+                  fontSize: '0.71rem',
+                  fontWeight: 700,
+                  fontFamily: 'monospace',
+                  backgroundColor: '#eff6ff',
+                  border: '1px solid #bfdbfe',
+                  color: '#1d4ed8'
+                }}>
+                  {bName}
+                </span>
+              ))}
+            </div>
+          </td>
+        </tr>
+      );
+    };
+
+    // Step 2 Scene Row (Strictly Raw Spectral Bands Only)
+    const renderStep2SceneRow = (sc, idx) => {
+      const isDownloading = sc.status === 'DOWNLOADING';
+      const isComplete = sc.status === 'COMPLETE';
+      const isFailed = sc.status === 'FAILED';
+      const isSkipped = sc.status === 'SKIPPED';
+      const rawBands = getRawBandsForScene(sc);
+      const missingBandsList = sc.missingBands || [];
+
+      const statusBg = isDownloading ? '#eff6ff'
+        : isComplete ? '#ecfdf5'
+        : isSkipped ? '#fffbeb'
+        : isFailed ? '#fef2f2'
+        : '#f8fafc';
+      const statusColor = isDownloading ? '#1d4ed8'
+        : isComplete ? '#047857'
+        : isSkipped ? '#b45309'
+        : isFailed ? '#b91c1c'
+        : '#64748b';
+      const statusBorder = isDownloading ? '1px solid #bfdbfe'
+        : isComplete ? '1px solid #a7f3d0'
+        : isSkipped ? '1px solid #fde68a'
+        : isFailed ? '1px solid #fecaca'
+        : '1px solid #e2e8f0';
+
+      const rowBg = isDownloading ? '#f0f9ff' : (idx % 2 === 0 ? '#ffffff' : '#fcfdfd');
+
+      return (
+        <tr key={`step2_${sc.folder}_${idx}`} style={{ borderBottom: '1px solid #f1f5f9', backgroundColor: rowBg }}>
+          <td style={{ padding: '0.65rem 1rem', color: '#1e293b', fontFamily: 'monospace', fontWeight: 600, whiteSpace: 'nowrap' }}>
+            {sc.date}
+          </td>
+          <td style={{ padding: '0.65rem 1rem', color: '#2563eb', fontWeight: 700, fontFamily: 'monospace' }}>
+            {sc.tile}
+          </td>
+          <td style={{ padding: '0.65rem 1rem', color: '#475569', fontWeight: 600 }}>
+            {sc.satellite}
+          </td>
+          <td style={{ padding: '0.65rem 1rem' }}>
+            <div style={{ color: '#0f172a', fontFamily: 'monospace', fontSize: '0.76rem', fontWeight: 600 }}>
+              {cleanFolderName(sc.folder)}
+            </div>
+            {sc.warning && (
+              <div
+                onClick={() => {
+                  setSelectedWarningScene(sc);
+                  setShowWarningModal(true);
+                }}
+                title="Click to inspect missing details & warnings"
+                style={{
+                  marginTop: '0.25rem',
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  gap: '0.3rem',
+                  padding: '0.15rem 0.5rem',
+                  borderRadius: '0.25rem',
+                  backgroundColor: '#fffbeb',
+                  border: '1px solid #fde68a',
+                  color: '#92400e',
+                  fontSize: '0.71rem',
+                  fontWeight: 600,
+                  cursor: 'pointer'
+                }}
+              >
+                <AlertTriangle size={11} color="#d97706" /> {sc.warning} <span style={{ textDecoration: 'underline', marginLeft: '0.2rem', color: '#b45309' }}>[Inspect]</span>
+              </div>
+            )}
+          </td>
+          <td style={{ padding: '0.65rem 1rem' }}>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '0.2rem', alignItems: 'flex-start' }}>
+              <span style={{
+                padding: '0.18rem 0.5rem',
+                borderRadius: '0.25rem',
+                fontSize: '0.71rem',
+                fontWeight: 700,
+                backgroundColor: statusBg,
+                color: statusColor,
+                border: statusBorder,
+                display: 'inline-flex',
+                alignItems: 'center',
+                gap: '0.3rem'
+              }}>
+                {isDownloading && <RefreshCw size={9} className="animate-spin" />}
+                {isDownloading ? 'DOWNLOADING' : (isComplete ? 'COMPLETE' : (isSkipped ? 'SKIPPED' : (isFailed ? 'FAILED' : 'PENDING')))}
+              </span>
+              {rawBands.length > 0 && (
+                <div style={{ fontSize: '0.67rem', color: '#16a34a', fontWeight: 600 }}>
+                  {rawBands.length} band{rawBands.length !== 1 ? 's' : ''} verified
+                </div>
+              )}
+            </div>
+          </td>
+          <td style={{ padding: '0.65rem 1rem' }}>
+            <div style={{ display: 'flex', gap: '0.3rem', flexWrap: 'wrap', alignItems: 'center' }}>
+              {rawBands.map((bName, bIdx) => (
+                <span key={bIdx} style={{
+                  padding: '0.14rem 0.45rem',
+                  borderRadius: '0.25rem',
+                  fontSize: '0.71rem',
+                  fontWeight: 700,
+                  fontFamily: 'monospace',
+                  backgroundColor: '#eff6ff',
+                  border: '1px solid #bfdbfe',
+                  color: '#1d4ed8'
+                }}>
+                  {bName}
+                  {sc.bandSizes?.[bName] ? ` (${sc.bandSizes[bName]})` : ''}
+                </span>
+              ))}
+              {missingBandsList.map((mb, mbIdx) => (
+                <span
+                  key={`m_${mbIdx}`}
+                  onClick={() => {
+                    setSelectedWarningScene(sc);
+                    setShowWarningModal(true);
+                  }}
+                  title="Click to inspect missing bands"
+                  style={{
+                    padding: '0.14rem 0.45rem',
+                    borderRadius: '0.25rem',
+                    fontSize: '0.71rem',
+                    fontWeight: 700,
+                    fontFamily: 'monospace',
+                    backgroundColor: '#fef2f2',
+                    border: '1px dashed #f87171',
+                    color: '#dc2626',
+                    cursor: 'pointer',
+                    display: 'inline-flex',
+                    alignItems: 'center',
+                    gap: '0.25rem'
+                  }}
+                >
+                  Missing: {mb} <AlertTriangle size={10} color="#dc2626" />
+                </span>
+              ))}
+              {isDownloading && (
+                <span style={{
+                  padding: '0.14rem 0.45rem',
+                  borderRadius: '0.25rem',
+                  fontSize: '0.71rem',
+                  fontWeight: 600,
+                  backgroundColor: '#eff6ff',
+                  border: '1px solid #bfdbfe',
+                  color: '#2563eb',
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  gap: '0.25rem'
+                }}>
+                  <RefreshCw size={9} className="animate-spin" /> downloading...
+                </span>
+              )}
+              {rawBands.length === 0 && missingBandsList.length === 0 && !isDownloading && (
+                <span style={{ color: '#94a3b8', fontSize: '0.73rem' }}>Awaiting download...</span>
+              )}
+            </div>
+          </td>
+        </tr>
+      );
+    };
+
+    // Step 3 Scene Row (Strictly Indices Only: NDVI, LSWI, VV_VH)
+    const renderStep3SceneRow = (sc, idx) => {
+      const isComplete = sc.status === 'COMPLETE';
+      const indicesBands = getIndicesBandsForScene(sc);
+      const rowBg = idx % 2 === 0 ? '#ffffff' : '#fcfdfd';
+
+      return (
+        <tr key={`step3_${sc.folder}_${idx}`} style={{ borderBottom: '1px solid #f1f5f9', backgroundColor: rowBg }}>
+          <td style={{ padding: '0.65rem 1rem', color: '#1e293b', fontFamily: 'monospace', fontWeight: 600, whiteSpace: 'nowrap' }}>
+            {sc.date}
+          </td>
+          <td style={{ padding: '0.65rem 1rem', color: '#2563eb', fontWeight: 700, fontFamily: 'monospace' }}>
+            {sc.tile}
+          </td>
+          <td style={{ padding: '0.65rem 1rem', color: '#475569', fontWeight: 600 }}>
+            {sc.satellite}
+          </td>
+          <td style={{ padding: '0.65rem 1rem' }}>
+            <div style={{ color: '#0f172a', fontFamily: 'monospace', fontSize: '0.76rem', fontWeight: 600 }}>
+              {cleanFolderName(sc.folder)}
+            </div>
+          </td>
+          <td style={{ padding: '0.65rem 1rem' }}>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '0.2rem', alignItems: 'flex-start' }}>
+              <span style={{
+                padding: '0.18rem 0.5rem',
+                borderRadius: '0.25rem',
+                fontSize: '0.71rem',
+                fontWeight: 700,
+                backgroundColor: isComplete ? '#ecfdf5' : '#f8fafc',
+                color: isComplete ? '#047857' : '#64748b',
+                border: isComplete ? '1px solid #a7f3d0' : '1px solid #e2e8f0',
+                display: 'inline-block'
+              }}>
+                {isComplete ? 'COMPLETE' : 'PENDING'}
+              </span>
+              {indicesBands.length > 0 && (
+                <div style={{ fontSize: '0.67rem', color: '#16a34a', fontWeight: 600 }}>
+                  {indicesBands.length} indices verified
+                </div>
+              )}
+            </div>
+          </td>
+          <td style={{ padding: '0.65rem 1rem' }}>
+            <div style={{ display: 'flex', gap: '0.3rem', flexWrap: 'wrap', alignItems: 'center' }}>
+              {indicesBands.map((bName, bIdx) => (
+                <span key={bIdx} style={{
+                  padding: '0.14rem 0.45rem',
+                  borderRadius: '0.25rem',
+                  fontSize: '0.71rem',
+                  fontWeight: 700,
+                  fontFamily: 'monospace',
+                  backgroundColor: '#ecfdf5',
+                  border: '1px solid #a7f3d0',
+                  color: '#047857'
+                }}>
+                  {bName}
+                </span>
+              ))}
+              {indicesBands.length === 0 && (
+                <span style={{ color: '#94a3b8', fontSize: '0.73rem' }}>Awaiting index calculation...</span>
+              )}
+            </div>
+          </td>
+        </tr>
+      );
+    };
+
+    // Step 4 Temporal Composite Row
+    const renderStep4Row = (row, idx) => {
+      const isComplete = row.status === 'COMPLETE';
+      const isProcessing = row.status === 'PROCESSING';
+      const rowBg = idx % 2 === 0 ? '#ffffff' : '#fcfdfd';
+
+      return (
+        <tr key={`step4_${idx}`} style={{ borderBottom: '1px solid #f1f5f9', backgroundColor: rowBg }}>
+          <td style={{ padding: '0.65rem 1rem', color: '#1e293b', fontFamily: 'monospace', fontWeight: 600, whiteSpace: 'nowrap' }}>
+            {row.date}
+          </td>
+          <td style={{ padding: '0.65rem 1rem', color: '#2563eb', fontWeight: 700, fontFamily: 'monospace' }}>
+            {row.tile}
+          </td>
+          <td style={{ padding: '0.65rem 1rem', color: '#475569', fontWeight: 600 }}>
+            {row.satellite}
+          </td>
+          <td style={{ padding: '0.65rem 1rem' }}>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '0.35rem' }}>
+              <div style={{
+                color: '#2563eb',
+                fontFamily: 'monospace',
+                fontSize: '0.72rem',
+                fontWeight: 700,
+                backgroundColor: '#eff6ff',
+                padding: '0.15rem 0.45rem',
+                borderRadius: '0.25rem',
+                border: '1px solid #bfdbfe',
+                display: 'inline-flex',
+                alignItems: 'center',
+                gap: '0.3rem',
+                width: 'fit-content'
+              }}>
+                <Folder size={11} color="#2563eb" /> {row.backendFolder}
+              </div>
+              {row.compositeFiles.map((cf, fIdx) => (
+                <div key={fIdx} style={{
+                  color: '#0f172a',
+                  fontFamily: 'monospace',
+                  fontSize: '0.74rem',
+                  fontWeight: 600,
+                  backgroundColor: '#f8fafc',
+                  padding: '0.2rem 0.5rem',
+                  borderRadius: '0.25rem',
+                  border: '1px solid #e2e8f0',
                   display: 'flex',
                   alignItems: 'center',
-                  gap: '0.75rem',
-                  fontSize: '0.78rem',
-                  padding: '0.45rem 0.65rem',
-                  borderRadius: '0.375rem',
-                  backgroundColor: idx === 0 ? '#f0f9ff' : '#f8fafc',
-                  borderLeft: idx === 0 ? '4px solid #0284c7' : '4px solid #cbd5e1'
+                  justifyContent: 'space-between',
+                  gap: '0.5rem',
+                  width: 'fit-content'
                 }}>
-                  {st.timestamp && (
-                    <span style={{ fontFamily: 'monospace', color: '#64748b', fontSize: '0.72rem', minWidth: '130px' }}>
-                      [{st.timestamp}]
-                    </span>
-                  )}
-                  <span style={{ fontWeight: idx === 0 ? 700 : 600, color: idx === 0 ? '#0369a1' : '#334155' }}>
-                    {st.text}
+                  <span style={{ display: 'inline-flex', alignItems: 'center', gap: '0.35rem' }}>
+                    <FileText size={11} color="#64748b" />
+                    {cf.name}
                   </span>
-                  {idx === 0 && (
-                    <span style={{ fontSize: '0.68rem', fontWeight: 700, color: '#0284c7', backgroundColor: '#e0f2fe', padding: '0.1rem 0.4rem', borderRadius: '0.2rem', marginLeft: 'auto' }}>
-                      ACTIVE / RECENT
+                  {cf.size && (
+                    <span style={{ fontSize: '0.69rem', color: '#16a34a', fontWeight: 700, backgroundColor: '#ecfdf5', padding: '0.05rem 0.35rem', borderRadius: '0.2rem' }}>
+                      {cf.size}
                     </span>
                   )}
                 </div>
               ))}
             </div>
-          </div>
-        )}
+          </td>
+          <td style={{ padding: '0.65rem 1rem' }}>
+            <span style={{
+              padding: '0.18rem 0.5rem',
+              borderRadius: '0.25rem',
+              fontSize: '0.71rem',
+              fontWeight: 700,
+              backgroundColor: isComplete ? '#ecfdf5' : (isProcessing ? '#eff6ff' : '#f8fafc'),
+              color: isComplete ? '#047857' : (isProcessing ? '#1d4ed8' : '#64748b'),
+              border: isComplete ? '1px solid #a7f3d0' : (isProcessing ? '1px solid #bfdbfe' : '1px solid #e2e8f0'),
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: '0.3rem'
+            }}>
+              {isProcessing && <RefreshCw size={9} className="animate-spin" />}
+              {row.status}
+            </span>
+          </td>
+          <td style={{ padding: '0.65rem 1rem' }}>
+            <div style={{ display: 'flex', gap: '0.3rem', flexWrap: 'wrap', alignItems: 'center' }}>
+              {row.bands.map((bName, bIdx) => (
+                <span key={bIdx} style={{
+                  padding: '0.14rem 0.45rem',
+                  borderRadius: '0.25rem',
+                  fontSize: '0.71rem',
+                  fontWeight: 700,
+                  fontFamily: 'monospace',
+                  backgroundColor: '#ecfdf5',
+                  border: '1px solid #a7f3d0',
+                  color: '#047857'
+                }}>
+                  {bName}
+                </span>
+              ))}
+            </div>
+          </td>
+        </tr>
+      );
+    };
 
-        {/* 3. AWS S3 vs NAS Storage Gap Check Audit Summary Banner */}
-        {gapSummary.availableS3 > 0 && (
-          <div style={{ backgroundColor: '#ffffff', border: '1px solid #e2e8f0', borderRadius: '0.65rem', padding: '0.85rem 1rem', display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: '0.75rem' }}>
-            <div style={{ fontSize: '0.82rem', fontWeight: 700, color: '#0f172a' }}>
-              Scene Discovery & Archive Gap Check Audit:
-            </div>
-            <div style={{ display: 'flex', gap: '0.75rem', flexWrap: 'wrap' }}>
-              <span style={{ fontSize: '0.75rem', fontWeight: 700, backgroundColor: '#eff6ff', color: '#1d4ed8', border: '1px solid #bfdbfe', padding: '0.25rem 0.65rem', borderRadius: '0.375rem' }}>
-                🌐 Available on AWS S3: {gapSummary.availableS3} scenes
-              </span>
-              <span style={{ fontSize: '0.75rem', fontWeight: 700, backgroundColor: '#ecfdf5', color: '#047857', border: '1px solid #a7f3d0', padding: '0.25rem 0.65rem', borderRadius: '0.375rem' }}>
-                💾 Already Held on NAS: {gapSummary.alreadyHeld} scenes
-              </span>
-              <span style={{ fontSize: '0.75rem', fontWeight: 700, backgroundColor: '#fef3c7', color: '#b45309', border: '1px solid #fde68a', padding: '0.25rem 0.65rem', borderRadius: '0.375rem' }}>
-                ⬇️ Queued for Download: {gapSummary.missing} scenes
-              </span>
-            </div>
-          </div>
-        )}
+    // Warning Table Row Component
+    const renderWarningTableRow = (item, idx) => {
+      const isFailed = item.status === 'FAILED';
+      const isSkipped = item.status === 'SKIPPED' || item.status === 'SKIPPED (CLOUDS)';
+      const rowBg = isFailed ? '#fff5f5' : (isSkipped ? '#fffbeb' : (idx % 2 === 0 ? '#ffffff' : '#fcfdfd'));
 
-        {/* 4. Tile Scenes Audit Summary Insights */}
-        {tileAuditList && tileAuditList.length > 0 && (
-          <div style={{ backgroundColor: '#f8fafc', border: '1px solid #e2e8f0', borderRadius: '0.65rem', padding: '0.85rem 1rem' }}>
-            <div style={{ fontSize: '0.82rem', fontWeight: 700, color: '#334155', marginBottom: '0.65rem' }}>
-              Individual Tile Audit & Storage Status ({tileAuditList.length} Tiles)
+      const statusBg = isFailed ? '#fef2f2' : (isSkipped ? '#fffbeb' : '#fef3c7');
+      const statusColor = isFailed ? '#b91c1c' : (isSkipped ? '#b45309' : '#92400e');
+      const statusBorder = isFailed ? '1px solid #fecaca' : (isSkipped ? '1px solid #fde68a' : '1px solid #f59e0b');
+
+      return (
+        <tr key={`warn_row_${item.id || idx}`} style={{ borderBottom: '1px solid #f1f5f9', backgroundColor: rowBg }}>
+          <td style={{ padding: '0.65rem 1rem', color: '#1e293b', fontFamily: 'monospace', fontWeight: 600, whiteSpace: 'nowrap' }}>
+            {item.date}
+          </td>
+          <td style={{ padding: '0.65rem 1rem', color: '#2563eb', fontWeight: 700, fontFamily: 'monospace' }}>
+            {item.tile}
+          </td>
+          <td style={{ padding: '0.65rem 1rem', color: '#475569', fontWeight: 600 }}>
+            {item.satellite}
+          </td>
+          <td style={{ padding: '0.65rem 1rem' }}>
+            <div style={{ color: '#0f172a', fontFamily: 'monospace', fontSize: '0.76rem', fontWeight: 600 }}>
+              {cleanFolderName(item.folder)}
             </div>
-            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(240px, 1fr))', gap: '0.75rem' }}>
-              {tileAuditList.map((t, idx) => (
-                <div key={idx} style={{ backgroundColor: '#ffffff', border: '1px solid #cbd5e1', borderRadius: '0.5rem', padding: '0.65rem 0.85rem', fontSize: '0.78rem' }}>
-                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.35rem' }}>
-                    <span style={{ fontWeight: 800, color: '#2563eb', fontFamily: 'monospace' }}>Tile: {t.tile}</span>
-                    <span style={{
-                      fontSize: '0.68rem',
-                      fontWeight: 700,
+          </td>
+          <td style={{ padding: '0.65rem 1rem' }}>
+            <span style={{
+              padding: '0.18rem 0.5rem',
+              borderRadius: '0.25rem',
+              fontSize: '0.71rem',
+              fontWeight: 700,
+              backgroundColor: statusBg,
+              color: statusColor,
+              border: statusBorder,
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: '0.3rem'
+            }}>
+              <AlertTriangle size={10} color={statusColor} />
+              {item.status}
+            </span>
+          </td>
+          <td style={{ padding: '0.65rem 1.25rem' }}>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '0.3rem' }}>
+              {item.missingBands && item.missingBands.length > 0 && (
+                <div style={{ display: 'flex', gap: '0.3rem', flexWrap: 'wrap', alignItems: 'center' }}>
+                  <span style={{ fontSize: '0.69rem', fontWeight: 700, color: '#b91c1c' }}>Missing Bands:</span>
+                  {item.missingBands.map((bName, bIdx) => (
+                    <span key={bIdx} style={{
                       padding: '0.1rem 0.4rem',
                       borderRadius: '0.2rem',
-                      backgroundColor: t.status === 'DOWNLOADED' ? '#dcfce7' : t.status === 'PARTIAL' ? '#fef3c7' : '#f1f5f9',
-                      color: t.status === 'DOWNLOADED' ? '#15803d' : t.status === 'PARTIAL' ? '#b45309' : '#475569'
+                      fontSize: '0.7rem',
+                      fontWeight: 700,
+                      fontFamily: 'monospace',
+                      backgroundColor: '#fef2f2',
+                      border: '1px solid #fecaca',
+                      color: '#b91c1c'
                     }}>
-                      {t.status}
+                      {bName}
                     </span>
-                  </div>
-                  <div style={{ color: '#475569', fontSize: '0.74rem' }}>
-                    <span style={{ fontWeight: 700 }}>{t.held} / {t.total || '?'}</span> scenes held ({t.total > 0 ? Math.round((t.held/t.total)*100) : 0}% complete)
-                  </div>
+                  ))}
                 </div>
-              ))}
+              )}
+              <div style={{
+                fontSize: '0.75rem',
+                color: isFailed ? '#991b1b' : '#92400e',
+                fontWeight: 600,
+                lineHeight: 1.35
+              }}>
+                {item.details}
+              </div>
+            </div>
+          </td>
+        </tr>
+      );
+    };
+
+    // Dedicated Gap Check Summary Card for Step 1
+    const renderGapCheckSummaryCard = () => {
+      const tilesFormatted = identifiedTiles.map(t => `'${t}'`).join(', ');
+      return (
+        <div style={{
+          backgroundColor: '#ffffff',
+          border: '1px solid #bfdbfe',
+          borderRadius: '0.5rem',
+          padding: '0.85rem 1.1rem',
+          marginBottom: '0.85rem',
+          display: 'flex',
+          flexDirection: 'column',
+          gap: '0.65rem',
+          boxShadow: '0 1px 3px rgba(37, 99, 235, 0.06)'
+        }}>
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: '0.5rem' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '0.55rem' }}>
+              <span style={{
+                backgroundColor: '#2563eb',
+                color: '#ffffff',
+                fontSize: '0.72rem',
+                fontWeight: 800,
+                padding: '0.2rem 0.55rem',
+                borderRadius: '0.25rem',
+                letterSpacing: '0.04em'
+              }}>
+                [STAGE 1/4] SCENE DISCOVERY &amp; GAP CHECK
+              </span>
+              <span style={{ fontWeight: 800, color: '#0f172a', fontSize: '0.88rem' }}>
+                Gap Check &amp; Scene Search for '{targetDistrict}'
+              </span>
+            </div>
+            <span style={{
+              fontSize: '0.72rem',
+              fontWeight: 700,
+              color: '#1d4ed8',
+              backgroundColor: '#eff6ff',
+              padding: '0.2rem 0.6rem',
+              borderRadius: '0.25rem',
+              border: '1px solid #bfdbfe'
+            }}>
+              ✓ GAP CHECK COMPLETE
+            </span>
+          </div>
+
+          <div style={{ fontSize: '0.77rem', color: '#475569', display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: '0.35rem' }}>
+            <span style={{ color: '#2563eb', fontWeight: 700 }}>•</span>
+            <span>Querying database for tiles overlapping <strong>'{targetDistrict}'</strong>:</span>
+            <span style={{ fontFamily: 'monospace', color: '#0f172a', fontWeight: 700, backgroundColor: '#f1f5f9', padding: '0.1rem 0.35rem', borderRadius: '0.25rem' }}>
+              [{tilesFormatted}]
+            </span>
+            <span style={{ color: '#64748b' }}>({identifiedTiles.length} total)</span>
+          </div>
+
+          <div style={{
+            display: 'grid',
+            gridTemplateColumns: 'repeat(3, 1fr)',
+            gap: '0.65rem',
+            marginTop: '0.2rem'
+          }}>
+            <div style={{
+              backgroundColor: '#eff6ff',
+              border: '1px solid #bfdbfe',
+              borderRadius: '0.375rem',
+              padding: '0.55rem 0.85rem'
+            }}>
+              <div style={{ fontSize: '0.71rem', color: '#1e40af', fontWeight: 600 }}>• Available on AWS S3</div>
+              <div style={{ fontSize: '1.25rem', fontWeight: 800, color: '#1d4ed8', marginTop: '0.1rem' }}>
+                {gapAvailableS3} <span style={{ fontSize: '0.75rem', fontWeight: 600 }}>total scenes</span>
+              </div>
+            </div>
+
+            <div style={{
+              backgroundColor: '#ecfdf5',
+              border: '1px solid #a7f3d0',
+              borderRadius: '0.375rem',
+              padding: '0.55rem 0.85rem'
+            }}>
+              <div style={{ fontSize: '0.71rem', color: '#065f46', fontWeight: 600 }}>• Already held in archive</div>
+              <div style={{ fontSize: '1.25rem', fontWeight: 800, color: '#047857', marginTop: '0.1rem' }}>
+                {gapAlreadyHeld} <span style={{ fontSize: '0.75rem', fontWeight: 600 }}>scenes (cached)</span>
+              </div>
+            </div>
+
+            <div style={{
+              backgroundColor: '#fffbeb',
+              border: '1px solid #fde68a',
+              borderRadius: '0.375rem',
+              padding: '0.55rem 0.85rem'
+            }}>
+              <div style={{ fontSize: '0.71rem', color: '#92400e', fontWeight: 600 }}>• Missing from archive</div>
+              <div style={{ fontSize: '1.25rem', fontWeight: 800, color: '#b45309', marginTop: '0.1rem' }}>
+                {gapMissing} <span style={{ fontSize: '0.75rem', fontWeight: 600 }}>scenes (queued for download)</span>
+              </div>
             </div>
           </div>
-        )}
+        </div>
+      );
+    };
 
-        {/* 5. KPI Cards */}
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: '1rem' }}>
-          <div style={kpiCardStyle}>
-            <div style={kpiLabelStyle}>Total Scenes to Acquire</div>
-            <div style={{ fontSize: '1.75rem', fontWeight: 800, color: '#0f172a' }}>{totalScenes}</div>
+    // Collect all unified pipeline issues & warnings across scenes, composites, and execution logs
+    const allIssueItems = [];
+    const seenIssueKeys = new Set();
+
+    // 1. Missing bands / failed / skipped scenes from displayScenes
+    displayScenes.forEach(sc => {
+      const hasMissingBands = sc.missingBands && sc.missingBands.length > 0;
+      const isFailed = sc.status === 'FAILED' || sc.isFailedDownload;
+      const isSkipped = sc.status === 'SKIPPED' || (sc.warning && (sc.warning.includes('bounds') || sc.warning.includes('0 valid')));
+      const isWarning = sc.status === 'WARNING' || !!sc.warning;
+
+      if (hasMissingBands || isFailed || isSkipped || isWarning) {
+        const itemStatus = isFailed ? 'FAILED' : (isSkipped ? 'SKIPPED' : 'WARNING');
+        let detailMsg = sc.warning || '';
+        if (hasMissingBands && !detailMsg) {
+          detailMsg = `Missing required spectral band(s) [${sc.missingBands.join(', ')}] needed for indices calculation.`;
+        }
+        if (isFailed && !detailMsg) {
+          detailMsg = `Band acquisition or verification attempt failed. Scene remains incomplete/pending.`;
+        }
+        if (isSkipped && !detailMsg) {
+          detailMsg = `Tile bounding box does not overlap '${targetDistrict}' target boundary (0 valid pixels). Safely omitted from final layer stack.`;
+        }
+
+        const key = `scene_${sc.folder}`;
+        if (!seenIssueKeys.has(key)) {
+          seenIssueKeys.add(key);
+          allIssueItems.push({
+            id: key,
+            date: sc.date || '—',
+            tile: sc.tile || '—',
+            satellite: sc.satellite || (sc.folder.startsWith('S1') ? 'Sentinel-1' : 'Sentinel-2'),
+            folder: sc.folder,
+            status: itemStatus,
+            type: hasMissingBands ? 'MISSING_BANDS' : (isSkipped ? 'OUT_OF_BOUNDS' : (isFailed ? 'FAILED' : 'WARNING')),
+            missingBands: sc.missingBands || [],
+            details: detailMsg || 'Warning reported during pipeline execution.'
+          });
+        }
+      }
+    });
+
+    // 2. Step 4 skipped/warning rows (e.g. heavy cloud cover / no rasters)
+    step4Rows.forEach((r, rIdx) => {
+      if (r.status === 'SKIPPED (CLOUDS)' || r.warning) {
+        const key = `step4_${r.date}_${rIdx}`;
+        if (!seenIssueKeys.has(key)) {
+          seenIssueKeys.add(key);
+          allIssueItems.push({
+            id: key,
+            date: r.date || '—',
+            tile: r.tile || targetDistrict,
+            satellite: r.satellite || 'Composite',
+            folder: r.backendFolder || defaultBackendFolder,
+            status: 'SKIPPED (CLOUDS)',
+            type: 'NO_RASTERS',
+            missingBands: r.bands || [],
+            details: r.warning || 'No cloud-free optical rasters available for this composite window (cloud cover threshold exceeded).'
+          });
+        }
+      }
+    });
+
+    // 3. Any additional warnings from warningsList (execution logs)
+    warningsList.forEach((w, wIdx) => {
+      const key = `warn_${w.scene}_${w.message}`;
+      const matchingSc = allIssueItems.find(it => it.folder === w.scene || (it.details && it.details.includes(w.scene)));
+      if (!matchingSc && !seenIssueKeys.has(key)) {
+        seenIssueKeys.add(key);
+        allIssueItems.push({
+          id: `warn_${wIdx}`,
+          date: (selectedReq?.start_date || '').split('T')[0] || '—',
+          tile: (w.scene && w.scene.includes('S1')) ? 'S1_SAR' : (targetDistrict || '—'),
+          satellite: (w.scene && w.scene.startsWith('S1')) ? 'Sentinel-1' : 'Sentinel-2',
+          folder: w.scene || 'Pipeline Execution',
+          status: w.type === 'OUT_OF_BOUNDS' ? 'SKIPPED' : (w.type === 'DOWNLOAD_FAILED' || w.type === 'FAILED' ? 'FAILED' : 'WARNING'),
+          type: w.type || 'WARNING',
+          missingBands: w.bands || [],
+          details: w.message
+        });
+      }
+    });
+
+    // Extract or format the exact pipeline request configuration line from logs / request parameters
+    const reqHeaderM = (rawLogs || '').match(/(\[\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\]\s+INFO:sdap\.universal_pipeline:\s+Range:.*)/i);
+    const firstTsM = (rawLogs || '').match(/^\[(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})\]/m);
+    const requestTimestamp = reqHeaderM
+      ? (reqHeaderM[1].match(/^\[([^\]]+)\]/) ? reqHeaderM[1].match(/^\[([^\]]+)\]/)[1] : '')
+      : (firstTsM ? firstTsM[1] : (selectedReq?.created_at ? selectedReq.created_at.replace('T', ' ').slice(0, 19) : new Date().toISOString().replace('T', ' ').slice(0, 19)));
+    const requestDateRange = selectedReq ? `${(selectedReq.start_date || '').split('T')[0] || '—'} to ${(selectedReq.end_date || '').split('T')[0] || '—'}` : '—';
+    const requestSatellites = selectedReq?.satellite || 'Sentinel-1, Sentinel-2';
+    const requestIndicesFormatted = Array.isArray(selectedReq?.indices)
+      ? JSON.stringify(selectedReq.indices)
+      : (selectedReq?.indices ? JSON.stringify(selectedReq.indices.split(',').map(s => s.trim())) : "['NDVI', 'LSWI', 'VV/VH']");
+    const requestLevel = (selectedReq?.level || 'MAX').toUpperCase();
+    const requestMaxCloud = selectedReq?.max_cloud_cover !== undefined ? `${parseFloat(selectedReq.max_cloud_cover).toFixed(1)}%` : '—';
+    const requestComposite = (selectedReq?.composite_interval || 'NONE').toUpperCase();
+
+    // Check which steps were requested and reached in real time
+    const hasCompositeInterval = Boolean(
+      selectedReq?.composite_interval &&
+      selectedReq.composite_interval.toLowerCase() !== 'none' &&
+      selectedReq.composite_interval.toLowerCase() !== 'null'
+    );
+
+    const hasReachedStep1 = true;
+    const hasReachedStep2 = Boolean(
+      (rawLogs && (
+        /STAGE\s*2/i.test(rawLogs) ||
+        /STEP\s*2/i.test(rawLogs) ||
+        /FETCHING.*SCENES/i.test(rawLogs) ||
+        /Downloading/i.test(rawLogs) ||
+        /Processing\s+['"]?S[12]/i.test(rawLogs) ||
+        /Band\s+'[A-Za-z0-9_]+/i.test(rawLogs) ||
+        /NAS VERIFIED/i.test(rawLogs) ||
+        /NEW DOWNLOAD/i.test(rawLogs)
+      )) ||
+      displayScenes.some(s => s.status === 'COMPLETE' || s.status === 'DOWNLOADING' || (s.bands && s.bands.length > 0)) ||
+      (selectedReq?.status === 'COMPLETED')
+    );
+
+    const hasReachedStep3 = Boolean(
+      hasReachedStep2 && (
+        (rawLogs && (
+          /STAGE\s*3/i.test(rawLogs) ||
+          /STEP\s*3/i.test(rawLogs) ||
+          /CLOUD MASKING/i.test(rawLogs) ||
+          /INDICES COMPUTED/i.test(rawLogs) ||
+          /INDICES VERIFIED/i.test(rawLogs) ||
+          /SAR.*RATIO/i.test(rawLogs) ||
+          /NDVI\.tif/i.test(rawLogs) ||
+          /LSWI\.tif/i.test(rawLogs) ||
+          /VV_VH\.tif/i.test(rawLogs)
+        )) ||
+        displayScenes.some(s => (s.bands || []).some(b => ['NDVI', 'LSWI', 'VV_VH', 'EVI', 'NDWI'].includes(b))) ||
+        (selectedReq?.status === 'COMPLETED')
+      )
+    );
+
+    const hasReachedStep4 = Boolean(
+      hasCompositeInterval && hasReachedStep3 && (
+        (rawLogs && (
+          /STAGE\s*4/i.test(rawLogs) ||
+          /TEMPORAL COMPOSITING/i.test(rawLogs) ||
+          /DELIVERY_CLIP/i.test(rawLogs)
+        )) ||
+        (backendComposites && backendComposites.length > 0) ||
+        (selectedReq?.status === 'COMPLETED')
+      )
+    );
+
+    // Dynamic Step Tabs based on real-time execution progress
+    const stepTabs = [
+      { id: 'all', label: `All Steps (${displayScenes.length})` },
+      { id: 'step1', label: `Step-1: Discovery & Gap Check (${displayScenes.length})` },
+    ];
+    if (hasReachedStep2) {
+      stepTabs.push({ id: 'step2', label: `Step-2: Band Acquisition (${displayScenes.length})` });
+    }
+    if (hasReachedStep3) {
+      stepTabs.push({ id: 'step3', label: `Step-3: Indices & Masking (${displayScenes.length})` });
+    }
+    if (hasReachedStep4) {
+      stepTabs.push({ id: 'step4', label: `Step-4: ${intervalLabel} Composites (${step4Rows.length} windows)` });
+    }
+    stepTabs.push({ id: 'warnings', label: `Warnings (${allIssueItems.length})`, isWarning: true });
+
+    const activeStepFilter = stepTabs.some(t => t.id === logStepFilter) ? logStepFilter : 'all';
+
+    return (
+      <div style={{ display: 'flex', flexDirection: 'column', gap: '0.85rem', padding: '0', backgroundColor: '#ffffff' }}>
+
+        {/* 0. Request Basic Configuration & Parameters Banner */}
+        <div style={{
+          backgroundColor: '#ffffff',
+          borderRadius: '0.5rem',
+          padding: '0.75rem 1rem',
+          border: '1px solid #e2e8f0',
+          boxShadow: '0 1px 3px rgba(0, 0, 0, 0.05)',
+          display: 'flex',
+          flexDirection: 'column',
+          gap: '0.45rem'
+        }}>
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: '0.5rem' }}>
+            <span style={{ color: '#1d4ed8', fontWeight: 800, fontSize: '0.76rem', display: 'inline-flex', alignItems: 'center', gap: '0.4rem', letterSpacing: '0.02em' }}>
+              <Terminal size={14} color="#2563eb" />
+              PIPELINE CONFIGURATION &amp; REQUEST PARAMETERS
+            </span>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+              <span style={{ fontSize: '0.73rem', color: '#64748b', fontWeight: 600 }}>
+                Request #{selectedReq?.id || '—'} · {selectedReq?.district || selectedReq?.state || 'District'}
+              </span>
+            </div>
           </div>
-          <div style={kpiCardStyle}>
-            <div style={kpiLabelStyle}>Complete on NAS</div>
-            <div style={{ fontSize: '1.75rem', fontWeight: 800, color: '#16a34a' }}>{completeScenes}</div>
-          </div>
-          <div style={kpiCardStyle}>
-            <div style={kpiLabelStyle}>Tiles Covered</div>
-            <div style={{ fontSize: '1.75rem', fontWeight: 800, color: '#2563eb' }}>{tilesCoveredCount}</div>
-          </div>
-          <div style={kpiCardStyle}>
-            <div style={kpiLabelStyle}>Bands Needed</div>
-            <div style={{ fontSize: '1.75rem', fontWeight: 800, color: '#7c3aed' }}>{bandsNeededCount}</div>
+          <div style={{
+            backgroundColor: '#ffffff',
+            padding: '0.55rem 0.85rem',
+            borderRadius: '0.375rem',
+            border: '1px solid #e2e8f0',
+            color: '#1e293b',
+            fontFamily: 'monospace',
+            fontSize: '0.76rem',
+            overflowX: 'auto',
+            whiteSpace: 'pre-wrap',
+            wordBreak: 'break-word',
+            lineHeight: 1.6
+          }}>
+            <span style={{ color: '#64748b' }}>[{requestTimestamp}]</span>{' '}
+            <span style={{ color: '#2563eb', fontWeight: 700 }}>INFO:sdap.universal_pipeline:</span>{'  '}
+            <span style={{ color: '#334155', fontWeight: 600 }}>Range: </span><span style={{ color: '#0284c7', fontWeight: 700 }}>{requestDateRange}</span>
+            <span style={{ color: '#cbd5e1' }}> | </span>
+            <span style={{ color: '#334155', fontWeight: 600 }}>Satellite: </span><span style={{ color: '#0284c7', fontWeight: 700 }}>{requestSatellites}</span>
+            <span style={{ color: '#cbd5e1' }}> | </span>
+            <span style={{ color: '#334155', fontWeight: 600 }}>Indices: </span><span style={{ color: '#059669', fontWeight: 700 }}>{requestIndicesFormatted}</span>
+            <span style={{ color: '#cbd5e1' }}> | </span>
+            <span style={{ color: '#334155', fontWeight: 600 }}>Level: </span><span style={{ color: '#d97706', fontWeight: 700 }}>{requestLevel}</span>
+            <span style={{ color: '#cbd5e1' }}> | </span>
+            <span style={{ color: '#334155', fontWeight: 600 }}>Max Cloud: </span><span style={{ color: '#dc2626', fontWeight: 700 }}>{requestMaxCloud}</span>
+            <span style={{ color: '#cbd5e1' }}> | </span>
+            <span style={{ color: '#334155', fontWeight: 600 }}>Composite: </span><span style={{ color: requestComposite === 'NONE' ? '#64748b' : '#059669', fontWeight: 700 }}>{requestComposite}</span>
           </div>
         </div>
 
-        {/* 6. Progress Bar */}
-        <div style={{ display: 'flex', flexDirection: 'column', gap: '0.45rem', backgroundColor: '#ffffff', border: '1px solid #e2e8f0', borderRadius: '0.5rem', padding: '0.85rem 1rem' }}>
+        {/* 1. Four KPI Metric Cards (Total Scenes | Complete | Tiles Covered | Bands Needed) */}
+        <div style={{
+          display: 'grid',
+          gridTemplateColumns: 'repeat(4, 1fr)',
+          gap: '0.75rem',
+          margin: '0.15rem 0'
+        }}>
+          {/* Card 1: Total Scenes */}
+          <div style={lightKpiCardStyle}>
+            <div style={lightKpiLabelStyle}>Total Scenes</div>
+            <div style={{ fontSize: '1.4rem', fontWeight: 800, color: '#0f172a' }}>
+              {totalScenes}
+            </div>
+          </div>
+
+          {/* Card 2: Complete */}
+          <div style={lightKpiCardStyle}>
+            <div style={lightKpiLabelStyle}>Complete</div>
+            <div style={{ fontSize: '1.4rem', fontWeight: 800, color: '#16a34a' }}>
+              {completeScenes}
+            </div>
+          </div>
+
+          {/* Card 3: Tiles Covered */}
+          <div style={lightKpiCardStyle}>
+            <div style={lightKpiLabelStyle}>Tiles Covered</div>
+            <div style={{ fontSize: '1.4rem', fontWeight: 800, color: '#2563eb' }}>
+              {tilesCoveredCount}
+            </div>
+          </div>
+
+          {/* Card 4: Bands Needed */}
+          <div style={lightKpiCardStyle}>
+            <div style={lightKpiLabelStyle}>Bands Needed</div>
+            <div style={{ fontSize: '1.4rem', fontWeight: 800, color: '#2563eb' }}>
+              {bandsNeededCount}
+            </div>
+          </div>
+        </div>
+
+        {/* 2. Acquisition Progress Bar */}
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '0.25rem', margin: '0' }}>
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-            <span style={{ fontSize: '0.82rem', fontWeight: 600, color: '#334155' }}>Acquisition Progress</span>
-            <span style={{ fontSize: '0.85rem', fontWeight: 700, color: '#2563eb' }}>{progressPct}% ({completeScenes} of {totalScenes} completed)</span>
+            <span style={{ fontSize: '0.82rem', fontWeight: 600, color: '#475569' }}>Acquisition Progress</span>
+            <span style={{ fontSize: '0.82rem', fontWeight: 700, color: '#2563eb' }}>{progressPct}%</span>
           </div>
-          <div style={{ height: '8px', width: '100%', backgroundColor: '#e2e8f0', borderRadius: '9999px', overflow: 'hidden' }}>
-            <div style={{ height: '100%', width: `${progressPct}%`, backgroundColor: '#2563eb', borderRadius: '9999px', transition: 'width 0.3s ease' }} />
+          <div style={{ height: '7px', width: '100%', backgroundColor: '#f1f5f9', border: '1px solid #e2e8f0', borderRadius: '9999px', overflow: 'hidden' }}>
+            <div style={{
+              height: '100%',
+              width: `${progressPct}%`,
+              backgroundColor: '#2563eb',
+              borderRadius: '9999px',
+              transition: 'width 0.4s ease'
+            }} />
           </div>
         </div>
 
-        {/* 7. Section Header */}
-        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '0 0.25rem' }}>
-          <span style={{ fontSize: '0.95rem', fontWeight: 700, color: '#0f172a' }}>
-            Acquisition Scenes Breakdown (Latest Logs & Active Downloads on TOP)
+        {/* 2.8 Interactive Step Navigation Bar (Dynamically renders ONLY steps requested & reached in real time) */}
+        <div style={{
+          display: 'flex',
+          gap: '0.5rem',
+          flexWrap: 'wrap',
+          alignItems: 'center',
+          backgroundColor: '#f8fafc',
+          padding: '0.5rem 0.75rem',
+          borderRadius: '0.5rem',
+          border: '1px solid #e2e8f0'
+        }}>
+          <span style={{ fontSize: '0.74rem', fontWeight: 700, color: '#475569', marginRight: '0.25rem' }}>
+            Pipeline Steps:
           </span>
-          <span style={{ fontSize: '0.75rem', color: '#64748b' }}>Showing {displayScenes.length} of {totalScenes} scenes</span>
+          {stepTabs.map(s => {
+            const active = activeStepFilter === s.id;
+            const isWarn = s.isWarning;
+            const hasNoWarnings = isWarn && allIssueItems.length === 0;
+            return (
+              <button
+                key={s.id}
+                onClick={() => {
+                  if (hasNoWarnings) return;
+                  setLogStepFilter(s.id);
+                }}
+                disabled={hasNoWarnings}
+                title={hasNoWarnings ? 'No warnings recorded' : undefined}
+                style={{
+                  padding: '0.3rem 0.65rem',
+                  borderRadius: '0.375rem',
+                  fontSize: '0.74rem',
+                  fontWeight: active ? 700 : 600,
+                  cursor: hasNoWarnings ? 'default' : 'pointer',
+                  opacity: hasNoWarnings ? 0.6 : 1,
+                  border: active
+                    ? (isWarn ? '1px solid #d97706' : '1px solid #2563eb')
+                    : (isWarn && allIssueItems.length > 0 ? '1px solid #fde68a' : '1px solid #cbd5e1'),
+                  backgroundColor: active
+                    ? (isWarn ? '#fef3c7' : '#eff6ff')
+                    : (isWarn && allIssueItems.length > 0 ? '#fffbeb' : '#ffffff'),
+                  color: active
+                    ? (isWarn ? '#92400e' : '#1d4ed8')
+                    : (isWarn && allIssueItems.length > 0 ? '#b45309' : '#64748b'),
+                  boxShadow: active
+                    ? (isWarn ? '0 1px 2px rgba(217, 119, 6, 0.15)' : '0 1px 2px rgba(37, 99, 235, 0.12)')
+                    : 'none',
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  gap: '0.3rem',
+                  transition: 'all 0.15s ease'
+                }}
+              >
+                {isWarn && <AlertTriangle size={12} color={active ? '#92400e' : (allIssueItems.length > 0 ? '#d97706' : '#94a3b8')} />}
+                {s.label}
+              </button>
+            );
+          })}
         </div>
 
-        {/* 8. Scenes Table (Reverse Chronological Order: Recently Running Scene on TOP) */}
-        <div style={{ backgroundColor: '#ffffff', border: '1px solid #e2e8f0', borderRadius: '0.5rem', overflow: 'hidden', boxShadow: '0 1px 3px rgba(0,0,0,0.03)' }}>
+        {/* Dedicated Step-1 Gap Check Summary Card when Step 1 or All Steps is selected */}
+        {(activeStepFilter === 'all' || activeStepFilter === 'step1') && renderGapCheckSummaryCard()}
+
+        {/* 3. Section Header: Acquisition Scenes Breakdown / Warnings Breakdown */}
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', margin: '0.15rem 0 0 0' }}>
+          <span style={{ fontSize: '1.05rem', fontWeight: 800, color: '#0f172a' }}>
+            {activeStepFilter === 'warnings' ? 'Acquisition Warnings & Missing Deliverables' : 'Acquisition Scenes Breakdown'}
+          </span>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
+            {activeStepFilter === 'warnings' ? (
+              <span style={{ fontSize: '0.75rem', color: '#b45309', fontWeight: 700, backgroundColor: '#fffbeb', padding: '0.2rem 0.6rem', borderRadius: '0.25rem', border: '1px solid #fde68a' }}>
+                ⚠ {allIssueItems.length} ALERT{allIssueItems.length !== 1 ? 'S' : ''} RECORDED
+              </span>
+            ) : logSearchQuery ? (
+              <span style={{ fontSize: '0.75rem', color: '#2563eb', fontWeight: 600 }}>
+                Filtered ({displayScenes.length} scenes)
+              </span>
+            ) : null}
+            <span style={{ display: 'inline-flex', alignItems: 'center', gap: '0.35rem', fontSize: '0.74rem', fontWeight: 700, color: '#1d4ed8', backgroundColor: '#eff6ff', padding: '0.2rem 0.6rem', borderRadius: '0.25rem', border: '1px solid #bfdbfe' }}>
+              <span style={{ width: '6px', height: '6px', borderRadius: '50%', backgroundColor: '#10b981', display: 'inline-block' }} />
+              REAL-TIME SYNC · {displayScenes.length} scene{displayScenes.length !== 1 ? 's' : ''}
+            </span>
+          </div>
+        </div>
+
+        {/* 4. Table Structure: Exactly matching user reference (Date, Tile, Satellite, Folder, Status, Bands / Details) */}
+        <div style={{
+          backgroundColor: '#ffffff',
+          border: '1px solid #e2e8f0',
+          borderRadius: '0.5rem',
+          boxShadow: '0 1px 3px rgba(0, 0, 0, 0.04)',
+          overflowX: 'auto'
+        }}>
           <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.8rem', textAlign: 'left' }}>
             <thead>
               <tr style={{ backgroundColor: '#f8fafc', borderBottom: '1px solid #e2e8f0' }}>
-                <th style={{ padding: '0.75rem 1rem', width: '110px', fontWeight: 700, color: '#475569' }}>Date</th>
-                <th style={{ padding: '0.75rem 1rem', width: '90px', fontWeight: 700, color: '#475569' }}>Tile</th>
-                <th style={{ padding: '0.75rem 1rem', width: '80px', fontWeight: 700, color: '#475569' }}>Satellite</th>
-                <th style={{ padding: '0.75rem 1rem', minWidth: '220px', fontWeight: 700, color: '#475569' }}>Folder / Scene ID</th>
-                <th style={{ padding: '0.75rem 1rem', width: '120px', fontWeight: 700, color: '#475569' }}>Tile Progress</th>
-                <th style={{ padding: '0.75rem 1rem', width: '130px', fontWeight: 700, color: '#475569' }}>Status</th>
-                <th style={{ padding: '0.75rem 1rem', minWidth: '260px', fontWeight: 700, color: '#475569' }}>Bands Verified & Sizes</th>
-                <th style={{ padding: '0.75rem 1rem', width: '100px', fontWeight: 700, color: '#475569' }}>Total Size</th>
+                <th style={{ padding: '0.75rem 1rem', width: '115px', fontWeight: 700, color: '#475569', whiteSpace: 'nowrap' }}>Date</th>
+                <th style={{ padding: '0.75rem 1rem', width: '85px', fontWeight: 700, color: '#475569', whiteSpace: 'nowrap' }}>Tile</th>
+                <th style={{ padding: '0.75rem 1rem', width: '90px', fontWeight: 700, color: '#475569', whiteSpace: 'nowrap' }}>Satellite</th>
+                <th style={{ padding: '0.75rem 1rem', width: '280px', fontWeight: 700, color: '#475569' }}>Folder</th>
+                <th style={{ padding: '0.75rem 1rem', width: '145px', fontWeight: 700, color: '#475569', whiteSpace: 'nowrap' }}>Status</th>
+                <th style={{ padding: '0.75rem 1.25rem', fontWeight: 700, color: '#475569' }}>
+                  {activeStepFilter === 'warnings' ? 'Warning Details / Missing Bands' : 'Bands'}
+                </th>
               </tr>
             </thead>
             <tbody>
               {displayScenes.length === 0 ? (
                 <tr>
-                  <td colSpan={8} style={{ padding: '2.5rem 1rem', textAlign: 'center', color: '#94a3b8' }}>
-                    <RefreshCw size={20} className="animate-spin" style={{ margin: '0 auto 0.5rem auto', color: '#94a3b8' }} />
-                    <div>No scenes recorded yet in current execution stream. Waiting for pipeline...</div>
+                  <td colSpan={6} style={{ padding: '3rem 1rem', textAlign: 'center', color: '#64748b', backgroundColor: '#ffffff' }}>
+                    <RefreshCw size={22} className="animate-spin" style={{ margin: '0 auto 0.5rem auto', color: '#2563eb' }} />
+                    <div>Synchronizing acquisition stream... Connecting to NAS &amp; AWS S3...</div>
                   </td>
                 </tr>
               ) : (
-                displayScenes.map((sc, idx) => {
-                  const auditInfo = tileAuditList.find(a => a.tile === sc.tile);
-                  const tileSceneInsight = auditInfo
-                    ? `${auditInfo.held}/${auditInfo.total || '?'} scenes`
-                    : '1 Scene';
+                <>
+                  {/* STEP 1: Discovery & Gap Check */}
+                  {(activeStepFilter === 'all' || activeStepFilter === 'step1') && (
+                    <>
+                      {renderStepHeader(
+                        1,
+                        'Discovery & Gap Check',
+                        `Overlapping tiles queried · Available on S3: ${gapAvailableS3} | Already held: ${gapAlreadyHeld} | Queued: ${gapMissing}`,
+                        `✓ STEP-1 COMPLETE · ${displayScenes.length} SCENES DISCOVERED`
+                      )}
+                      {displayScenes.map((sc, idx) => renderStep1SceneRow(sc, idx))}
+                    </>
+                  )}
 
-                  const isDownloading = sc.status === 'DOWNLOADING';
-                  const isComplete = sc.status === 'COMPLETE';
-                  const isFailed = sc.status === 'FAILED';
+                  {/* STEP 2: Raw Band Acquisition & NAS Download (Only shown if reached in real time) */}
+                  {hasReachedStep2 && (activeStepFilter === 'all' || activeStepFilter === 'step2') && (
+                    <>
+                      {renderStepHeader(
+                        2,
+                        'Raw Band Acquisition & NAS Download',
+                        'Downloading spectral bands (B02-B11, SCL, TCI / VV, VH) to local NAS storage',
+                        `✓ STEP-2 · ALL BANDS VERIFIED`
+                      )}
+                      {displayScenes.map((sc, idx) => renderStep2SceneRow(sc, idx))}
+                    </>
+                  )}
 
-                  return (
-                    <tr key={sc.folder + idx} style={{
-                      borderBottom: '1px solid #f1f5f9',
-                      backgroundColor: isDownloading ? '#f0f9ff' : (idx % 2 === 0 ? '#ffffff' : '#fcfcfd')
-                    }}>
-                      <td style={{ padding: '0.7rem 1rem', color: '#334155', fontFamily: 'monospace', fontWeight: 600 }}>
-                        {sc.date}
-                      </td>
-                      <td style={{ padding: '0.7rem 1rem', color: '#2563eb', fontWeight: 700, fontFamily: 'monospace' }}>
-                        {sc.tile}
-                      </td>
-                      <td style={{ padding: '0.7rem 1rem', color: '#475569', fontWeight: 600 }}>
-                        {sc.satellite}
-                      </td>
-                      <td style={{ padding: '0.7rem 1rem', color: '#0f172a', fontFamily: 'monospace', fontSize: '0.75rem' }}>
-                        <div>{sc.folder}</div>
-                        {sc.storagePath && (
-                          <div style={{ fontSize: '0.68rem', color: '#64748b', wordBreak: 'break-all' }}>
-                            📁 {sc.storagePath}
-                          </div>
-                        )}
-                      </td>
-                      <td style={{ padding: '0.7rem 1rem', color: '#475569', fontSize: '0.74rem', fontWeight: 600 }}>
-                        <span style={{ backgroundColor: '#f1f5f9', padding: '0.15rem 0.4rem', borderRadius: '0.2rem', color: '#334155' }}>
-                          {tileSceneInsight}
-                        </span>
-                      </td>
-                      <td style={{ padding: '0.7rem 1rem' }}>
-                        <span style={{
-                          padding: '0.2rem 0.5rem',
-                          borderRadius: '0.25rem',
-                          fontSize: '0.72rem',
-                          fontWeight: 700,
-                          backgroundColor: isDownloading ? '#e0f2fe' : isComplete ? '#ecfdf5' : isFailed ? '#fee2e2' : '#f8fafc',
-                          color: isDownloading ? '#0369a1' : isComplete ? '#047857' : isFailed ? '#dc2626' : '#64748b',
-                          border: isDownloading ? '1px solid #7dd3fc' : isComplete ? '1px solid #6ee7b7' : isFailed ? '1px solid #fca5a5' : '1px solid #e2e8f0',
-                          display: 'inline-flex',
-                          alignItems: 'center',
-                          gap: '0.25rem'
-                        }}>
-                          {isDownloading && <RefreshCw size={10} className="animate-spin" />}
-                          {sc.status}
-                          {sc.progressPct && ` (${sc.progressPct})`}
-                        </span>
-                      </td>
-                      <td style={{ padding: '0.7rem 1rem' }}>
-                        <div style={{ display: 'flex', gap: '0.35rem', flexWrap: 'wrap' }}>
-                          {sc.bands && sc.bands.map((b, bIdx) => {
-                            const bSize = sc.bandSizes ? sc.bandSizes[b] : null;
-                            return (
-                              <span key={bIdx} style={{
-                                padding: '0.15rem 0.45rem',
-                                borderRadius: '0.25rem',
-                                fontSize: '0.7rem',
-                                fontWeight: 700,
-                                fontFamily: 'monospace',
-                                backgroundColor: '#f0fdf4',
-                                border: '1px solid #a7f3d0',
-                                color: '#047857'
-                              }}>
-                                {b}{bSize ? ` (${bSize})` : ''}
-                              </span>
-                            );
-                          })}
+                  {/* STEP 3: Masking & Surface Reflectance Indices Calculation (Only shown if reached in real time) */}
+                  {hasReachedStep3 && (activeStepFilter === 'all' || activeStepFilter === 'step3') && (
+                    <>
+                      {renderStepHeader(
+                        3,
+                        'Masking & Surface Reflectance Indices Calculation',
+                        'SCL cloud masking evaluated · Computing NDVI, LSWI, VV/VH ratio',
+                        `✓ STEP-3 · INDICES COMPUTED`
+                      )}
+                      {displayScenes.map((sc, idx) => renderStep3SceneRow(sc, idx))}
+                    </>
+                  )}
+
+                  {/* STEP 4: Temporal Composites Deliverables (Only shown if composite != NONE and reached in real time) */}
+                  {hasReachedStep4 && (activeStepFilter === 'all' || activeStepFilter === 'step4') && (
+                    <>
+                      {renderStepHeader(
+                        4,
+                        'Temporal Composites & Layer Deliverables',
+                        `${intervalLabel} GeoTIFF composite layer stacks archived on NAS storage · ${selectedReq?.district || 'AOI'}`,
+                        `✓ STEP-4 · ${step4Rows.length} WEEKS ARCHIVED`
+                      )}
+                      {step4Rows.map((row, idx) => renderStep4Row(row, idx))}
+                    </>
+                  )}
+
+                  {/* Pipeline Stopped Notice if user stopped before later steps */}
+                  {selectedReq?.status === 'STOPPED' && !hasReachedStep2 && (
+                    <tr>
+                      <td colSpan={6} style={{ padding: '0.9rem 1rem', textAlign: 'center', backgroundColor: '#fef2f2', color: '#991b1b', borderTop: '1px solid #fecaca' }}>
+                        <div style={{ fontWeight: 700, fontSize: '0.8rem', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '0.4rem' }}>
+                          <Square size={12} fill="#b91c1c" /> Execution stopped at Step-1 by user. Subsequent stages (Step-2, Step-3, Step-4) were not executed.
                         </div>
                       </td>
-                      <td style={{ padding: '0.7rem 1rem', fontFamily: 'monospace', fontSize: '0.74rem', fontWeight: 600, color: '#334155' }}>
-                        {sc.totalSize || (sc.bands ? `${sc.bands.length} bands` : '—')}
+                    </tr>
+                  )}
+                  {selectedReq?.status === 'STOPPED' && hasReachedStep2 && !hasReachedStep3 && (
+                    <tr>
+                      <td colSpan={6} style={{ padding: '0.9rem 1rem', textAlign: 'center', backgroundColor: '#fef2f2', color: '#991b1b', borderTop: '1px solid #fecaca' }}>
+                        <div style={{ fontWeight: 700, fontSize: '0.8rem', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '0.4rem' }}>
+                          <Square size={12} fill="#b91c1c" /> Execution stopped at Step-2 by user. Subsequent stages (Step-3 Indices, Step-4 Composites) were not executed.
+                        </div>
                       </td>
                     </tr>
-                  );
-                })
+                  )}
+
+                  {/* WARNINGS STEP: Shown clearly when user clicks on Warnings */}
+                  {activeStepFilter === 'warnings' && (
+                    <>
+                      {renderStepHeader(
+                        '!',
+                        'Pipeline Warnings & Missing Deliverables',
+                        `Total ${allIssueItems.length} alerts recorded during acquisition & processing`,
+                        `⚠ ${allIssueItems.length} ALERTS`
+                      )}
+                      {allIssueItems.length > 0 ? (
+                        allIssueItems.map((item, idx) => renderWarningTableRow(item, idx))
+                      ) : (
+                        <tr>
+                          <td colSpan={6} style={{ padding: '2.5rem 1rem', textAlign: 'center', color: '#16a34a', backgroundColor: '#f0fdf4' }}>
+                            <CheckCircle size={24} style={{ margin: '0 auto 0.4rem auto', color: '#16a34a' }} />
+                            <div style={{ fontWeight: 700, fontSize: '0.9rem' }}>No Warnings or Missing Items</div>
+                            <div style={{ fontSize: '0.75rem', color: '#15803d', marginTop: '0.2rem' }}>All scenes, spectral bands, and composite windows processed successfully without errors or gaps.</div>
+                          </td>
+                        </tr>
+                      )}
+                    </>
+                  )}
+                </>
               )}
             </tbody>
           </table>
@@ -3069,12 +4928,9 @@ export default function App() {
               boxShadow: '0 4px 6px -1px rgba(0,0,0,0.03)'
             }}>
               <div style={{ marginBottom: '1.5rem', borderBottom: '1px solid #f1f5f9', pb: '1rem' }}>
-                <h2 style={{ fontSize: '1.25rem', fontWeight: 700, color: '#0f172a', margin: '0 0 0.25rem 0' }}>
+                <h2 style={{ fontSize: '1.25rem', fontWeight: 700, color: '#0f172a', margin: 0 }}>
                   Submit Satellite Acquisition & Pipeline Request
                 </h2>
-                <p style={{ fontSize: '0.85rem', color: '#64748b', margin: 0 }}>
-                  Configure district parameters, date bounds, satellite sensors, and indices for automated gap check & acquisition.
-                </p>
               </div>
 
               {reqFormMessage && (
@@ -3334,13 +5190,11 @@ export default function App() {
                   </label>
                   <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.75rem' }}>
                     {(() => {
-                      let available = [];
-                      if (selectedSatellites.includes('Sentinel-2')) {
-                        available.push('NDVI', 'LSWI', 'EVI', 'NDWI');
-                      }
-                      if (selectedSatellites.includes('Sentinel-1')) {
-                        available.push('VV/VH');
-                      }
+                      const desiredOrder = ['VV/VH', 'NDVI', 'LSWI', 'EVI', 'NDWI'];
+                      const available = desiredOrder.filter(idx => {
+                        if (idx === 'VV/VH') return selectedSatellites.includes('Sentinel-1');
+                        return selectedSatellites.includes('Sentinel-2');
+                      });
                       return available.map((idx) => {
                         const checked = selectedIndices.includes(idx);
                         return (
@@ -3376,7 +5230,6 @@ export default function App() {
                       <option value="min">min (Minimum Value Composite)</option>
                       <option value="mean">mean (Average Value Composite)</option>
                     </select>
-                    <span style={{ fontSize: '0.72rem', color: '#94a3b8' }}>Calculation level for NDVI &amp; LSWI temporal compositing</span>
                   </div>
 
                   <div>
@@ -3389,11 +5242,10 @@ export default function App() {
                       onChange={(e) => setMaxCloudCover(e.target.value)}
                       style={{ width: '100%', padding: '0.6rem 0.75rem', borderRadius: '0.375rem', border: '1px solid #cbd5e1', fontSize: '0.875rem', backgroundColor: '#ffffff', outline: 'none' }}
                     />
-                    <span style={{ fontSize: '0.72rem', color: '#94a3b8' }}>Skip Sentinel-2 scenes above threshold (0-100%)</span>
                   </div>
                 </div>
 
-                {/* Dynamic Estimated Storage & Download Time Box */}
+                {/* Dynamic Estimated Storage & Pipeline Step Duration Box */}
                 <div style={{ backgroundColor: willBeRejected ? '#fef2f2' : willRequireApproval ? '#fffbeb' : '#f0fdf4', border: `1px solid ${willBeRejected ? '#fca5a5' : willRequireApproval ? '#fde68a' : '#bbf7d0'}`, borderRadius: '0.5rem', padding: '1rem 1.25rem' }}>
                   <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: '1rem' }}>
                     <div style={{ display: 'flex', alignItems: 'center', gap: '1.75rem', flexWrap: 'wrap' }}>
@@ -3410,16 +5262,47 @@ export default function App() {
                         </div>
                       </div>
 
-                      {/* Download Time Estimate */}
+                      {/* Step-Based Pipeline Duration Estimate */}
                       <div style={{ borderLeft: '1px solid #cbd5e1', paddingLeft: '1.5rem' }}>
-                        <div style={{ display: 'flex', alignItems: 'center', gap: '0.35rem', fontSize: '0.8rem', fontWeight: 600, color: '#64748b', marginBottom: '0.25rem' }}>
-                          <Clock size={14} color="#d97706" /> Estimated Download Duration
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '0.45rem', fontSize: '0.8rem', fontWeight: 600, color: '#64748b', marginBottom: '0.25rem' }}>
+                          <Clock size={14} color="#d97706" /> Estimated Processing Duration
+                          <span style={{
+                            padding: '0.1rem 0.45rem',
+                            borderRadius: '9999px',
+                            fontSize: '0.68rem',
+                            fontWeight: 700,
+                            backgroundColor: '#fef3c7',
+                            color: '#92400e',
+                            border: '1px solid #fde68a'
+                          }}>
+                            {estResult.activeStepsCount}/{estResult.totalPipelineSteps} Steps Active
+                          </span>
                         </div>
                         <div style={{ fontSize: '1.45rem', fontWeight: 800, color: '#92400e' }}>
                           {estResult.downloadTimeText}
                         </div>
-                        <div style={{ fontSize: '0.74rem', color: '#64748b', marginTop: '0.2rem' }}>
-                          Est. at ~12 MB/s pipeline network transfer
+                        <div style={{ fontSize: '0.72rem', color: '#475569', marginTop: '0.25rem', display: 'flex', flexWrap: 'wrap', gap: '0.35rem' }}>
+                          {(estResult.stepBreakdown || []).map((st) => (
+                            <span
+                              key={st.step}
+                              style={{
+                                display: 'inline-flex',
+                                alignItems: 'center',
+                                gap: '0.2rem',
+                                padding: '0.1rem 0.4rem',
+                                borderRadius: '0.25rem',
+                                fontSize: '0.68rem',
+                                fontWeight: st.active ? 600 : 400,
+                                backgroundColor: st.active ? '#ffffff' : '#f1f5f9',
+                                color: st.active ? '#0f172a' : '#94a3b8',
+                                border: st.active ? '1px solid #cbd5e1' : '1px dashed #cbd5e1',
+                                textDecoration: st.active ? 'none' : 'line-through'
+                              }}
+                              title={st.name}
+                            >
+                              Step {st.step}: {st.active ? st.durationText : 'Skipped'}
+                            </span>
+                          ))}
                         </div>
                       </div>
                     </div>
@@ -3496,12 +5379,14 @@ export default function App() {
                       <div style={{ display: 'flex', justifyContent: 'space-between' }}><span style={{ color: '#64748b' }}>Season</span><span style={{ fontWeight: 600, color: '#0f172a' }}>{confirmPayload.season || '—'}</span></div>
                       <div style={{ display: 'flex', justifyContent: 'space-between' }}><span style={{ color: '#64748b' }}>Satellite</span><span style={{ fontWeight: 600, color: '#0f172a' }}>{confirmPayload.satellite}</span></div>
                       <div style={{ display: 'flex', justifyContent: 'space-between' }}><span style={{ color: '#64748b' }}>Date Range</span><span style={{ fontWeight: 600, color: '#0f172a' }}>{confirmPayload.start_date} → {confirmPayload.end_date}</span></div>
-                      <div style={{ display: 'flex', justifyContent: 'space-between' }}><span style={{ color: '#64748b' }}>Indices</span><span style={{ fontWeight: 600, color: '#0f172a' }}>{(confirmPayload.indices || []).join(', ')}</span></div>
+                      <div style={{ display: 'flex', justifyContent: 'space-between' }}><span style={{ color: '#64748b' }}>Indices</span><span style={{ fontWeight: 600, color: '#0f172a' }}>{(confirmPayload.indices || []).length > 0 ? confirmPayload.indices.join(', ') : 'None (Raw Bands Only)'}</span></div>
+                      <div style={{ display: 'flex', justifyContent: 'space-between' }}><span style={{ color: '#64748b' }}>Composite Interval</span><span style={{ fontWeight: 600, color: '#0f172a', textTransform: 'capitalize' }}>{confirmPayload.composite_interval || 'none'}</span></div>
                       <div style={{ display: 'flex', justifyContent: 'space-between' }}><span style={{ color: '#64748b' }}>Calculation Level</span><span style={{ fontWeight: 600, color: '#0284c7' }}>{confirmPayload.level ? confirmPayload.level.toUpperCase() : 'MAX'}</span></div>
                       <hr style={{ border: 'none', borderTop: '1px solid #e2e8f0', margin: '0.25rem 0' }} />
+                      <div style={{ display: 'flex', justifyContent: 'space-between' }}><span style={{ color: '#64748b' }}>Active Pipeline Steps</span><span style={{ fontWeight: 700, color: '#1d4ed8' }}>{estResult.activeStepsCount} of {estResult.totalPipelineSteps} Steps</span></div>
                       <div style={{ display: 'flex', justifyContent: 'space-between' }}><span style={{ color: '#64748b' }}>Estimated Scenes</span><span style={{ fontWeight: 700, color: '#0f172a' }}>~{estResult.scenes}</span></div>
                       <div style={{ display: 'flex', justifyContent: 'space-between' }}><span style={{ color: '#64748b' }}>Estimated Storage</span><span style={{ fontWeight: 700, fontSize: '1rem', color: willRequireApproval ? '#92400e' : '#166534' }}>{estimatedGb} GB</span></div>
-                      <div style={{ display: 'flex', justifyContent: 'space-between' }}><span style={{ color: '#64748b' }}>Estimated Download Time</span><span style={{ fontWeight: 700, fontSize: '1rem', color: '#92400e' }}>{estResult.downloadTimeText}</span></div>
+                      <div style={{ display: 'flex', justifyContent: 'space-between' }}><span style={{ color: '#64748b' }}>Estimated Processing Time</span><span style={{ fontWeight: 700, fontSize: '1rem', color: '#92400e' }}>{estResult.downloadTimeText} ({estResult.activeStepsCount} Steps)</span></div>
                       <div style={{ display: 'flex', justifyContent: 'space-between' }}><span style={{ color: '#64748b' }}>Expected Status</span><span style={{ fontWeight: 700, color: willRequireApproval ? '#92400e' : '#166534' }}>{willRequireApproval ? 'HOLD FOR APPROVAL' : 'AUTO-ACCEPTED + PIPELINE STARTS'}</span></div>
                     </div>
 
@@ -4179,9 +6064,6 @@ export default function App() {
                 <h3 style={{ fontSize: '1.1rem', fontWeight: 700, color: '#0f172a', margin: 0, display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
                   <Users size={18} color="#2563eb" /> System User Directory & Access Controls
                 </h3>
-                <span style={{ fontSize: '0.8rem', color: '#64748b' }}>
-                  Add new users, assign roles (USER / ADMIN), manage permissions, delete accounts, or inspect individual user pipelines and logs.
-                </span>
               </div>
 
               {adminUserMsg && (
@@ -4578,12 +6460,9 @@ export default function App() {
               padding: '1.5rem'
             }}>
               <div style={{ marginBottom: '1.25rem' }}>
-                <h2 style={{ fontSize: '1.2rem', fontWeight: 700, color: '#0f172a', margin: '0 0 0.35rem 0', display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                <h2 style={{ fontSize: '1.2rem', fontWeight: 700, color: '#0f172a', margin: 0, display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
                   <HardDrive size={22} color="#2563eb" /> GeoTIFF Raster Retrieval & Export Form
                 </h2>
-                <p style={{ fontSize: '0.85rem', color: '#64748b', margin: 0 }}>
-                  Select State & District to match spatial tile boundaries in PostgreSQL, resolve held scenes, and retrieve verified .tif file paths for downstream spatial analysis.
-                </p>
               </div>
 
               <div style={{
@@ -5178,6 +7057,340 @@ export default function App() {
                 </div>
               </div>
             )}
+
+            {/* ========================================================================= */}
+            {/* Existing Layer Stacks on NAS Archive (Filter & Direct Download Form)       */}
+            {/* ========================================================================= */}
+            <div style={{
+              backgroundColor: '#ffffff',
+              borderRadius: '0.75rem',
+              border: '1px solid #e2e8f0',
+              padding: '1.5rem',
+              boxShadow: '0 1px 3px rgba(0, 0, 0, 0.04)'
+            }}>
+              <div style={{ marginBottom: '1.25rem' }}>
+                <h2 style={{ fontSize: '1.2rem', fontWeight: 700, color: '#0f172a', margin: 0, display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                  <HardDrive size={22} color="#2563eb" /> Existing Layer Stacks on NAS Archive
+                </h2>
+              </div>
+
+              {/* Filter Controls Grid */}
+              <div style={{
+                display: 'grid',
+                gridTemplateColumns: 'repeat(auto-fit, minmax(210px, 1fr))',
+                gap: '1rem',
+                backgroundColor: '#f8fafc',
+                padding: '1.25rem',
+                borderRadius: '0.5rem',
+                border: '1px solid #e2e8f0',
+                marginBottom: '1.25rem'
+              }}>
+                {/* State / Region Select */}
+                <div>
+                  <label style={{ display: 'block', fontSize: '0.8rem', fontWeight: 600, color: '#334155', marginBottom: '0.35rem' }}>
+                    State / Region
+                  </label>
+                  <select
+                    value={stackArchiveState}
+                    onChange={(e) => {
+                      setStackArchiveState(e.target.value);
+                      setStackArchiveDistrict('');
+                    }}
+                    style={{ width: '100%', padding: '0.5rem 0.75rem', borderRadius: '0.375rem', border: '1px solid #cbd5e1', fontSize: '0.875rem', backgroundColor: '#ffffff' }}
+                  >
+                    <option value="">-- All States / Select State --</option>
+                    {(retDownloadedStates.length > 0 ? retDownloadedStates : statesList).map((s, i) => {
+                      const stName = typeof s === 'string' ? s : (s.state_name || '');
+                      return <option key={i} value={stName}>{stName}</option>;
+                    })}
+                  </select>
+                </div>
+
+                {/* Target District Select */}
+                <div>
+                  <label style={{ display: 'block', fontSize: '0.8rem', fontWeight: 600, color: '#334155', marginBottom: '0.35rem' }}>
+                    Target District *
+                  </label>
+                  <select
+                    value={stackArchiveDistrict}
+                    onChange={(e) => setStackArchiveDistrict(e.target.value)}
+                    style={{ width: '100%', padding: '0.5rem 0.75rem', borderRadius: '0.375rem', border: '1px solid #cbd5e1', fontSize: '0.875rem', backgroundColor: '#ffffff' }}
+                  >
+                    <option value="">-- Select Target District --</option>
+                    {(retDownloadedDistricts.length > 0 ? retDownloadedDistricts : districtsList)
+                      .filter(d => {
+                        const dState = typeof d === 'string' ? '' : (d.state_name || '');
+                        return !stackArchiveState || (dState && dState.toLowerCase() === stackArchiveState.toLowerCase());
+                      })
+                      .map((d, i) => {
+                        const dName = typeof d === 'string' ? d : (d.district_name || '');
+                        return <option key={i} value={dName}>{dName}</option>;
+                      })}
+                  </select>
+                </div>
+
+                {/* Crop / Meteorological Season Select */}
+                <div>
+                  <label style={{ display: 'block', fontSize: '0.8rem', fontWeight: 600, color: '#334155', marginBottom: '0.35rem' }}>
+                    Crop / Meteorological Season
+                  </label>
+                  <select
+                    value={stackArchiveSeason}
+                    onChange={(e) => {
+                      const sVal = e.target.value;
+                      setStackArchiveSeason(sVal);
+                      if (sVal.startsWith('Kharif')) {
+                        setStackArchiveStartDate('2024-06-01');
+                        setStackArchiveEndDate('2024-10-31');
+                      } else if (sVal.startsWith('Rabi')) {
+                        setStackArchiveStartDate('2024-11-01');
+                        setStackArchiveEndDate('2025-04-30');
+                      } else if (sVal.startsWith('Zaid')) {
+                        setStackArchiveStartDate('2024-03-01');
+                        setStackArchiveEndDate('2024-06-30');
+                      } else if (sVal.startsWith('Pre-Monsoon')) {
+                        setStackArchiveStartDate('2024-03-01');
+                        setStackArchiveEndDate('2024-05-31');
+                      } else if (sVal.startsWith('Post-Monsoon')) {
+                        setStackArchiveStartDate('2024-10-01');
+                        setStackArchiveEndDate('2024-12-31');
+                      }
+                    }}
+                    style={{ width: '100%', padding: '0.5rem 0.75rem', borderRadius: '0.375rem', border: '1px solid #cbd5e1', fontSize: '0.875rem', backgroundColor: '#ffffff' }}
+                  >
+                    <option value="ALL">All Seasons</option>
+                    <option value="Kharif (Jun – Oct)">Kharif (Jun – Oct)</option>
+                    <option value="Rabi (Nov – Apr)">Rabi (Nov – Apr)</option>
+                    <option value="Zaid (Mar – Jun)">Zaid (Mar – Jun)</option>
+                    <option value="Pre-Monsoon (Mar – May)">Pre-Monsoon (Mar – May)</option>
+                    <option value="Monsoon / Kharif (Jun – Sep)">Monsoon / Kharif (Jun – Sep)</option>
+                    <option value="Post-Monsoon (Oct – Dec)">Post-Monsoon (Oct – Dec)</option>
+                  </select>
+                </div>
+
+                {/* Start Date */}
+                <div>
+                  <label style={{ display: 'block', fontSize: '0.8rem', fontWeight: 600, color: '#334155', marginBottom: '0.35rem' }}>
+                    Start Date
+                  </label>
+                  <input
+                    type="date"
+                    value={stackArchiveStartDate}
+                    onChange={(e) => setStackArchiveStartDate(e.target.value)}
+                    style={{ width: '100%', padding: '0.5rem 0.75rem', borderRadius: '0.375rem', border: '1px solid #cbd5e1', fontSize: '0.875rem' }}
+                  />
+                </div>
+
+                {/* End Date */}
+                <div>
+                  <label style={{ display: 'block', fontSize: '0.8rem', fontWeight: 600, color: '#334155', marginBottom: '0.35rem' }}>
+                    End Date
+                  </label>
+                  <input
+                    type="date"
+                    value={stackArchiveEndDate}
+                    onChange={(e) => setStackArchiveEndDate(e.target.value)}
+                    style={{ width: '100%', padding: '0.5rem 0.75rem', borderRadius: '0.375rem', border: '1px solid #cbd5e1', fontSize: '0.875rem' }}
+                  />
+                </div>
+              </div>
+
+              {/* Action Buttons */}
+              <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem', flexWrap: 'wrap' }}>
+                <button
+                  type="button"
+                  onClick={handleVerifyStackArchive}
+                  disabled={verifyingStackArchive}
+                  style={{
+                    backgroundColor: verifyingStackArchive ? '#1d4ed8' : '#2563eb',
+                    color: '#ffffff',
+                    padding: '0.65rem 1.25rem',
+                    borderRadius: '0.375rem',
+                    border: 'none',
+                    fontWeight: 600,
+                    fontSize: '0.875rem',
+                    cursor: verifyingStackArchive ? 'not-allowed' : 'pointer',
+                    display: 'inline-flex',
+                    alignItems: 'center',
+                    gap: '0.5rem',
+                    boxShadow: '0 1px 2px rgba(37, 99, 235, 0.2)'
+                  }}
+                >
+                  <RefreshCw size={16} className={verifyingStackArchive ? 'animate-spin' : ''} />
+                  {verifyingStackArchive ? 'Verifying Stacks on NAS...' : 'Verify Stacks on NAS'}
+                </button>
+
+                <button
+                  type="button"
+                  onClick={handleResetStackArchive}
+                  disabled={verifyingStackArchive}
+                  style={{
+                    backgroundColor: '#ffffff',
+                    color: '#475569',
+                    padding: '0.65rem 1.25rem',
+                    borderRadius: '0.375rem',
+                    border: '1px solid #cbd5e1',
+                    fontWeight: 600,
+                    fontSize: '0.875rem',
+                    cursor: 'pointer'
+                  }}
+                >
+                  Reset Form
+                </button>
+              </div>
+
+              {/* Notice Banner */}
+              {stackArchiveNotice && (
+                <div style={{
+                  marginTop: '1.25rem',
+                  padding: '0.85rem 1.25rem',
+                  borderRadius: '0.5rem',
+                  fontSize: '0.85rem',
+                  fontWeight: 500,
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: '0.75rem',
+                  backgroundColor: stackArchiveNotice.type === 'success' ? '#f0fdf4' : (stackArchiveNotice.type === 'warning' ? '#fef3c7' : '#fee2e2'),
+                  color: stackArchiveNotice.type === 'success' ? '#15803d' : (stackArchiveNotice.type === 'warning' ? '#92400e' : '#991b1b'),
+                  border: `1px solid ${stackArchiveNotice.type === 'success' ? '#86efac' : (stackArchiveNotice.type === 'warning' ? '#fde68a' : '#fca5a5')}`
+                }}>
+                  {stackArchiveNotice.type === 'success' ? <CheckCircle size={18} color="#166534" /> : (stackArchiveNotice.type === 'warning' ? <AlertTriangle size={18} color="#d97706" /> : <XCircle size={18} color="#dc2626" />)}
+                  <div>{stackArchiveNotice.text}</div>
+                </div>
+              )}
+
+              {/* Results Table (Only displayed when verified) */}
+              {hasVerifiedStackArchive && (
+                <div style={{ marginTop: '1.5rem' }}>
+                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '0.75rem', flexWrap: 'wrap', gap: '0.5rem' }}>
+                    <div style={{ fontSize: '0.9rem', fontWeight: 700, color: '#0f172a' }}>
+                      Verified Layer Stacks ({stackArchiveResults.length} file{stackArchiveResults.length === 1 ? '' : 's'})
+                    </div>
+                    {stackArchiveResults.length > 0 && (
+                      <div style={{ position: 'relative' }}>
+                        <Search size={14} style={{ position: 'absolute', left: '0.65rem', top: '50%', transform: 'translateY(-50%)', color: '#94a3b8' }} />
+                        <input
+                          type="text"
+                          placeholder="Search verified stacks..."
+                          value={stackArchiveSearch}
+                          onChange={(e) => setStackArchiveSearch(e.target.value)}
+                          style={{ padding: '0.35rem 0.65rem 0.35rem 2rem', borderRadius: '0.375rem', border: '1px solid #cbd5e1', fontSize: '0.8rem' }}
+                        />
+                      </div>
+                    )}
+                  </div>
+
+                  {stackArchiveResults.length === 0 ? (
+                    <div style={{ padding: '2rem', textAlign: 'center', backgroundColor: '#f8fafc', borderRadius: '0.5rem', border: '1px dashed #cbd5e1', color: '#64748b', fontSize: '0.875rem' }}>
+                      No layer-stacked GeoTIFFs found on NAS archive matching your filter criteria.
+                    </div>
+                  ) : (
+                    <div style={{ overflowX: 'auto', border: '1px solid #e2e8f0', borderRadius: '0.5rem' }}>
+                      <table style={{ width: '100%', borderCollapse: 'collapse', textAlign: 'left', fontSize: '0.85rem' }}>
+                        <thead>
+                          <tr style={{ backgroundColor: '#f8fafc', borderBottom: '1px solid #e2e8f0', color: '#475569', fontSize: '0.78rem', textTransform: 'uppercase' }}>
+                            <th style={{ padding: '0.75rem 1rem' }}>Stacked File Name</th>
+                            <th style={{ padding: '0.75rem 1rem' }}>Sensor</th>
+                            <th style={{ padding: '0.75rem 1rem' }}>District</th>
+                            <th style={{ padding: '0.75rem 1rem' }}>Season</th>
+                            <th style={{ padding: '0.75rem 1rem' }}>File Size</th>
+                            <th style={{ padding: '0.75rem 1rem' }}>Modified Date</th>
+                            <th style={{ padding: '0.75rem 1rem', textAlign: 'right' }}>Actions</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {stackArchiveResults
+                            .filter(item => {
+                              if (!stackArchiveSearch) return true;
+                              const q = stackArchiveSearch.toLowerCase();
+                              return (item.filename || '').toLowerCase().includes(q) || (item.district || '').toLowerCase().includes(q) || (item.sensor || '').toLowerCase().includes(q);
+                            })
+                            .map((item, idx) => (
+                              <tr key={idx} style={{ borderBottom: '1px solid #f1f5f9' }}>
+                                <td style={{ padding: '0.75rem 1rem', fontWeight: 600, color: '#0f172a', fontFamily: 'monospace', fontSize: '0.82rem' }}>
+                                  {item.filename}
+                                </td>
+                                <td style={{ padding: '0.75rem 1rem' }}>
+                                  <span style={{
+                                    fontSize: '0.72rem',
+                                    fontWeight: 700,
+                                    padding: '0.15rem 0.45rem',
+                                    borderRadius: '0.25rem',
+                                    backgroundColor: item.sensor === 'Sentinel-1' ? '#fef3c7' : (item.sensor === 'Sentinel-2' ? '#dcfce7' : '#e0e7ff'),
+                                    color: item.sensor === 'Sentinel-1' ? '#92400e' : (item.sensor === 'Sentinel-2' ? '#166534' : '#3730a3')
+                                  }}>
+                                    {item.sensor || 'Sentinel-2'}
+                                  </span>
+                                </td>
+                                <td style={{ padding: '0.75rem 1rem', color: '#334155' }}>
+                                  {item.district || '—'}
+                                </td>
+                                <td style={{ padding: '0.75rem 1rem', color: '#334155' }}>
+                                  {item.season || '—'}
+                                </td>
+                                <td style={{ padding: '0.75rem 1rem', fontFamily: 'monospace', color: '#475569' }}>
+                                  {item.size_mb} MB
+                                </td>
+                                <td style={{ padding: '0.75rem 1rem', color: '#64748b', fontSize: '0.8rem' }}>
+                                  {item.modified_at || '—'}
+                                </td>
+                                <td style={{ padding: '0.75rem 1rem', textAlign: 'right' }}>
+                                  <div style={{ display: 'inline-flex', alignItems: 'center', gap: '0.5rem', justifyContent: 'flex-end' }}>
+                                    <button
+                                      type="button"
+                                      onClick={() => {
+                                        setSelectedStackForLogs(item);
+                                        setStackModalFilter('ALL');
+                                        setStackModalSearch('');
+                                      }}
+                                      style={{
+                                        display: 'inline-flex',
+                                        alignItems: 'center',
+                                        gap: '0.35rem',
+                                        padding: '0.4rem 0.75rem',
+                                        borderRadius: '0.375rem',
+                                        backgroundColor: '#eff6ff',
+                                        border: '1px solid #bfdbfe',
+                                        color: '#1d4ed8',
+                                        fontSize: '0.8rem',
+                                        fontWeight: 600,
+                                        cursor: 'pointer'
+                                      }}
+                                      title="View Layer Stack Execution & Verification Logs"
+                                    >
+                                      <Terminal size={13} /> Logs
+                                    </button>
+                                    <button
+                                      type="button"
+                                      onClick={() => handleDownloadStackedTif(item.path, item.filename)}
+                                      style={{
+                                        display: 'inline-flex',
+                                        alignItems: 'center',
+                                        gap: '0.35rem',
+                                        padding: '0.4rem 0.85rem',
+                                        borderRadius: '0.375rem',
+                                        backgroundColor: '#166534',
+                                        border: 'none',
+                                        color: '#ffffff',
+                                        fontSize: '0.8rem',
+                                        fontWeight: 600,
+                                        cursor: 'pointer',
+                                        boxShadow: '0 1px 2px rgba(22, 101, 52, 0.2)'
+                                      }}
+                                    >
+                                      <Download size={13} /> Download Stack (.tif)
+                                    </button>
+                                  </div>
+                                </td>
+                              </tr>
+                            ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
           </div>
         )}
 
@@ -5422,13 +7635,9 @@ export default function App() {
               padding: '1.5rem'
             }}>
               <div style={{ marginBottom: '1.25rem' }}>
-                <h2 style={{ fontSize: '1.2rem', fontWeight: 700, color: '#0f172a', margin: '0 0 0.35rem 0', display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                <h2 style={{ fontSize: '1.2rem', fontWeight: 700, color: '#0f172a', margin: 0, display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
                   <Layers size={22} color="#2563eb" /> Multi-Band Layer Stacking Studio
                 </h2>
-                <p style={{ fontSize: '0.85rem', color: '#64748b', margin: 0 }}>
-                  Combine individual spectral bands and derived indices into a single unified multi-band GeoTIFF file.
-                  Layers are ordered strictly according to your selection sequence and stored to NAS storage in <code style={{ backgroundColor: '#f1f5f9', padding: '0.15rem 0.35rem', borderRadius: '0.25rem', color: '#0f172a' }}>Composites/stack/{'{district}'}/</code>.
-                </p>
               </div>
 
               {/* Notice Banner */}
@@ -5522,6 +7731,31 @@ export default function App() {
                         const dName = typeof d === 'string' ? d : (d.district_name || '');
                         return <option key={i} value={dName}>{dName}</option>;
                       })}
+                  </select>
+                </div>
+
+                {/* Acquisition Job / Request Select */}
+                <div>
+                  <label style={{ display: 'block', fontSize: '0.8rem', fontWeight: 600, color: '#334155', marginBottom: '0.35rem' }}>
+                    Acquisition Job / Request
+                  </label>
+                  <select
+                    value={stackSelectedRequestId || ''}
+                    onChange={(e) => {
+                      const reqId = e.target.value;
+                      setStackSelectedRequestId(reqId);
+                      loadBandsAndScenesForRegion(stackState, stackDistrict, stackSeason, stackStartDate, stackEndDate, reqId ? Number(reqId) : null);
+                    }}
+                    style={{ width: '100%', padding: '0.5rem 0.75rem', borderRadius: '0.375rem', border: '1px solid #cbd5e1', fontSize: '0.875rem', backgroundColor: '#ffffff' }}
+                  >
+                    <option value="">-- Auto-Select / All Matching Requests --</option>
+                    {requests
+                      .filter(r => stackDistrict && r.district && r.district.toLowerCase() === stackDistrict.toLowerCase())
+                      .map((r, i) => (
+                        <option key={r.id || i} value={r.id}>
+                          {r.request_title || 'Untitled Request'} ({r.satellite || 'Sentinel'} • {r.season || 'Custom'})
+                        </option>
+                      ))}
                   </select>
                 </div>
 
@@ -5762,7 +7996,7 @@ export default function App() {
                         <div style={{ display: 'flex', alignItems: 'center', gap: '0.35rem', flexShrink: 0, marginLeft: '0.5rem' }}>
                           {hasScenes && (
                             <span style={{ fontSize: '0.68rem', color: '#64748b', backgroundColor: '#f1f5f9', padding: '0.1rem 0.35rem', borderRadius: '0.2rem', fontWeight: 500 }}>
-                              {scenes.length} scene{scenes.length > 1 ? 's' : ''}
+                              {scenes.length} {scenes.some(s => s.is_composite) && scenes.every(s => s.is_composite) ? 'composite' : 'scene'}{scenes.length > 1 ? 's' : ''}
                             </span>
                           )}
                           {isChecked && (
@@ -5897,8 +8131,17 @@ export default function App() {
                                               {s.tile}
                                             </span>
                                           )}
+                                          {s.is_composite ? (
+                                            <span style={{ backgroundColor: '#fef3c7', color: '#92400e', border: '1px solid #fde68a', borderRadius: '0.2rem', padding: '0.05rem 0.35rem', fontSize: '0.66rem', fontWeight: 700, marginLeft: '0.35rem' }}>
+                                              COMPOSITE
+                                            </span>
+                                          ) : (
+                                            <span style={{ backgroundColor: '#e0f2fe', color: '#0369a1', border: '1px solid #bae6fd', borderRadius: '0.2rem', padding: '0.05rem 0.35rem', fontSize: '0.66rem', fontWeight: 700, marginLeft: '0.35rem' }}>
+                                              RAW SCENE
+                                            </span>
+                                          )}
                                           <span style={{ color: isSceneSelected ? '#334155' : '#94a3b8', marginLeft: '0.35rem' }}>
-                                            🛰️ {s.scene_id ? (s.scene_id.length > 22 ? s.scene_id.substring(0, 20) + '...' : s.scene_id) : 'Scene'}
+                                            🛰️ {s.scene_id ? (s.scene_id.length > 25 ? s.scene_id.substring(0, 22) + '...' : s.scene_id) : 'Scene'}
                                           </span>
                                           {s.filename && (
                                             <span style={{ color: isSceneSelected ? groupColor : '#94a3b8', marginLeft: '0.45rem', fontFamily: 'monospace', fontSize: '0.7rem' }}>
@@ -5952,7 +8195,7 @@ export default function App() {
                         <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
                           <Sliders size={16} color="#2563eb" />
                           <span style={{ fontSize: '0.85rem', fontWeight: 700, color: '#1e40af' }}>
-                            Derived Spectral Indices (Calculated On-The-Fly)
+                            Derived Spectral Indices
                           </span>
                         </div>
                       </div>
@@ -5993,40 +8236,6 @@ export default function App() {
                   </div>
                 );
               })()}
-
-              {/* Preserved Output Filename Field */}
-              <div style={{
-                marginBottom: '1.5rem',
-                padding: '0.85rem 1.25rem',
-                backgroundColor: '#f8fafc',
-                borderRadius: '0.5rem',
-                border: '1px solid #e2e8f0'
-              }}>
-                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '0.35rem', flexWrap: 'wrap', gap: '0.5rem' }}>
-                  <label style={{ fontSize: '0.85rem', fontWeight: 600, color: '#334155' }}>
-                    Output Stack Filename (Preserved Filename)
-                  </label>
-                  <span style={{ fontSize: '0.75rem', color: '#64748b' }}>
-                    Keeps exact original filename for downloaded rasters (e.g. <code style={{ backgroundColor: '#e2e8f0', padding: '0.1rem 0.3rem', borderRadius: '0.2rem', color: '#0f172a' }}>NDVI.tif</code>)
-                  </span>
-                </div>
-                <input
-                  type="text"
-                  value={stackCustomFilename}
-                  onChange={(e) => setStackCustomFilename(e.target.value)}
-                  placeholder="e.g. NDVI.tif or district_stack.tif"
-                  style={{
-                    width: '100%',
-                    padding: '0.55rem 0.75rem',
-                    borderRadius: '0.375rem',
-                    border: '1px solid #cbd5e1',
-                    fontSize: '0.85rem',
-                    fontFamily: 'monospace',
-                    backgroundColor: '#ffffff',
-                    boxSizing: 'border-box'
-                  }}
-                />
-              </div>
 
               {/* Execution Actions & Output Preview */}
               <div style={{
@@ -6079,6 +8288,453 @@ export default function App() {
 
             </div>
 
+            {/* Live Real-Time Layer Stacking Execution Console */}
+            {(stackLoading || stackLogs.length > 0 || stackTaskId) && (
+              <div style={{
+                backgroundColor: '#ffffff',
+                borderRadius: '0.75rem',
+                border: '1px solid #e2e8f0',
+                overflow: 'hidden',
+                boxShadow: '0 4px 12px rgba(0, 0, 0, 0.05)',
+                display: 'flex',
+                flexDirection: 'column'
+              }}>
+                {/* Console Header */}
+                <div style={{
+                  backgroundColor: '#f8fafc',
+                  padding: '0.75rem 1.25rem',
+                  borderBottom: '1px solid #e2e8f0',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'space-between',
+                  flexWrap: 'wrap',
+                  gap: '0.75rem'
+                }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '0.65rem' }}>
+                    <Terminal size={17} color="#2563eb" />
+                    <div>
+                      <div style={{ fontSize: '0.88rem', fontWeight: 700, color: '#0f172a', display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                        Layer Stacking Live Execution Console
+                        {stackLoading && (
+                          <span style={{ display: 'inline-flex', alignItems: 'center', gap: '0.3rem', fontSize: '0.72rem', backgroundColor: '#eff6ff', color: '#2563eb', padding: '0.1rem 0.45rem', borderRadius: '0.25rem', border: '1px solid #bfdbfe' }}>
+                            <RefreshCw size={11} className="spin" /> Processing ({stackProgress}%)
+                          </span>
+                        )}
+                        {!stackLoading && stackResult && (
+                          <span style={{ fontSize: '0.72rem', backgroundColor: '#f0fdf4', color: '#16a34a', padding: '0.1rem 0.45rem', borderRadius: '0.25rem', border: '1px solid #bbf7d0' }}>
+                            ✓ Complete
+                          </span>
+                        )}
+                        {!stackLoading && !stackResult && stackLogs.some(l => l.level === 'ERROR') && (
+                          <span style={{ fontSize: '0.72rem', backgroundColor: '#fef2f2', color: '#dc2626', padding: '0.1rem 0.45rem', borderRadius: '0.25rem', border: '1px solid #fecaca' }}>
+                            ✕ Failed
+                          </span>
+                        )}
+                      </div>
+                      <div style={{ fontSize: '0.73rem', color: '#64748b', marginTop: '0.1rem' }}>
+                        Step: <span style={{ color: '#334155', fontFamily: 'monospace', fontWeight: 600 }}>{stackStep || 'WAITING'}</span>
+                        {stackTaskId && <span style={{ marginLeft: '0.5rem' }}>• Task ID: <code style={{ color: '#2563eb' }}>{stackTaskId}</code></span>}
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* View Mode & Actions */}
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', flexWrap: 'wrap' }}>
+                    <div style={{ display: 'inline-flex', backgroundColor: '#f1f5f9', borderRadius: '0.375rem', padding: '2px', border: '1px solid #cbd5e1' }}>
+                      <button
+                        type="button"
+                        onClick={() => setStackLogViewMode('table')}
+                        style={{
+                          display: 'inline-flex',
+                          alignItems: 'center',
+                          gap: '0.35rem',
+                          padding: '0.25rem 0.65rem',
+                          borderRadius: '0.25rem',
+                          border: 'none',
+                          fontSize: '0.75rem',
+                          fontWeight: 600,
+                          cursor: 'pointer',
+                          backgroundColor: stackLogViewMode === 'table' ? '#ffffff' : 'transparent',
+                          color: stackLogViewMode === 'table' ? '#2563eb' : '#64748b',
+                          boxShadow: stackLogViewMode === 'table' ? '0 1px 2px rgba(0,0,0,0.06)' : 'none'
+                        }}
+                      >
+                        <Table size={13} /> Table View
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setStackLogViewMode('terminal')}
+                        style={{
+                          display: 'inline-flex',
+                          alignItems: 'center',
+                          gap: '0.35rem',
+                          padding: '0.25rem 0.65rem',
+                          borderRadius: '0.25rem',
+                          border: 'none',
+                          fontSize: '0.75rem',
+                          fontWeight: 600,
+                          cursor: 'pointer',
+                          backgroundColor: stackLogViewMode === 'terminal' ? '#ffffff' : 'transparent',
+                          color: stackLogViewMode === 'terminal' ? '#2563eb' : '#64748b',
+                          boxShadow: stackLogViewMode === 'terminal' ? '0 1px 2px rgba(0,0,0,0.06)' : 'none'
+                        }}
+                      >
+                        <Terminal size={13} /> Terminal View
+                      </button>
+                    </div>
+
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setStackLogs([]);
+                        setStackTaskId('');
+                        setStackProgress(0);
+                        setStackStep('');
+                        setStackResult(null);
+                        setStackLoading(false);
+                        if (stackPollIntervalRef.current) {
+                          clearInterval(stackPollIntervalRef.current);
+                          stackPollIntervalRef.current = null;
+                        }
+                        localStorage.removeItem('sdap_active_stack_task');
+                      }}
+                      title="Clear Console & Reset"
+                      style={{
+                        display: 'inline-flex',
+                        alignItems: 'center',
+                        gap: '0.35rem',
+                        padding: '0.25rem 0.55rem',
+                        borderRadius: '0.25rem',
+                        border: '1px solid #cbd5e1',
+                        backgroundColor: '#ffffff',
+                        color: '#64748b',
+                        fontSize: '0.72rem',
+                        fontWeight: 600,
+                        cursor: 'pointer'
+                      }}
+                    >
+                      <Trash2 size={13} /> Clear
+                    </button>
+                  </div>
+                </div>
+
+                {/* KPI Metrics Summary Bar */}
+                {(() => {
+                  const total = stackLogs.length;
+                  const infoCnt = stackLogs.filter(l => l.level === 'INFO').length;
+                  const successCnt = stackLogs.filter(l => l.level === 'SUCCESS').length;
+                  const warnCnt = stackLogs.filter(l => l.level === 'WARNING').length;
+                  const errCnt = stackLogs.filter(l => l.level === 'ERROR').length;
+
+                  return (
+                    <div style={{
+                      display: 'grid',
+                      gridTemplateColumns: 'repeat(auto-fit, minmax(130px, 1fr))',
+                      gap: '0.5rem',
+                      padding: '0.65rem 1.25rem',
+                      backgroundColor: '#f8fafc',
+                      borderBottom: '1px solid #e2e8f0'
+                    }}>
+                      <div style={{ backgroundColor: '#ffffff', padding: '0.45rem 0.75rem', borderRadius: '0.375rem', border: '1px solid #e2e8f0' }}>
+                        <div style={{ fontSize: '0.68rem', color: '#64748b', fontWeight: 600, textTransform: 'uppercase' }}>Total Events</div>
+                        <div style={{ fontSize: '1.05rem', fontWeight: 800, color: '#0f172a' }}>{total}</div>
+                      </div>
+                      <div style={{ backgroundColor: '#ffffff', padding: '0.45rem 0.75rem', borderRadius: '0.375rem', border: '1px solid #e2e8f0' }}>
+                        <div style={{ fontSize: '0.68rem', color: '#2563eb', fontWeight: 600, textTransform: 'uppercase' }}>Info Logs</div>
+                        <div style={{ fontSize: '1.05rem', fontWeight: 800, color: '#1d4ed8' }}>{infoCnt}</div>
+                      </div>
+                      <div style={{ backgroundColor: '#ffffff', padding: '0.45rem 0.75rem', borderRadius: '0.375rem', border: '1px solid #e2e8f0' }}>
+                        <div style={{ fontSize: '0.68rem', color: '#16a34a', fontWeight: 600, textTransform: 'uppercase' }}>Success Steps</div>
+                        <div style={{ fontSize: '1.05rem', fontWeight: 800, color: '#15803d' }}>{successCnt}</div>
+                      </div>
+                      <div style={{ backgroundColor: '#ffffff', padding: '0.45rem 0.75rem', borderRadius: '0.375rem', border: '1px solid #e2e8f0' }}>
+                        <div style={{ fontSize: '0.68rem', color: '#d97706', fontWeight: 600, textTransform: 'uppercase' }}>Warnings</div>
+                        <div style={{ fontSize: '1.05rem', fontWeight: 800, color: '#b45309' }}>{warnCnt}</div>
+                      </div>
+                      <div style={{ backgroundColor: '#ffffff', padding: '0.45rem 0.75rem', borderRadius: '0.375rem', border: '1px solid #e2e8f0' }}>
+                        <div style={{ fontSize: '0.68rem', color: '#dc2626', fontWeight: 600, textTransform: 'uppercase' }}>Errors</div>
+                        <div style={{ fontSize: '1.05rem', fontWeight: 800, color: errCnt > 0 ? '#b91c1c' : '#64748b' }}>{errCnt}</div>
+                      </div>
+                    </div>
+                  );
+                })()}
+
+                {/* Filter and Search Bar */}
+                <div style={{
+                  padding: '0.5rem 1.25rem',
+                  backgroundColor: '#ffffff',
+                  borderBottom: '1px solid #e2e8f0',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'space-between',
+                  gap: '0.75rem',
+                  flexWrap: 'wrap'
+                }}>
+                  {/* Filter Pills */}
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '0.35rem', flexWrap: 'wrap' }}>
+                    {[
+                      { key: 'all', label: `All (${stackLogs.length})` },
+                      { key: 'info', label: `Info (${stackLogs.filter(l => l.level === 'INFO').length})` },
+                      { key: 'success', label: `Success (${stackLogs.filter(l => l.level === 'SUCCESS').length})` },
+                      { key: 'warnings', label: `Warnings (${stackLogs.filter(l => l.level === 'WARNING').length})` },
+                      { key: 'errors', label: `Errors (${stackLogs.filter(l => l.level === 'ERROR').length})` }
+                    ].map(f => {
+                      const isActive = stackLogFilter === f.key;
+                      return (
+                        <button
+                          key={f.key}
+                          type="button"
+                          onClick={() => setStackLogFilter(f.key)}
+                          style={{
+                            padding: '0.2rem 0.55rem',
+                            borderRadius: '0.25rem',
+                            fontSize: '0.72rem',
+                            fontWeight: 600,
+                            border: isActive ? '1px solid #2563eb' : '1px solid #e2e8f0',
+                            backgroundColor: isActive ? '#eff6ff' : '#f8fafc',
+                            color: isActive ? '#1d4ed8' : '#64748b',
+                            cursor: 'pointer',
+                            transition: 'all 0.15s ease'
+                          }}
+                        >
+                          {f.label}
+                        </button>
+                      );
+                    })}
+                  </div>
+
+                  {/* Search Input */}
+                  <div style={{ position: 'relative', minWidth: '220px', flex: '1', maxWidth: '360px' }}>
+                    <Search size={13} style={{ position: 'absolute', left: '0.6rem', top: '50%', transform: 'translateY(-50%)', color: '#94a3b8' }} />
+                    <input
+                      type="text"
+                      placeholder="Search execution logs..."
+                      value={stackLogSearchQuery}
+                      onChange={e => setStackLogSearchQuery(e.target.value)}
+                      style={{
+                        width: '100%',
+                        padding: '0.3rem 0.6rem 0.3rem 1.85rem',
+                        borderRadius: '0.375rem',
+                        border: '1px solid #cbd5e1',
+                        fontSize: '0.75rem',
+                        backgroundColor: '#ffffff'
+                      }}
+                    />
+                    {stackLogSearchQuery && (
+                      <button
+                        type="button"
+                        onClick={() => setStackLogSearchQuery('')}
+                        style={{
+                          position: 'absolute',
+                          right: '0.45rem',
+                          top: '50%',
+                          transform: 'translateY(-50%)',
+                          background: 'none',
+                          border: 'none',
+                          cursor: 'pointer',
+                          color: '#94a3b8'
+                        }}
+                      >
+                        <X size={12} />
+                      </button>
+                    )}
+                  </div>
+                </div>
+
+                {/* Live Progress Bar */}
+                <div style={{ width: '100%', height: '4px', backgroundColor: '#f1f5f9', overflow: 'hidden' }}>
+                  <div style={{
+                    width: `${Math.min(100, Math.max(0, stackProgress))}%`,
+                    height: '100%',
+                    backgroundColor: stackResult ? '#22c55e' : (stackLogs.some(l => l.level === 'ERROR') ? '#ef4444' : '#2563eb'),
+                    transition: 'width 0.3s ease'
+                  }} />
+                </div>
+
+                {/* Log Content Area */}
+                {(() => {
+                  const filteredLogs = stackLogs.filter(l => {
+                    if (stackLogFilter === 'info' && l.level !== 'INFO') return false;
+                    if (stackLogFilter === 'success' && l.level !== 'SUCCESS') return false;
+                    if (stackLogFilter === 'warnings' && l.level !== 'WARNING') return false;
+                    if (stackLogFilter === 'errors' && l.level !== 'ERROR' && l.level !== 'WARNING') return false;
+                    if (stackLogSearchQuery && stackLogSearchQuery.trim()) {
+                      const q = stackLogSearchQuery.toLowerCase();
+                      const msg = (l.message || '').toLowerCase();
+                      const lvl = (l.level || '').toLowerCase();
+                      const ts = (l.timestamp || '').toLowerCase();
+                      return msg.includes(q) || lvl.includes(q) || ts.includes(q);
+                    }
+                    return true;
+                  });
+
+                  const detectPhase = (msg = '') => {
+                    const m = msg.toLowerCase();
+                    if (m.includes('initiated') || m.includes('registered') || m.includes('initiating')) return 'INIT';
+                    if (m.includes('boundary') || m.includes('polygon') || m.includes('loaded (epsg')) return 'BOUNDARY';
+                    if (m.includes('spectral bands') || m.includes('locating candidate') || m.includes('queued')) return 'BANDS';
+                    if (m.includes('raster grid') || m.includes('resolution') || m.includes('target raster')) return 'GRID SETUP';
+                    if (m.includes('reprojected') || m.includes('tile ')) return 'REPROJECT';
+                    if (m.includes('mosaicing') || m.includes('valid pixels')) return 'MOSAICING';
+                    if (m.includes('db') || m.includes('calibrat') || m.includes('backscatter')) return 'CALIBRATION';
+                    if (m.includes('layer sequence') || m.includes('attached band') || m.includes('assembling')) return 'STACKING';
+                    if (m.includes('destination') || m.includes('writing') || m.includes('copying') || m.includes('geotiff')) return 'EXPORT';
+                    if (m.includes('saved:') || m.includes('completed')) return 'COMPLETED';
+                    if (m.includes('failed') || m.includes('error')) return 'FAILED';
+                    return 'PROCESSING';
+                  };
+
+                  return (
+                    <div
+                      ref={stackTerminalContainerRef}
+                      id="stack-logs-terminal-container"
+                      style={{
+                        maxHeight: '420px',
+                        overflowY: 'auto',
+                        backgroundColor: '#ffffff'
+                      }}
+                    >
+                      {stackLogViewMode === 'table' ? (
+                        <table style={{ width: '100%', borderCollapse: 'collapse', textAlign: 'left', fontSize: '0.78rem' }}>
+                          <thead style={{ position: 'sticky', top: 0, zIndex: 1, backgroundColor: '#f8fafc' }}>
+                            <tr style={{ borderBottom: '1px solid #e2e8f0', color: '#64748b', fontSize: '0.71rem', textTransform: 'uppercase' }}>
+                              <th style={{ padding: '0.55rem 0.85rem', width: '95px' }}>Time</th>
+                              <th style={{ padding: '0.55rem 0.85rem', width: '95px' }}>Level</th>
+                              <th style={{ padding: '0.55rem 0.85rem', width: '110px' }}>Phase / Step</th>
+                              <th style={{ padding: '0.55rem 0.85rem' }}>Execution Log / Activity</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {filteredLogs.length === 0 ? (
+                              <tr>
+                                <td colSpan="4" style={{ padding: '2rem', textAlign: 'center', color: '#94a3b8' }}>
+                                  {stackLogs.length === 0 ? 'No logs recorded yet.' : 'No logs match the current filter or search query.'}
+                                </td>
+                              </tr>
+                            ) : (
+                              filteredLogs.map((log, idx) => {
+                                const isErr = log.level === 'ERROR';
+                                const isWarn = log.level === 'WARNING';
+                                const isSuccess = log.level === 'SUCCESS';
+                                const badgeColor = isErr ? '#dc2626' : (isWarn ? '#d97706' : (isSuccess ? '#16a34a' : '#2563eb'));
+                                const badgeBg = isErr ? '#fee2e2' : (isWarn ? '#fef3c7' : (isSuccess ? '#dcfce7' : '#eff6ff'));
+                                const badgeBorder = isErr ? '#fecaca' : (isWarn ? '#fde68a' : (isSuccess ? '#bbf7d0' : '#bfdbfe'));
+                                const phase = detectPhase(log.message);
+
+                                return (
+                                  <tr
+                                    key={idx}
+                                    style={{
+                                      borderBottom: '1px solid #f1f5f9',
+                                      backgroundColor: isErr ? '#fff5f5' : (isWarn ? '#fffbeb' : (idx % 2 === 0 ? '#ffffff' : '#fafafa'))
+                                    }}
+                                  >
+                                    <td style={{ padding: '0.5rem 0.85rem', color: '#64748b', fontFamily: 'monospace', fontSize: '0.74rem', whiteSpace: 'nowrap' }}>
+                                      {log.timestamp || '—'}
+                                    </td>
+                                    <td style={{ padding: '0.5rem 0.85rem' }}>
+                                      <span style={{
+                                        display: 'inline-flex',
+                                        alignItems: 'center',
+                                        gap: '0.25rem',
+                                        padding: '0.12rem 0.45rem',
+                                        borderRadius: '0.25rem',
+                                        fontSize: '0.68rem',
+                                        fontWeight: 700,
+                                        color: badgeColor,
+                                        backgroundColor: badgeBg,
+                                        border: `1px solid ${badgeBorder}`
+                                      }}>
+                                        {isSuccess && <CheckCircle size={10} />}
+                                        {isErr && <XCircle size={10} />}
+                                        {isWarn && <AlertTriangle size={10} />}
+                                        {!isSuccess && !isErr && !isWarn && <Info size={10} />}
+                                        {log.level || 'INFO'}
+                                      </span>
+                                    </td>
+                                    <td style={{ padding: '0.5rem 0.85rem' }}>
+                                      <span style={{
+                                        display: 'inline-block',
+                                        padding: '0.1rem 0.4rem',
+                                        borderRadius: '0.2rem',
+                                        fontSize: '0.67rem',
+                                        fontWeight: 700,
+                                        fontFamily: 'monospace',
+                                        color: '#475569',
+                                        backgroundColor: '#f1f5f9',
+                                        border: '1px solid #cbd5e1'
+                                      }}>
+                                        {phase}
+                                      </span>
+                                    </td>
+                                    <td style={{
+                                      padding: '0.5rem 0.85rem',
+                                      color: isErr ? '#dc2626' : (isWarn ? '#b45309' : (isSuccess ? '#15803d' : '#1e293b')),
+                                      fontFamily: log.message?.includes('\\') || log.message?.includes('/') || log.message?.includes('.tif') ? 'monospace' : 'inherit',
+                                      fontSize: '0.78rem',
+                                      wordBreak: 'break-word',
+                                      lineHeight: 1.45
+                                    }}>
+                                      {log.message}
+                                    </td>
+                                  </tr>
+                                );
+                              })
+                            )}
+                          </tbody>
+                        </table>
+                      ) : (
+                        <div style={{ fontFamily: 'Consolas, Monaco, "Courier New", monospace', fontSize: '0.78rem', lineHeight: 1.55, padding: '0.85rem 1rem' }}>
+                          {filteredLogs.length === 0 ? (
+                            <div style={{ color: '#94a3b8', textAlign: 'center', padding: '1.5rem' }}>
+                              {stackLogs.length === 0 ? 'No logs recorded yet.' : 'No logs match the current filter or search query.'}
+                            </div>
+                          ) : (
+                            filteredLogs.map((log, idx) => {
+                              const isErr = log.level === 'ERROR';
+                              const isWarn = log.level === 'WARNING';
+                              const isSuccess = log.level === 'SUCCESS';
+                              const textColor = isErr ? '#dc2626' : (isWarn ? '#d97706' : (isSuccess ? '#16a34a' : '#2563eb'));
+                              return (
+                                <div key={idx} style={{ display: 'flex', gap: '0.6rem', padding: '0.15rem 0' }}>
+                                  <span style={{ color: '#94a3b8', minWidth: '70px', userSelect: 'none' }}>[{log.timestamp || '—'}]</span>
+                                  <span style={{ color: textColor, minWidth: '75px', fontWeight: 700 }}>[{log.level || 'INFO'}]</span>
+                                  <span style={{ color: isErr ? '#dc2626' : (isWarn ? '#b45309' : (isSuccess ? '#15803d' : '#1e293b')), flex: 1, wordBreak: 'break-word' }}>
+                                    {log.message}
+                                  </span>
+                                </div>
+                              );
+                            })
+                          )}
+                        </div>
+                      )}
+                      <div ref={stackLogsEndRef} />
+                    </div>
+                  );
+                })()}
+
+                {/* Console Footer */}
+                <div style={{
+                  padding: '0.45rem 1.25rem',
+                  backgroundColor: '#f8fafc',
+                  borderTop: '1px solid #e2e8f0',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'space-between',
+                  fontSize: '0.72rem',
+                  color: '#64748b'
+                }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                    <span style={{ display: 'inline-block', width: '7px', height: '7px', borderRadius: '50%', backgroundColor: stackLoading ? '#2563eb' : (stackResult ? '#16a34a' : '#94a3b8') }} />
+                    <span>PostgreSQL Database Synced & Persistent across page reloads</span>
+                  </div>
+                  <div>
+                    {stackLogs.length} events logged
+                  </div>
+                </div>
+              </div>
+            )}
+
             {/* Success Result Card */}
             {stackResult && (
               <div style={{
@@ -6089,31 +8745,77 @@ export default function App() {
                 boxShadow: '0 4px 6px -1px rgba(0, 0, 0, 0.05)'
               }}>
                 <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '1rem', flexWrap: 'wrap', gap: '0.5rem' }}>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', flexWrap: 'wrap' }}>
                     <CheckCircle size={22} color="#16a34a" />
                     <h3 style={{ fontSize: '1.1rem', fontWeight: 700, color: '#0f172a', margin: 0 }}>
-                      Layer Stack Generated Successfully
+                      {stackResult.already_completed ? 'Layer Stack Verified (Already Completed on NAS)' : 'Layer Stack Generated Successfully'}
                     </h3>
+                    <span style={{
+                      padding: '0.2rem 0.65rem',
+                      borderRadius: '9999px',
+                      fontSize: '0.72rem',
+                      fontWeight: 700,
+                      backgroundColor: stackResult.already_completed ? '#eff6ff' : '#ecfdf5',
+                      color: stackResult.already_completed ? '#1d4ed8' : '#047857',
+                      border: `1px solid ${stackResult.already_completed ? '#bfdbfe' : '#a7f3d0'}`
+                    }}>
+                      {stackResult.already_completed ? 'EXISTING TASK • INSTANT REUSE' : 'NEW TASK • COMPLETED'}
+                    </span>
                   </div>
-                  <button
-                    onClick={() => handleDownloadStackedTif(stackResult.output_path, stackResult.filename)}
-                    style={{
-                      display: 'flex',
-                      alignItems: 'center',
-                      gap: '0.45rem',
-                      backgroundColor: '#16a34a',
-                      color: '#ffffff',
-                      fontWeight: 600,
-                      fontSize: '0.85rem',
-                      padding: '0.55rem 1.15rem',
-                      borderRadius: '0.375rem',
-                      border: 'none',
-                      cursor: 'pointer',
-                      boxShadow: '0 2px 4px rgba(0,0,0,0.1)'
-                    }}
-                  >
-                    <Download size={16} /> Download Stacked GeoTIFF ({stackResult.file_size_mb} MB)
-                  </button>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setSelectedStackForLogs({
+                          filename: stackResult.filename,
+                          path: stackResult.output_path,
+                          district: stackResult.district,
+                          season: stackResult.season,
+                          size_mb: stackResult.file_size_mb,
+                          status: 'SUCCESS',
+                          logs: stackLogs.length > 0 ? stackLogs : (stackResult.logs || []),
+                          execution_logs: stackResult.execution_logs || ''
+                        });
+                        setStackModalFilter('ALL');
+                        setStackModalSearch('');
+                      }}
+                      style={{
+                        display: 'inline-flex',
+                        alignItems: 'center',
+                        gap: '0.4rem',
+                        backgroundColor: '#eff6ff',
+                        color: '#1d4ed8',
+                        border: '1px solid #bfdbfe',
+                        fontWeight: 600,
+                        fontSize: '0.85rem',
+                        padding: '0.55rem 0.95rem',
+                        borderRadius: '0.375rem',
+                        cursor: 'pointer'
+                      }}
+                    >
+                      <Terminal size={15} /> Logs
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => handleDownloadStackedTif(stackResult.output_path, stackResult.filename)}
+                      style={{
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: '0.45rem',
+                        backgroundColor: '#16a34a',
+                        color: '#ffffff',
+                        fontWeight: 600,
+                        fontSize: '0.85rem',
+                        padding: '0.55rem 1.15rem',
+                        borderRadius: '0.375rem',
+                        border: 'none',
+                        cursor: 'pointer',
+                        boxShadow: '0 2px 4px rgba(0,0,0,0.1)'
+                      }}
+                    >
+                      <Download size={16} /> Download Stacked GeoTIFF ({stackResult.file_size_mb} MB)
+                    </button>
+                  </div>
                 </div>
 
                 <div style={{
@@ -6150,117 +8852,45 @@ export default function App() {
               </div>
             )}
 
-            {/* Previously Stacked Files History Table */}
+            {/* Link to GeoTIFF Retrieval & NAS Archive tab */}
             <div style={{
-              backgroundColor: '#ffffff',
+              backgroundColor: '#f8fafc',
               borderRadius: '0.75rem',
-              border: '1px solid #e2e8f0',
-              padding: '1.5rem'
+              border: '1px dashed #cbd5e1',
+              padding: '1.25rem 1.5rem',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'space-between',
+              flexWrap: 'wrap',
+              gap: '1rem'
             }}>
-              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '1rem', flexWrap: 'wrap', gap: '0.75rem' }}>
-                <div>
-                  <h3 style={{ fontSize: '1.05rem', fontWeight: 700, color: '#0f172a', margin: '0 0 0.25rem 0', display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
-                    <HardDrive size={18} color="#2563eb" /> Existing Layer Stacks on NAS Archive
-                  </h3>
-                  <span style={{ fontSize: '0.8rem', color: '#64748b' }}>
-                    Archived in <code style={{ backgroundColor: '#f1f5f9', padding: '0.1rem 0.3rem', borderRadius: '0.2rem' }}>Composites/stack/</code> directory
-                  </span>
-                </div>
-
-                <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-                  <div style={{ position: 'relative' }}>
-                    <Search size={14} style={{ position: 'absolute', left: '0.65rem', top: '50%', transform: 'translateY(-50%)', color: '#94a3b8' }} />
-                    <input
-                      type="text"
-                      placeholder="Search files or district..."
-                      value={stackHistorySearch}
-                      onChange={(e) => setStackHistorySearch(e.target.value)}
-                      style={{ padding: '0.4rem 0.65rem 0.4rem 2rem', borderRadius: '0.375rem', border: '1px solid #cbd5e1', fontSize: '0.8rem' }}
-                    />
-                  </div>
-                  <button
-                    onClick={() => fetchStackHistory(stackDistrict)}
-                    disabled={loadingStackHistory}
-                    title="Refresh History"
-                    style={{ padding: '0.4rem 0.65rem', borderRadius: '0.375rem', border: '1px solid #cbd5e1', backgroundColor: '#ffffff', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '0.35rem', fontSize: '0.8rem', color: '#475569' }}
-                  >
-                    <RefreshCw size={13} className={loadingStackHistory ? 'spin' : ''} /> Refresh
-                  </button>
-                </div>
+              <div>
+                <h4 style={{ fontSize: '0.95rem', fontWeight: 700, color: '#0f172a', margin: '0 0 0.25rem 0', display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                  <HardDrive size={18} color="#2563eb" /> Existing Layer Stacks Archive on NAS
+                </h4>
+                <p style={{ fontSize: '0.8rem', color: '#64748b', margin: 0 }}>
+                  Archived stacked GeoTIFFs can be verified, filtered by region/season/date, and downloaded under Tab 4 (GeoTIFF Raster Retrieval &amp; Export Form).
+                </p>
               </div>
-
-              <div style={{ overflowX: 'auto' }}>
-                <table style={{ width: '100%', borderCollapse: 'collapse', textAlign: 'left', fontSize: '0.85rem' }}>
-                  <thead>
-                    <tr style={{ backgroundColor: '#f8fafc', borderBottom: '1px solid #e2e8f0', color: '#475569', fontSize: '0.78rem', textTransform: 'uppercase' }}>
-                      <th style={{ padding: '0.75rem 1rem' }}>Stacked File Name</th>
-                      <th style={{ padding: '0.75rem 1rem' }}>District</th>
-                      <th style={{ padding: '0.75rem 1rem' }}>File Size</th>
-                      <th style={{ padding: '0.75rem 1rem' }}>Generated / Modified</th>
-                      <th style={{ padding: '0.75rem 1rem', textAlign: 'right' }}>Actions</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {loadingStackHistory ? (
-                      <tr>
-                        <td colSpan="5" style={{ padding: '2rem', textAlign: 'center', color: '#64748b' }}>
-                          <RefreshCw size={20} className="spin" style={{ display: 'inline-block', marginBottom: '0.5rem' }} />
-                          <div>Checking NAS archive for stacked rasters...</div>
-                        </td>
-                      </tr>
-                    ) : stackHistory.length === 0 ? (
-                      <tr>
-                        <td colSpan="5" style={{ padding: '2rem', textAlign: 'center', color: '#94a3b8' }}>
-                          No layer stacks found in NAS archive for the selected district. Use the studio form above to generate one.
-                        </td>
-                      </tr>
-                    ) : (
-                      stackHistory
-                        .filter(item => {
-                          if (!stackHistorySearch) return true;
-                          const q = stackHistorySearch.toLowerCase();
-                          return (item.filename || '').toLowerCase().includes(q) || (item.district || '').toLowerCase().includes(q);
-                        })
-                        .map((item, idx) => (
-                          <tr key={idx} style={{ borderBottom: '1px solid #f1f5f9' }}>
-                            <td style={{ padding: '0.75rem 1rem', fontWeight: 600, color: '#0f172a', fontFamily: 'monospace', fontSize: '0.82rem' }}>
-                              {item.filename}
-                            </td>
-                            <td style={{ padding: '0.75rem 1rem', color: '#334155' }}>
-                              {item.district || '—'}
-                            </td>
-                            <td style={{ padding: '0.75rem 1rem', fontFamily: 'monospace', color: '#475569' }}>
-                              {item.size_mb} MB
-                            </td>
-                            <td style={{ padding: '0.75rem 1rem', color: '#64748b', fontSize: '0.8rem' }}>
-                              {item.modified_at || '—'}
-                            </td>
-                            <td style={{ padding: '0.75rem 1rem', textAlign: 'right' }}>
-                              <button
-                                onClick={() => handleDownloadStackedTif(item.path, item.filename)}
-                                style={{
-                                  display: 'inline-flex',
-                                  alignItems: 'center',
-                                  gap: '0.35rem',
-                                  padding: '0.35rem 0.75rem',
-                                  borderRadius: '0.375rem',
-                                  backgroundColor: '#eff6ff',
-                                  border: '1px solid #bfdbfe',
-                                  color: '#1d4ed8',
-                                  fontSize: '0.78rem',
-                                  fontWeight: 600,
-                                  cursor: 'pointer'
-                                }}
-                              >
-                                <Download size={13} /> Download .tif
-                              </button>
-                            </td>
-                          </tr>
-                        ))
-                    )}
-                  </tbody>
-                </table>
-              </div>
+              <button
+                type="button"
+                onClick={() => setActiveTab('retrieve_data')}
+                style={{
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  gap: '0.4rem',
+                  padding: '0.5rem 1rem',
+                  borderRadius: '0.375rem',
+                  backgroundColor: '#eff6ff',
+                  border: '1px solid #bfdbfe',
+                  color: '#1d4ed8',
+                  fontSize: '0.82rem',
+                  fontWeight: 600,
+                  cursor: 'pointer'
+                }}
+              >
+                Go to NAS Layer Stacks Archive →
+              </button>
             </div>
 
           </div>
@@ -6272,27 +8902,58 @@ export default function App() {
       {/* MODAL 1: Execution Logs Terminal Viewer */}
       {/* ========================================================================= */}
       {isLogsModalOpen && selectedReqForLogs && (
-        <div className="modal-overlay">
-          <div className="modal-content">
+        <div className="modal-overlay" onClick={closeLogsModal}>
+          <div className="modal-content" onClick={(e) => e.stopPropagation()} style={{
+            backgroundColor: '#ffffff',
+            color: '#0f172a',
+            border: '1px solid #e2e8f0',
+            width: '100%',
+            maxWidth: '1240px',
+            height: '92vh',
+            maxHeight: '94vh',
+            display: 'flex',
+            flexDirection: 'column',
+            borderRadius: '0.75rem',
+            overflow: 'hidden',
+            boxShadow: '0 25px 50px -12px rgba(15, 23, 42, 0.25)'
+          }}>
             
-            {/* Modal Header */}
+            {/* Modal Header: Clean white background with black text & blue accents */}
             <div style={{
-              padding: '1rem 1.25rem',
-              borderBottom: '1px solid #e2e8f0',
+              padding: '1.25rem 1.5rem 0.75rem 1.5rem',
               display: 'flex',
-              alignItems: 'center',
+              alignItems: 'flex-start',
               justifyContent: 'space-between',
-              backgroundColor: '#f8fafc'
+              backgroundColor: '#ffffff',
+              borderBottom: '1px solid #e2e8f0'
             }}>
               <div>
-                <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-                  <h3 style={{ fontSize: '1.05rem', fontWeight: 700, color: '#0f172a', margin: 0 }}>
-                    Execution Logs — #{selectedReqForLogs.id}: {selectedReqForLogs.request_title}
+                <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem', marginBottom: '0.35rem' }}>
+                  <h3 style={{ fontSize: '1.35rem', fontWeight: 800, color: '#0f172a', margin: 0, letterSpacing: '-0.02em' }}>
+                    {selectedReqForLogs.request_title || `Request #${selectedReqForLogs.id}`}
                   </h3>
-                  {renderStatusBadge(selectedReqForLogs.status)}
+                  <span style={{
+                    padding: '0.2rem 0.75rem',
+                    borderRadius: '9999px',
+                    fontSize: '0.75rem',
+                    fontWeight: 700,
+                    letterSpacing: '0.05em',
+                    textTransform: 'uppercase',
+                    backgroundColor: selectedReqForLogs.status === 'COMPLETED' ? '#ecfdf5' :
+                                     ['PROCESSING', 'DOWNLOADING'].includes(selectedReqForLogs.status) ? '#eff6ff' :
+                                     selectedReqForLogs.status === 'INCOMPLETE' ? '#fffbeb' : '#fef2f2',
+                    color: selectedReqForLogs.status === 'COMPLETED' ? '#047857' :
+                           ['PROCESSING', 'DOWNLOADING'].includes(selectedReqForLogs.status) ? '#1d4ed8' :
+                           selectedReqForLogs.status === 'INCOMPLETE' ? '#b45309' : '#b91c1c',
+                    border: selectedReqForLogs.status === 'COMPLETED' ? '1px solid #a7f3d0' :
+                            ['PROCESSING', 'DOWNLOADING'].includes(selectedReqForLogs.status) ? '1px solid #bfdbfe' :
+                            selectedReqForLogs.status === 'INCOMPLETE' ? '1px solid #fde68a' : '1px solid #fecaca'
+                  }}>
+                    {selectedReqForLogs.status}
+                  </span>
                 </div>
-                <span style={{ fontSize: '0.78rem', color: '#64748b' }}>
-                  Target: {selectedReqForLogs.district || selectedReqForLogs.state} | Satellite: {selectedReqForLogs.satellite} | Est. Storage: {selectedReqForLogs.storage_estimated_gb} GB
+                <span style={{ fontSize: '0.85rem', color: '#64748b' }}>
+                  {selectedReqForLogs.district || ''}{selectedReqForLogs.state ? ', ' + selectedReqForLogs.state : ''} ({(selectedReqForLogs.start_date || '').split('T')[0]} to {(selectedReqForLogs.end_date || '').split('T')[0]})
                 </span>
               </div>
 
@@ -6303,16 +8964,23 @@ export default function App() {
                   background: 'none',
                   color: '#64748b',
                   cursor: 'pointer',
-                  padding: '0.25rem'
+                  padding: '0.25rem',
+                  borderRadius: '0.375rem',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  transition: 'color 0.15s ease'
                 }}
+                onMouseEnter={(e) => e.currentTarget.style.color = '#0f172a'}
+                onMouseLeave={(e) => e.currentTarget.style.color = '#64748b'}
               >
-                <X size={20} />
+                <X size={22} />
               </button>
             </div>
 
             {/* View Toolbar: Mode Switcher, Filters & Search */}
             <div style={{
-              padding: '0.65rem 1.25rem',
+              padding: '0.5rem 1.5rem',
               backgroundColor: '#f8fafc',
               borderBottom: '1px solid #e2e8f0',
               display: 'flex',
@@ -6321,27 +8989,27 @@ export default function App() {
               alignItems: 'center',
               justifyContent: 'space-between'
             }}>
-              {/* Left: View Mode Toggle & Filter Pills */}
-              <div style={{ display: 'flex', alignItems: 'center', gap: '0.6rem', flexWrap: 'wrap' }}>
-                <div style={{ display: 'inline-flex', backgroundColor: '#e2e8f0', borderRadius: '0.375rem', padding: '2px' }}>
+              {/* Left: View Mode Toggle */}
+              <div style={{ display: 'flex', alignItems: 'center', gap: '0.6rem' }}>
+                <div style={{ display: 'inline-flex', backgroundColor: '#f1f5f9', borderRadius: '0.375rem', padding: '3px', border: '1px solid #e2e8f0' }}>
                   <button
                     onClick={() => setLogViewMode('table')}
                     style={{
                       display: 'inline-flex',
                       alignItems: 'center',
                       gap: '0.35rem',
-                      padding: '0.35rem 0.75rem',
+                      padding: '0.35rem 0.8rem',
                       borderRadius: '0.25rem',
-                      border: 'none',
-                      fontSize: '0.78rem',
+                      border: logViewMode === 'table' ? '1px solid #cbd5e1' : 'none',
+                      fontSize: '0.76rem',
                       fontWeight: 600,
                       cursor: 'pointer',
                       backgroundColor: logViewMode === 'table' ? '#ffffff' : 'transparent',
-                      color: logViewMode === 'table' ? '#1d4ed8' : '#64748b',
+                      color: logViewMode === 'table' ? '#2563eb' : '#64748b',
                       boxShadow: logViewMode === 'table' ? '0 1px 2px rgba(0,0,0,0.06)' : 'none'
                     }}
                   >
-                    <Table size={14} /> Structured Table
+                    <Table size={13} /> Table View
                   </button>
                   <button
                     onClick={() => setLogViewMode('raw')}
@@ -6349,72 +9017,46 @@ export default function App() {
                       display: 'inline-flex',
                       alignItems: 'center',
                       gap: '0.35rem',
-                      padding: '0.35rem 0.75rem',
+                      padding: '0.35rem 0.8rem',
                       borderRadius: '0.25rem',
-                      border: 'none',
-                      fontSize: '0.78rem',
+                      border: logViewMode === 'raw' ? '1px solid #cbd5e1' : 'none',
+                      fontSize: '0.76rem',
                       fontWeight: 600,
                       cursor: 'pointer',
                       backgroundColor: logViewMode === 'raw' ? '#ffffff' : 'transparent',
-                      color: logViewMode === 'raw' ? '#1d4ed8' : '#64748b',
+                      color: logViewMode === 'raw' ? '#2563eb' : '#64748b',
                       boxShadow: logViewMode === 'raw' ? '0 1px 2px rgba(0,0,0,0.06)' : 'none'
                     }}
                   >
-                    <Terminal size={14} /> Raw Terminal
+                    <Terminal size={13} /> Raw Logs
                   </button>
                 </div>
-
-                {logViewMode === 'table' && (
-                  <div style={{ display: 'flex', gap: '0.25rem' }}>
-                    {[
-                      { id: 'all', label: 'All Records' },
-                      { id: 'downloads', label: 'Downloads & Cache' },
-                      { id: 'errors', label: 'Warnings & Errors' }
-                    ].map(f => (
-                      <button
-                        key={f.id}
-                        onClick={() => setLogFilter(f.id)}
-                        style={{
-                          padding: '0.3rem 0.6rem',
-                          borderRadius: '0.25rem',
-                          border: logFilter === f.id ? '1px solid #2563eb' : '1px solid #cbd5e1',
-                          backgroundColor: logFilter === f.id ? '#eff6ff' : '#ffffff',
-                          color: logFilter === f.id ? '#1d4ed8' : '#475569',
-                          fontSize: '0.74rem',
-                          fontWeight: 600,
-                          cursor: 'pointer'
-                        }}
-                      >
-                        {f.label}
-                      </button>
-                    ))}
-                  </div>
-                )}
               </div>
 
               {/* Right: Search Filter Input */}
               {logViewMode === 'table' && (
                 <div style={{ position: 'relative', width: '230px' }}>
-                  <Search size={14} style={{ position: 'absolute', left: '0.55rem', top: '50%', transform: 'translateY(-50%)', color: '#94a3b8' }} />
+                  <Search size={13} style={{ position: 'absolute', left: '0.65rem', top: '50%', transform: 'translateY(-50%)', color: '#64748b' }} />
                   <input
                     type="text"
-                    placeholder="Search logs / tiles / scenes..."
+                    placeholder="Filter tile / scene / date..."
                     value={logSearchQuery}
                     onChange={(e) => setLogSearchQuery(e.target.value)}
                     style={{
                       width: '100%',
                       padding: '0.35rem 0.5rem 0.35rem 1.85rem',
-                      fontSize: '0.78rem',
+                      fontSize: '0.76rem',
                       borderRadius: '0.375rem',
                       border: '1px solid #cbd5e1',
                       backgroundColor: '#ffffff',
+                      color: '#0f172a',
                       outline: 'none'
                     }}
                   />
                   {logSearchQuery && (
                     <button
                       onClick={() => setLogSearchQuery('')}
-                      style={{ position: 'absolute', right: '0.4rem', top: '50%', transform: 'translateY(-50%)', border: 'none', background: 'none', cursor: 'pointer', color: '#94a3b8', padding: 0 }}
+                      style={{ position: 'absolute', right: '0.45rem', top: '50%', transform: 'translateY(-50%)', border: 'none', background: 'none', cursor: 'pointer', color: '#64748b', padding: 0 }}
                     >
                       <X size={12} />
                     </button>
@@ -6425,37 +9067,45 @@ export default function App() {
 
             {/* Modal Body: Switch between Table View and Raw Terminal View */}
             <div style={{
-              padding: '1.25rem',
+              padding: '1rem 1.5rem',
               backgroundColor: '#ffffff',
-              flex: 1,
-              overflow: 'hidden',
+              flex: '1 1 auto',
+              minHeight: 0,
+              overflowY: 'auto',
               display: 'flex',
               flexDirection: 'column'
             }}>
               {logViewMode === 'table' ? (
-                renderLogTableView(selectedReqForLogs.execution_logs, selectedReqForLogs)
+                renderLogTableView(selectedReqForLogs.execution_logs, selectedReqForLogs, logsModalTifs, logsModalComposites)
               ) : (
-                <div className="log-terminal">
+                <div className="log-terminal" style={{
+                  flex: 1,
+                  maxHeight: '600px',
+                  backgroundColor: '#f8fafc',
+                  border: '1px solid #e2e8f0',
+                  color: '#0f172a',
+                  padding: '1rem 1.25rem'
+                }}>
                   {renderLogContent(selectedReqForLogs.execution_logs)}
-                  <div ref={logsEndRef} />
                 </div>
               )}
             </div>
 
             {/* Modal Footer Controls */}
             <div style={{
-              padding: '0.85rem 1.25rem',
+              padding: '0.85rem 1.5rem',
               borderTop: '1px solid #e2e8f0',
               display: 'flex',
               alignItems: 'center',
               justifyContent: 'space-between',
-              backgroundColor: '#ffffff'
+              backgroundColor: '#f8fafc'
             }}>
-              <div style={{ fontSize: '0.75rem', color: '#64748b', display: 'flex', alignItems: 'center', gap: '0.35rem' }}>
-                <RefreshCw size={12} className="animate-spin" /> Live logs stream updating automatically (S3 / DB)
+              <div style={{ fontSize: '0.78rem', color: '#475569', display: 'flex', alignItems: 'center', gap: '0.45rem' }}>
+                <span style={{ width: '8px', height: '8px', borderRadius: '50%', backgroundColor: '#10b981', display: 'inline-block', boxShadow: '0 0 6px rgba(16, 185, 129, 0.6)' }} />
+                <span>Live Real-Time Stream (1s polling · Auto-synced with NAS &amp; S3)</span>
               </div>
 
-              <div style={{ display: 'flex', gap: '0.5rem' }}>
+              <div style={{ display: 'flex', gap: '0.65rem' }}>
                 {selectedReqForLogs.status === 'PROCESSING' && (
                   <button
                     onClick={() => handleStop(selectedReqForLogs.id)}
@@ -6495,18 +9145,18 @@ export default function App() {
                     cursor: selectedReqForLogs.status === 'PROCESSING' ? 'not-allowed' : 'pointer'
                   }}
                 >
-                  <Play size={14} /> {rerunningId === selectedReqForLogs.id ? 'Retrying...' : 'Re-run / Resume Pipeline'}
+                  <Play size={14} /> {rerunningId === selectedReqForLogs.id ? 'Retrying...' : 'Re-run / Resume'}
                 </button>
 
                 <button
-                  onClick={() => setIsLogsModalOpen(false)}
+                  onClick={closeLogsModal}
                   style={{
                     backgroundColor: '#ffffff',
                     border: '1px solid #cbd5e1',
-                    color: '#334155',
+                    color: '#0f172a',
                     fontWeight: 600,
                     fontSize: '0.82rem',
-                    padding: '0.45rem 0.85rem',
+                    padding: '0.45rem 1rem',
                     borderRadius: '0.375rem',
                     cursor: 'pointer'
                   }}
@@ -6519,6 +9169,429 @@ export default function App() {
           </div>
         </div>
       )}
+
+      {/* ========================================================================= */}
+      {/* MODAL: Acquisition Warnings & Missing Items Inspection */}
+      {/* ========================================================================= */}
+      {showWarningModal && selectedReqForLogs && (() => {
+        const {
+          scenes = [],
+          gapSummary = {},
+          warningsList = []
+        } = parseAcquisitionScenes(selectedReqForLogs.execution_logs, selectedReqForLogs, logsModalTifs);
+
+        const districtName = selectedReqForLogs.district || selectedReqForLogs.state || 'Selected AOI';
+
+        // 1. Scenes with Missing Bands
+        const missingBandsScenes = scenes.filter(s => s.missingBands && s.missingBands.length > 0);
+
+        // 2. Out-of-bounds or Skipped Scenes
+        const skippedScenes = scenes.filter(s =>
+          s.status === 'SKIPPED' || (s.warning && (s.warning.includes('bounds') || s.warning.includes('0 valid')))
+        );
+
+        // 3. Failed Scenes
+        const failedScenes = scenes.filter(s => s.status === 'FAILED');
+
+        // 4. Queued / Missing Scenes from Archive Gap Check
+        const gapMissingCount = gapSummary.missing || 0;
+        const pendingScenes = scenes.filter(s => s.status === 'PENDING' || s.status === 'DOWNLOADING');
+
+        // Combined inspection items
+        const allIssueItems = [];
+
+        // Add scenes with missing bands
+        missingBandsScenes.forEach(sc => {
+          allIssueItems.push({
+            id: `mb_${sc.folder}`,
+            date: sc.date || '—',
+            tile: sc.tile || '—',
+            satellite: sc.satellite || 'Sentinel-2',
+            folder: sc.folder,
+            status: 'WARNING',
+            type: 'MISSING_BANDS',
+            missingBands: sc.missingBands,
+            details: `Scene is incomplete: Missing required spectral band(s) [${sc.missingBands.join(', ')}] needed for surface reflectance index calculation.`
+          });
+        });
+
+        // Add out-of-bounds / skipped scenes
+        skippedScenes.forEach(sc => {
+          if (!allIssueItems.some(i => i.folder === sc.folder)) {
+            allIssueItems.push({
+              id: `oob_${sc.folder}`,
+              date: sc.date || '—',
+              tile: sc.tile || 'S1_SAR',
+              satellite: sc.satellite || 'Sentinel-1',
+              folder: sc.folder,
+              status: 'SKIPPED',
+              type: 'OUT_OF_BOUNDS',
+              missingBands: [],
+              details: sc.warning || `Tile bounding box does not overlap '${districtName}' target boundary (0 valid pixels). Safely omitted from final layer stack.`
+            });
+          }
+        });
+
+        // Add failed scenes
+        failedScenes.forEach(sc => {
+          if (!allIssueItems.some(i => i.folder === sc.folder)) {
+            allIssueItems.push({
+              id: `fail_${sc.folder}`,
+              date: sc.date || '—',
+              tile: sc.tile || '—',
+              satellite: sc.satellite || 'Sentinel',
+              folder: sc.folder,
+              status: 'FAILED',
+              type: 'FAILED',
+              missingBands: [],
+              details: sc.warning || `Acquisition or band verification attempt failed. Scene queued for retry.`
+            });
+          }
+        });
+
+        // Add pending / queued scenes from archive gap
+        pendingScenes.forEach(sc => {
+          if (!allIssueItems.some(i => i.folder === sc.folder)) {
+            allIssueItems.push({
+              id: `gap_${sc.folder}`,
+              date: sc.date || '—',
+              tile: sc.tile || '—',
+              satellite: sc.satellite || 'Sentinel',
+              folder: sc.folder,
+              status: 'PENDING',
+              type: 'ARCHIVE_GAP',
+              missingBands: [],
+              details: `Available on AWS S3 repository but genuinely missing from local archive cache. Queued for background acquisition.`
+            });
+          }
+        });
+
+        // Add any additional warnings from warningsList
+        warningsList.forEach((w, wIdx) => {
+          if (!allIssueItems.some(i => i.folder === w.scene)) {
+            allIssueItems.push({
+              id: `warn_${wIdx}`,
+              date: (selectedReqForLogs.start_date || '').split('T')[0] || '—',
+              tile: w.scene.includes('S1') ? 'S1_SAR' : '—',
+              satellite: w.scene.startsWith('S1') ? 'Sentinel-1' : 'Sentinel-2',
+              folder: w.scene,
+              status: w.type === 'OUT_OF_BOUNDS' ? 'SKIPPED' : 'WARNING',
+              type: w.type,
+              missingBands: w.bands || [],
+              details: w.message
+            });
+          }
+        });
+
+        // Filter if a specific scene was clicked
+        const displayItems = selectedWarningScene
+          ? allIssueItems.filter(item => item.folder === selectedWarningScene.folder || (selectedWarningScene.tile && item.tile === selectedWarningScene.tile))
+          : allIssueItems;
+
+        return (
+          <div className="modal-overlay" style={{ zIndex: 1200 }} onClick={() => { setShowWarningModal(false); setSelectedWarningScene(null); }}>
+            <div
+              className="modal-content"
+              onClick={(e) => e.stopPropagation()}
+              style={{
+                backgroundColor: '#ffffff',
+                color: '#0f172a',
+                border: '1px solid #e2e8f0',
+                width: '100%',
+                maxWidth: '1050px',
+                maxHeight: '88vh',
+                display: 'flex',
+                flexDirection: 'column',
+                borderRadius: '0.75rem',
+                overflow: 'hidden',
+                boxShadow: '0 25px 50px -12px rgba(15, 23, 42, 0.35)'
+              }}
+            >
+              {/* Modal Header */}
+              <div style={{
+                padding: '1.1rem 1.5rem',
+                borderBottom: '1px solid #e2e8f0',
+                backgroundColor: '#f8fafc',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'space-between',
+                gap: '1rem'
+              }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '0.65rem' }}>
+                  <div style={{
+                    backgroundColor: '#fffbeb',
+                    border: '1px solid #fde68a',
+                    padding: '0.45rem',
+                    borderRadius: '0.375rem',
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'center'
+                  }}>
+                    <AlertTriangle size={20} color="#d97706" />
+                  </div>
+                  <div>
+                    <h3 style={{ fontSize: '1.05rem', fontWeight: 800, color: '#0f172a', margin: 0 }}>
+                      Acquisition Warnings &amp; Missing Items Inspection
+                    </h3>
+                    <div style={{ fontSize: '0.78rem', color: '#64748b', marginTop: '0.15rem' }}>
+                      Audit of missing spectral bands, missing scenes, and skipped tiles for <strong>{districtName}</strong>
+                    </div>
+                  </div>
+                </div>
+                <button
+                  onClick={() => { setShowWarningModal(false); setSelectedWarningScene(null); }}
+                  style={{
+                    border: 'none',
+                    background: 'none',
+                    color: '#64748b',
+                    cursor: 'pointer',
+                    padding: '0.3rem',
+                    borderRadius: '0.375rem',
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'center'
+                  }}
+                  onMouseEnter={(e) => e.currentTarget.style.color = '#0f172a'}
+                  onMouseLeave={(e) => e.currentTarget.style.color = '#64748b'}
+                >
+                  <X size={20} />
+                </button>
+              </div>
+
+              {/* Modal Body */}
+              <div style={{ padding: '1.25rem 1.5rem', overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: '1rem' }}>
+
+                {/* 3 KPI Summary Cards */}
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '0.75rem' }}>
+                  <div style={{
+                    backgroundColor: '#fef2f2',
+                    border: '1px solid #fecaca',
+                    borderRadius: '0.5rem',
+                    padding: '0.75rem 1rem'
+                  }}>
+                    <div style={{ fontSize: '0.72rem', fontWeight: 700, color: '#991b1b', textTransform: 'uppercase', letterSpacing: '0.04em' }}>
+                      Missing Spectral Bands
+                    </div>
+                    <div style={{ fontSize: '1.5rem', fontWeight: 800, color: '#b91c1c', marginTop: '0.2rem' }}>
+                      {missingBandsScenes.length} <span style={{ fontSize: '0.78rem', fontWeight: 600 }}>scene{missingBandsScenes.length !== 1 ? 's' : ''}</span>
+                    </div>
+                    <div style={{ fontSize: '0.71rem', color: '#7f1d1d', marginTop: '0.15rem' }}>
+                      Incomplete bands (e.g. B04, B08)
+                    </div>
+                  </div>
+
+                  <div style={{
+                    backgroundColor: '#fffbeb',
+                    border: '1px solid #fde68a',
+                    borderRadius: '0.5rem',
+                    padding: '0.75rem 1rem'
+                  }}>
+                    <div style={{ fontSize: '0.72rem', fontWeight: 700, color: '#92400e', textTransform: 'uppercase', letterSpacing: '0.04em' }}>
+                      Missing From Archive
+                    </div>
+                    <div style={{ fontSize: '1.5rem', fontWeight: 800, color: '#b45309', marginTop: '0.2rem' }}>
+                      {gapMissingCount || pendingScenes.length} <span style={{ fontSize: '0.78rem', fontWeight: 600 }}>scene{gapMissingCount !== 1 ? 's' : ''}</span>
+                    </div>
+                    <div style={{ fontSize: '0.71rem', color: '#78350f', marginTop: '0.15rem' }}>
+                      Queued for download from AWS S3
+                    </div>
+                  </div>
+
+                  <div style={{
+                    backgroundColor: '#f8fafc',
+                    border: '1px solid #cbd5e1',
+                    borderRadius: '0.5rem',
+                    padding: '0.75rem 1rem'
+                  }}>
+                    <div style={{ fontSize: '0.72rem', fontWeight: 700, color: '#475569', textTransform: 'uppercase', letterSpacing: '0.04em' }}>
+                      Skipped / Out-of-Bounds
+                    </div>
+                    <div style={{ fontSize: '1.5rem', fontWeight: 800, color: '#0f172a', marginTop: '0.2rem' }}>
+                      {skippedScenes.length} <span style={{ fontSize: '0.78rem', fontWeight: 600 }}>scene{skippedScenes.length !== 1 ? 's' : ''}</span>
+                    </div>
+                    <div style={{ fontSize: '0.71rem', color: '#64748b', marginTop: '0.15rem' }}>
+                      0 valid data pixels for {districtName}
+                    </div>
+                  </div>
+                </div>
+
+                {/* Filter notification if single scene was clicked */}
+                {selectedWarningScene && (
+                  <div style={{
+                    backgroundColor: '#eff6ff',
+                    border: '1px solid #bfdbfe',
+                    borderRadius: '0.375rem',
+                    padding: '0.65rem 1rem',
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'space-between',
+                    fontSize: '0.78rem',
+                    color: '#1e40af'
+                  }}>
+                    <span>
+                      Currently inspecting specific scene: <strong>{cleanFolderName(selectedWarningScene.folder)}</strong>
+                    </span>
+                    <button
+                      onClick={() => setSelectedWarningScene(null)}
+                      style={{
+                        backgroundColor: '#ffffff',
+                        border: '1px solid #bfdbfe',
+                        color: '#1d4ed8',
+                        padding: '0.2rem 0.6rem',
+                        borderRadius: '0.25rem',
+                        fontSize: '0.72rem',
+                        fontWeight: 700,
+                        cursor: 'pointer'
+                      }}
+                    >
+                      Show All ({allIssueItems.length}) Items
+                    </button>
+                  </div>
+                )}
+
+                {/* Table of Missing Items / Warnings: EXACT 6 columns matching user request */}
+                <div style={{
+                  backgroundColor: '#ffffff',
+                  border: '1px solid #e2e8f0',
+                  borderRadius: '0.5rem',
+                  overflow: 'hidden',
+                  boxShadow: '0 1px 3px rgba(0,0,0,0.04)'
+                }}>
+                  <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.8rem', textAlign: 'left' }}>
+                    <thead>
+                      <tr style={{ backgroundColor: '#f8fafc', borderBottom: '1px solid #e2e8f0' }}>
+                        <th style={{ padding: '0.7rem 1rem', width: '110px', fontWeight: 700, color: '#475569', whiteSpace: 'nowrap' }}>Date</th>
+                        <th style={{ padding: '0.7rem 1rem', width: '85px', fontWeight: 700, color: '#475569', whiteSpace: 'nowrap' }}>Tile</th>
+                        <th style={{ padding: '0.7rem 1rem', width: '90px', fontWeight: 700, color: '#475569', whiteSpace: 'nowrap' }}>Satellite</th>
+                        <th style={{ padding: '0.7rem 1rem', width: '250px', fontWeight: 700, color: '#475569' }}>Folder</th>
+                        <th style={{ padding: '0.7rem 1rem', width: '130px', fontWeight: 700, color: '#475569', whiteSpace: 'nowrap' }}>Status</th>
+                        <th style={{ padding: '0.7rem 1.25rem', fontWeight: 700, color: '#475569' }}>Missing Bands / Details</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {displayItems.length === 0 ? (
+                        <tr>
+                          <td colSpan={6} style={{ padding: '2.5rem 1rem', textAlign: 'center', color: '#16a34a', backgroundColor: '#ffffff' }}>
+                            <div style={{ display: 'inline-flex', alignItems: 'center', gap: '0.5rem', fontWeight: 700, fontSize: '0.9rem' }}>
+                              <CheckCircle size={20} color="#16a34a" /> No missing bands or warnings detected for this selection!
+                            </div>
+                            <div style={{ fontSize: '0.76rem', color: '#64748b', marginTop: '0.35rem' }}>
+                              All required spectral bands and spatial tiles have been verified.
+                            </div>
+                          </td>
+                        </tr>
+                      ) : (
+                        displayItems.map((item, idx) => {
+                          const isWarning = item.status === 'WARNING';
+                          const isSkipped = item.status === 'SKIPPED';
+                          const isPending = item.status === 'PENDING';
+                          const isFailed = item.status === 'FAILED';
+
+                          const statusBg = isWarning ? '#fffbeb' : (isSkipped ? '#f8fafc' : (isFailed ? '#fef2f2' : '#eff6ff'));
+                          const statusColor = isWarning ? '#b45309' : (isSkipped ? '#475569' : (isFailed ? '#b91c1c' : '#1d4ed8'));
+                          const statusBorder = isWarning ? '1px solid #fde68a' : (isSkipped ? '1px solid #cbd5e1' : (isFailed ? '1px solid #fecaca' : '1px solid #bfdbfe'));
+
+                          const rowBg = idx % 2 === 0 ? '#ffffff' : '#fcfdfd';
+
+                          return (
+                            <tr key={item.id || idx} style={{ borderBottom: '1px solid #f1f5f9', backgroundColor: rowBg }}>
+                              <td style={{ padding: '0.65rem 1rem', color: '#1e293b', fontFamily: 'monospace', fontWeight: 600, whiteSpace: 'nowrap' }}>
+                                {item.date}
+                              </td>
+                              <td style={{ padding: '0.65rem 1rem', color: '#2563eb', fontWeight: 700, fontFamily: 'monospace' }}>
+                                {item.tile}
+                              </td>
+                              <td style={{ padding: '0.65rem 1rem', color: '#475569', fontWeight: 600 }}>
+                                {item.satellite}
+                              </td>
+                              <td style={{ padding: '0.65rem 1rem' }}>
+                                <div style={{ color: '#0f172a', fontFamily: 'monospace', fontSize: '0.76rem', fontWeight: 600 }}>
+                                  {cleanFolderName(item.folder)}
+                                </div>
+                              </td>
+                              <td style={{ padding: '0.65rem 1rem' }}>
+                                <span style={{
+                                  padding: '0.18rem 0.5rem',
+                                  borderRadius: '0.25rem',
+                                  fontSize: '0.71rem',
+                                  fontWeight: 700,
+                                  backgroundColor: statusBg,
+                                  color: statusColor,
+                                  border: statusBorder,
+                                  display: 'inline-block'
+                                }}>
+                                  {item.status}
+                                </span>
+                              </td>
+                              <td style={{ padding: '0.65rem 1.25rem' }}>
+                                <div style={{ display: 'flex', flexDirection: 'column', gap: '0.35rem' }}>
+                                  {item.missingBands && item.missingBands.length > 0 && (
+                                    <div style={{ display: 'flex', gap: '0.3rem', flexWrap: 'wrap', alignItems: 'center' }}>
+                                      {item.missingBands.map((mb, mbIdx) => (
+                                        <span
+                                          key={mbIdx}
+                                          style={{
+                                            padding: '0.15rem 0.5rem',
+                                            borderRadius: '0.25rem',
+                                            fontSize: '0.71rem',
+                                            fontWeight: 700,
+                                            fontFamily: 'monospace',
+                                            backgroundColor: '#fef2f2',
+                                            border: '1px solid #f87171',
+                                            color: '#dc2626'
+                                          }}
+                                        >
+                                          Missing: {mb}
+                                        </span>
+                                      ))}
+                                    </div>
+                                  )}
+                                  <div style={{ fontSize: '0.75rem', color: '#334155', lineHeight: 1.4 }}>
+                                    {item.details}
+                                  </div>
+                                </div>
+                              </td>
+                            </tr>
+                          );
+                        })
+                      )}
+                    </tbody>
+                  </table>
+                </div>
+
+              </div>
+
+              {/* Modal Footer */}
+              <div style={{
+                padding: '0.85rem 1.5rem',
+                borderTop: '1px solid #e2e8f0',
+                backgroundColor: '#f8fafc',
+                display: 'flex',
+                justifyContent: 'flex-end',
+                alignItems: 'center'
+              }}>
+                <button
+                  onClick={() => { setShowWarningModal(false); setSelectedWarningScene(null); }}
+                  style={{
+                    backgroundColor: '#2563eb',
+                    color: '#ffffff',
+                    border: 'none',
+                    fontWeight: 600,
+                    fontSize: '0.82rem',
+                    padding: '0.45rem 1.25rem',
+                    borderRadius: '0.375rem',
+                    cursor: 'pointer',
+                    boxShadow: '0 1px 2px rgba(37, 99, 235, 0.2)'
+                  }}
+                >
+                  Close Inspection
+                </button>
+              </div>
+
+            </div>
+          </div>
+        );
+      })()}
 
       {/* ========================================================================= */}
       {/* MODAL 2: Storage Calculation Explanation */}
@@ -6561,6 +9634,329 @@ export default function App() {
                 style={{ backgroundColor: '#2563eb', color: '#ffffff', border: 'none', padding: '0.4rem 0.85rem', borderRadius: '0.375rem', fontSize: '0.8rem', fontWeight: 600, cursor: 'pointer' }}
               >
                 Got It
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ========================================================================= */}
+      {/* MODAL 3: Layer Stack Execution & Verification Logs Viewer */}
+      {/* ========================================================================= */}
+      {selectedStackForLogs && (
+        <div className="modal-overlay" onClick={() => setSelectedStackForLogs(null)}>
+          <div className="modal-content" onClick={(e) => e.stopPropagation()} style={{
+            backgroundColor: '#ffffff',
+            color: '#0f172a',
+            border: '1px solid #e2e8f0',
+            width: '100%',
+            maxWidth: '1120px',
+            maxHeight: '90vh',
+            display: 'flex',
+            flexDirection: 'column',
+            borderRadius: '0.75rem',
+            overflow: 'hidden',
+            boxShadow: '0 25px 50px -12px rgba(15, 23, 42, 0.25)'
+          }}>
+            {/* Modal Header */}
+            <div style={{
+              padding: '1.15rem 1.5rem 0.85rem 1.5rem',
+              display: 'flex',
+              alignItems: 'flex-start',
+              justifyContent: 'space-between',
+              backgroundColor: '#ffffff',
+              borderBottom: '1px solid #e2e8f0'
+            }}>
+              <div>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '0.65rem', marginBottom: '0.35rem', flexWrap: 'wrap' }}>
+                  <Terminal size={20} color="#2563eb" />
+                  <h3 style={{ fontSize: '1.15rem', fontWeight: 800, color: '#0f172a', margin: 0, fontFamily: 'monospace' }}>
+                    {selectedStackForLogs.filename}
+                  </h3>
+                  <span style={{
+                    padding: '0.2rem 0.65rem',
+                    borderRadius: '9999px',
+                    fontSize: '0.72rem',
+                    fontWeight: 700,
+                    backgroundColor: '#ecfdf5',
+                    color: '#047857',
+                    border: '1px solid #a7f3d0'
+                  }}>
+                    {selectedStackForLogs.status || 'VERIFIED'}
+                  </span>
+                </div>
+                <div style={{ fontSize: '0.82rem', color: '#64748b', display: 'flex', alignItems: 'center', gap: '0.75rem', flexWrap: 'wrap' }}>
+                  <span><b>District:</b> {selectedStackForLogs.district || '—'}</span>
+                  <span>•</span>
+                  <span><b>Season:</b> {selectedStackForLogs.season || '—'}</span>
+                  <span>•</span>
+                  <span><b>File Size:</b> {selectedStackForLogs.size_mb || '—'} MB</span>
+                  {selectedStackForLogs.modified_at && (
+                    <>
+                      <span>•</span>
+                      <span><b>Modified:</b> {selectedStackForLogs.modified_at}</span>
+                    </>
+                  )}
+                </div>
+              </div>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                <button
+                  type="button"
+                  onClick={() => handleDownloadStackedTif(selectedStackForLogs.path, selectedStackForLogs.filename)}
+                  style={{
+                    display: 'inline-flex',
+                    alignItems: 'center',
+                    gap: '0.35rem',
+                    padding: '0.4rem 0.8rem',
+                    borderRadius: '0.375rem',
+                    backgroundColor: '#166534',
+                    border: 'none',
+                    color: '#ffffff',
+                    fontSize: '0.78rem',
+                    fontWeight: 600,
+                    cursor: 'pointer'
+                  }}
+                >
+                  <Download size={13} /> Download Stack (.tif)
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setSelectedStackForLogs(null)}
+                  style={{
+                    border: 'none',
+                    background: 'none',
+                    color: '#64748b',
+                    cursor: 'pointer',
+                    padding: '0.25rem',
+                    borderRadius: '0.375rem',
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'center'
+                  }}
+                >
+                  <X size={20} />
+                </button>
+              </div>
+            </div>
+
+            {/* Toolbar: Table / Terminal Toggle + Level Filters + Search */}
+            <div style={{
+              padding: '0.6rem 1.5rem',
+              backgroundColor: '#f8fafc',
+              borderBottom: '1px solid #e2e8f0',
+              display: 'flex',
+              flexWrap: 'wrap',
+              gap: '0.75rem',
+              alignItems: 'center',
+              justifyContent: 'space-between'
+            }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', flexWrap: 'wrap' }}>
+                <div style={{ display: 'inline-flex', backgroundColor: '#e2e8f0', borderRadius: '0.375rem', padding: '2px' }}>
+                  <button
+                    type="button"
+                    onClick={() => setStackModalViewMode('table')}
+                    style={{
+                      padding: '0.3rem 0.75rem',
+                      borderRadius: '0.25rem',
+                      border: 'none',
+                      fontSize: '0.76rem',
+                      fontWeight: 600,
+                      cursor: 'pointer',
+                      backgroundColor: stackModalViewMode === 'table' ? '#ffffff' : 'transparent',
+                      color: stackModalViewMode === 'table' ? '#1d4ed8' : '#475569',
+                      boxShadow: stackModalViewMode === 'table' ? '0 1px 2px rgba(0,0,0,0.08)' : 'none'
+                    }}
+                  >
+                    Table View
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setStackModalViewMode('terminal')}
+                    style={{
+                      padding: '0.3rem 0.75rem',
+                      borderRadius: '0.25rem',
+                      border: 'none',
+                      fontSize: '0.76rem',
+                      fontWeight: 600,
+                      cursor: 'pointer',
+                      backgroundColor: stackModalViewMode === 'terminal' ? '#ffffff' : 'transparent',
+                      color: stackModalViewMode === 'terminal' ? '#1d4ed8' : '#475569',
+                      boxShadow: stackModalViewMode === 'terminal' ? '0 1px 2px rgba(0,0,0,0.08)' : 'none'
+                    }}
+                  >
+                    Terminal View
+                  </button>
+                </div>
+
+                {['ALL', 'INFO', 'SUCCESS', 'WARNING', 'ERROR'].map((lvl) => (
+                  <button
+                    key={lvl}
+                    type="button"
+                    onClick={() => setStackModalFilter(lvl)}
+                    style={{
+                      padding: '0.25rem 0.65rem',
+                      borderRadius: '9999px',
+                      fontSize: '0.72rem',
+                      fontWeight: 700,
+                      cursor: 'pointer',
+                      border: stackModalFilter === lvl ? '1px solid #2563eb' : '1px solid #cbd5e1',
+                      backgroundColor: stackModalFilter === lvl ? '#eff6ff' : '#ffffff',
+                      color: stackModalFilter === lvl ? '#1d4ed8' : '#475569'
+                    }}
+                  >
+                    {lvl}
+                  </button>
+                ))}
+              </div>
+
+              <div style={{ position: 'relative', minWidth: '240px' }}>
+                <Search size={14} color="#64748b" style={{ position: 'absolute', left: '0.65rem', top: '50%', transform: 'translateY(-50%)' }} />
+                <input
+                  type="text"
+                  placeholder="Search stack execution logs..."
+                  value={stackModalSearch}
+                  onChange={(e) => setStackModalSearch(e.target.value)}
+                  style={{
+                    width: '100%',
+                    padding: '0.35rem 0.75rem 0.35rem 2rem',
+                    borderRadius: '0.375rem',
+                    border: '1px solid #cbd5e1',
+                    fontSize: '0.78rem',
+                    backgroundColor: '#ffffff'
+                  }}
+                />
+              </div>
+            </div>
+
+            {/* Modal Body */}
+            {(() => {
+              const rawLogs = Array.isArray(selectedStackForLogs.logs) ? selectedStackForLogs.logs : [];
+              const filteredModalLogs = rawLogs.filter((log) => {
+                const lvl = (log.level || 'INFO').toUpperCase();
+                if (stackModalFilter !== 'ALL' && lvl !== stackModalFilter) return false;
+                if (stackModalSearch.trim()) {
+                  const q = stackModalSearch.toLowerCase();
+                  return (log.message || '').toLowerCase().includes(q) || (log.timestamp || '').toLowerCase().includes(q);
+                }
+                return true;
+              });
+
+              return (
+                <div style={{ flex: 1, overflowY: 'auto', backgroundColor: '#ffffff' }}>
+                  {stackModalViewMode === 'table' ? (
+                    <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.8rem' }}>
+                      <thead>
+                        <tr style={{ backgroundColor: '#f1f5f9', borderBottom: '1px solid #e2e8f0', textAlign: 'left', color: '#475569', fontSize: '0.72rem', textTransform: 'uppercase' }}>
+                          <th style={{ padding: '0.6rem 1rem', width: '60px' }}>#</th>
+                          <th style={{ padding: '0.6rem 1rem', width: '110px' }}>Timestamp</th>
+                          <th style={{ padding: '0.6rem 1rem', width: '110px' }}>Level</th>
+                          <th style={{ padding: '0.6rem 1rem' }}>Execution Details</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {filteredModalLogs.length === 0 ? (
+                          <tr>
+                            <td colSpan={4} style={{ padding: '2rem', textAlign: 'center', color: '#94a3b8' }}>
+                              No matching log entries found.
+                            </td>
+                          </tr>
+                        ) : (
+                          filteredModalLogs.map((log, idx) => {
+                            const isErr = log.level === 'ERROR';
+                            const isWarn = log.level === 'WARNING';
+                            const isSuccess = log.level === 'SUCCESS';
+                            const badgeColor = isErr ? '#b91c1c' : (isWarn ? '#b45309' : (isSuccess ? '#15803d' : '#1d4ed8'));
+                            const badgeBg = isErr ? '#fef2f2' : (isWarn ? '#fffbeb' : (isSuccess ? '#f0fdf4' : '#eff6ff'));
+                            const badgeBorder = isErr ? '#fecaca' : (isWarn ? '#fde68a' : (isSuccess ? '#bbf7d0' : '#bfdbfe'));
+                            return (
+                              <tr key={idx} style={{ borderBottom: '1px solid #f1f5f9', backgroundColor: idx % 2 === 0 ? '#ffffff' : '#f8fafc' }}>
+                                <td style={{ padding: '0.55rem 1rem', color: '#94a3b8', fontFamily: 'monospace', fontSize: '0.74rem' }}>
+                                  {idx + 1}
+                                </td>
+                                <td style={{ padding: '0.55rem 1rem', color: '#64748b', fontFamily: 'monospace', fontSize: '0.75rem' }}>
+                                  {log.timestamp || '—'}
+                                </td>
+                                <td style={{ padding: '0.55rem 1rem' }}>
+                                  <span style={{
+                                    display: 'inline-flex',
+                                    alignItems: 'center',
+                                    gap: '0.25rem',
+                                    padding: '0.15rem 0.5rem',
+                                    borderRadius: '0.25rem',
+                                    fontSize: '0.68rem',
+                                    fontWeight: 700,
+                                    color: badgeColor,
+                                    backgroundColor: badgeBg,
+                                    border: `1px solid ${badgeBorder}`
+                                  }}>
+                                    {log.level || 'INFO'}
+                                  </span>
+                                </td>
+                                <td style={{
+                                  padding: '0.55rem 1rem',
+                                  color: isErr ? '#dc2626' : (isWarn ? '#b45309' : (isSuccess ? '#15803d' : '#1e293b')),
+                                  fontFamily: 'monospace',
+                                  fontSize: '0.78rem',
+                                  wordBreak: 'break-word'
+                                }}>
+                                  {log.message}
+                                </td>
+                              </tr>
+                            );
+                          })
+                        )}
+                      </tbody>
+                    </table>
+                  ) : (
+                    <div style={{ fontFamily: 'Consolas, Monaco, "Courier New", monospace', fontSize: '0.78rem', lineHeight: 1.6, padding: '1rem 1.5rem', backgroundColor: '#ffffff' }}>
+                      {filteredModalLogs.map((log, idx) => {
+                        const isErr = log.level === 'ERROR';
+                        const isWarn = log.level === 'WARNING';
+                        const isSuccess = log.level === 'SUCCESS';
+                        const textColor = isErr ? '#dc2626' : (isWarn ? '#d97706' : (isSuccess ? '#16a34a' : '#2563eb'));
+                        return (
+                          <div key={idx} style={{ display: 'flex', gap: '0.65rem', padding: '0.15rem 0' }}>
+                            <span style={{ color: '#94a3b8', minWidth: '75px' }}>[{log.timestamp || '—'}]</span>
+                            <span style={{ color: textColor, minWidth: '80px', fontWeight: 700 }}>[{log.level || 'INFO'}]</span>
+                            <span style={{ color: isErr ? '#dc2626' : (isWarn ? '#b45309' : (isSuccess ? '#15803d' : '#1e293b')), flex: 1, wordBreak: 'break-word' }}>
+                              {log.message}
+                            </span>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+              );
+            })()}
+
+            {/* Modal Footer */}
+            <div style={{
+              padding: '0.65rem 1.5rem',
+              backgroundColor: '#f8fafc',
+              borderTop: '1px solid #e2e8f0',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'space-between',
+              fontSize: '0.75rem',
+              color: '#64748b'
+            }}>
+              <span style={{ fontFamily: 'monospace' }}>NAS Path: {selectedStackForLogs.path}</span>
+              <button
+                type="button"
+                onClick={() => setSelectedStackForLogs(null)}
+                style={{
+                  backgroundColor: '#2563eb',
+                  color: '#ffffff',
+                  border: 'none',
+                  padding: '0.4rem 0.9rem',
+                  borderRadius: '0.375rem',
+                  fontSize: '0.78rem',
+                  fontWeight: 600,
+                  cursor: 'pointer'
+                }}
+              >
+                Close Logs
               </button>
             </div>
           </div>

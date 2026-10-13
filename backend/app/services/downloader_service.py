@@ -9,7 +9,7 @@ import time
 import logging
 import xml.etree.ElementTree as ET
 from datetime import datetime
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple
 from concurrent.futures import ThreadPoolExecutor
 import boto3
 import rasterio
@@ -63,33 +63,100 @@ s3_s1_client = boto3.client(
 s3_client = s3_s2_client
 
 
-def resolve_s3_band_path(prefix: str, band_name: str) -> tuple[str, str]:
+import os
+import boto3
+from botocore import UNSIGNED
+from botocore.config import Config
+ 
+# Keep your existing imports and other functions here.
+ 
+ 
+#import os
+ 
+def resolve_s3_band_path(
+    prefix: str,
+    band_name: str
+) -> tuple[str, str]:
     """
-    Resolves the S3 object key and local filename for a band based on S3 bucket structure.
-    Strictly enforces Cloud-Optimized GeoTIFF (.tif/.tiff) format for both satellites.
-    Returns (s3_key, local_filename).
+    Resolve Sentinel-1 IW/SM measurement TIFF paths.
+    Returns (S3 object key, local filename).
     """
-    clean_band = band_name.replace(".tif", "").replace(".tiff", "").replace(".jp2", "").upper()
-
-    # 1. Sentinel-1 GRD SAR Products (GRD/[year]/[month]/[day]/[mode]/[polarization]/...)
-    if prefix.startswith("GRD/") or "s1" in prefix.lower():
-        if "VH" in clean_band:
-            s3_key = f"{prefix.rstrip('/')}/measurement/s1-vh.tiff"
-            return s3_key, "VH.tiff"
-        else:
-            s3_key = f"{prefix.rstrip('/')}/measurement/s1-vv.tiff"
-            return s3_key, "VV.tiff"
-
-    # 2. Sentinel-2 L2A COGs (sentinel-s2-l2a-cogs/[utm]/[lat]/[sq]/[year]/[month]/[folder]/)
-    if clean_band in ("B08A", "B8A"):
-        cog_name = "B8A.tif"
-    elif clean_band in ("TCI", "VISUAL"):
-        cog_name = "TCI.tif"
+ 
+    clean_band = os.path.splitext(
+        os.path.basename(band_name)
+    )[0].upper()
+ 
+    if clean_band not in {"VV", "VH"}:
+        raise ValueError(
+            f"Unsupported Sentinel-1 band: {band_name}"
+        )
+ 
+    prefix_clean = prefix.rstrip("/")
+ 
+    # Select filename according to the S3 product structure.
+    if "/IW/" in f"/{prefix_clean}/":
+        s3_filename = f"iw-{clean_band.lower()}.tiff"
+    elif "/S1/" in f"/{prefix_clean}/":
+        s3_filename = f"s1-{clean_band.lower()}.tiff"
     else:
-        cog_name = f"{clean_band}.tif"
+        raise ValueError(
+            f"Cannot identify Sentinel-1 mode from prefix: {prefix}"
+        )
+ 
+    s3_key = (
+        f"{prefix_clean}/measurement/{s3_filename}"
+    )
+ 
+    return s3_key, f"{clean_band}.tiff"
 
-    s3_key = f"{prefix.rstrip('/')}/{cog_name}"
-    return s3_key, cog_name
+
+_RASTER_BOUNDS_CACHE: Dict[str, Optional[Tuple[float, float, float, float]]] = {}
+
+def is_raster_overlapping_district(file_path: str, district_bbox: Optional[Any]) -> bool:
+    """
+    Validates whether a raster file geographically intersects the target district bounding box in EPSG:4326.
+    Protects against worldwide/out-of-bounds Sentinel-1 scenes being incorrectly mapped to Indian districts.
+    """
+    if not district_bbox or not file_path:
+        return True
+    try:
+        norm_key = str(file_path).strip().lower()
+        if norm_key in _RASTER_BOUNDS_CACHE:
+            bounds = _RASTER_BOUNDS_CACHE[norm_key]
+        else:
+            from rasterio.warp import transform_bounds
+            resolved, exists = resolve_tif_path(file_path)
+            if not exists or not os.path.exists(resolved):
+                _RASTER_BOUNDS_CACHE[norm_key] = None
+                return True
+            with rasterio.open(resolved) as src:
+                if src.crs:
+                    bounds = transform_bounds(src.crs, "EPSG:4326", *src.bounds)
+                elif src.gcps and len(src.gcps[0]) > 0:
+                    gcps_list, gcps_crs = src.gcps
+                    xs = [g.x for g in gcps_list]
+                    ys = [g.y for g in gcps_list]
+                    bounds = transform_bounds(gcps_crs or "EPSG:4326", "EPSG:4326", min(xs), min(ys), max(xs), max(ys))
+                else:
+                    bounds = None
+            _RASTER_BOUNDS_CACHE[norm_key] = bounds
+
+        if not bounds:
+            return True
+
+        b_minx, b_miny, b_maxx, b_maxy = bounds
+        # India bounds sanity check: Lon 65-100, Lat 5-40
+        if b_maxx < 65.0 or b_minx > 100.0 or b_maxy < 5.0 or b_miny > 40.0:
+            return False
+
+        d_minx, d_miny, d_maxx, d_maxy = district_bbox
+        buf = 0.25  # 0.25 degree (~25km buffer for swath overlap)
+        if b_maxx < (d_minx - buf) or b_minx > (d_maxx + buf) or b_maxy < (d_miny - buf) or b_miny > (d_maxy + buf):
+            return False
+        return True
+    except Exception as e:
+        logger.debug(f"Could not check raster bounds for {file_path}: {e}")
+        return True
 
 
 def ensure_nas_connection(path: str) -> bool:
@@ -217,7 +284,6 @@ def safe_move_file(src: str, dst: str, max_retries: int = 5, delay: float = 0.5)
                     logger.info(f"Cleaned up local staging file '{src}' due to unavailable NAS destination.")
                 except Exception:
                     pass
-            prune_empty_parent_dirs(src, stop_at=getattr(settings, "STAGING_DIR", None))
             err_msg = f"[NAS_ERROR] Cannot move file: NAS path '{dst}' is unreachable or disconnected. File removed from local staging; local storage is prohibited."
             logger.error(err_msg)
             raise RuntimeError(err_msg)
@@ -235,7 +301,6 @@ def safe_move_file(src: str, dst: str, max_retries: int = 5, delay: float = 0.5)
                         os.remove(src)
                     except Exception:
                         pass
-                prune_empty_parent_dirs(src, stop_at=getattr(settings, "STAGING_DIR", None))
                 err_msg = f"[NAS_ERROR] Failed creating directory on NAS '{os.path.dirname(dst)}': {mk_err2}. Staged file deleted; local storage prohibited."
                 logger.error(err_msg)
                 raise RuntimeError(err_msg)
@@ -253,8 +318,6 @@ def safe_move_file(src: str, dst: str, max_retries: int = 5, delay: float = 0.5)
                 os.remove(src)
             except Exception:
                 pass
-            # Prune empty parent directories inside local staging
-            prune_empty_parent_dirs(src, stop_at=getattr(settings, "STAGING_DIR", None))
             return True
         except Exception as e:
             last_error = e
@@ -273,7 +336,6 @@ def safe_move_file(src: str, dst: str, max_retries: int = 5, delay: float = 0.5)
             logger.info(f"Deleted local staging file '{src}' after {max_retries} failed NAS transfer attempts.")
         except Exception:
             pass
-    prune_empty_parent_dirs(src, stop_at=getattr(settings, "STAGING_DIR", None))
     err_msg = f"[NAS_ERROR] Could not transfer file to NAS '{dst}' after {max_retries} attempts: {last_error}. Download discarded; not stored in local directory."
     logger.error(err_msg)
     raise RuntimeError(err_msg)
@@ -321,6 +383,9 @@ def fetch_s3_object(key: str, target_path: str, bucket: str = None, client: boto
                 s3_meta = client.head_object(Bucket=bucket, Key=active_key)
                 expected_size = s3_meta.get("ContentLength", 0)
 
+                # Ensure parent dir still exists (safeguard against race conditions)
+                os.makedirs(os.path.dirname(temp_path), exist_ok=True)
+
                 # 2. Download raster to temporary .part file
                 client.download_file(bucket, active_key, temp_path)
                 downloaded_size = os.path.getsize(temp_path)
@@ -329,12 +394,20 @@ def fetch_s3_object(key: str, target_path: str, bucket: str = None, client: boto
                 if expected_size > 0 and downloaded_size != expected_size:
                     raise ValueError(f"Byte mismatch for {active_key}: AWS S3 size = {expected_size}, Local size = {downloaded_size}")
 
-                # 4. Atomic swap upon verified download
-                safe_move_file(temp_path, target_path)
+                # 4. Atomic local swap upon verified download
+                if os.path.exists(target_path):
+                    try:
+                        os.remove(target_path)
+                    except Exception:
+                        pass
+                os.replace(temp_path, target_path)
                 return True
             except Exception as error:
                 if os.path.exists(temp_path):
-                    os.remove(temp_path)
+                    try:
+                        os.remove(temp_path)
+                    except Exception:
+                        pass
                 if attempt == MAX_ATTEMPTS:
                     logger.debug(f"Candidate {active_key} on {bucket} failed: {error}")
                     break
@@ -586,6 +659,478 @@ def parse_s1_manifest_xml(xml_content: str) -> dict:
     return parsed
 
 
+def download_complete_s1_scene(
+    db: Session,
+    scene: SceneModel,
+    scene_archive_dir: str,
+    staging_dir: str,
+    user_id: int = None,
+    request_id: int = None
+) -> tuple[bool, list[dict], str]:
+    """
+    Downloads the complete Sentinel-1 (S1_SAR) product structure from AWS S3 (sentinel-s1-l1c)
+    and stores it completely on NAS storage, matching the ESA SAFE directory hierarchy:
+        <scene_dir>/
+            annotation/
+                calibration/
+                    calibration-iw-vh.xml, calibration-iw-vv.xml
+                    noise-iw-vh.xml, noise-iw-vv.xml
+                rfi/
+                    rfi-iw-vh.xml, rfi-iw-vv.xml
+                iw-vh.xml, iw-vv.xml
+            measurement/
+                iw-vh.tiff, iw-vv.tiff (or s1-vh.tiff, s1-vv.tiff)
+            preview/
+                icons/logo.png, map-overlay.kml, product-preview.html, quick-look.png, thumbnail.png
+            support/
+                s1-level-1-calibration.xsd, s1-level-1-measurement.xsd, etc.
+            manifest.safe
+            productInfo.json
+            report-*.pdf
+    """
+    folder = scene.folder or scene.scene_id
+    tile = scene.tile
+    sensing_date = scene.sensing_date
+    prefix = scene.prefix or ""
+    prefix_clean = prefix.strip().lstrip("/").rstrip("/") + "/"
+
+    # 1. Connect to NAS
+    if scene_archive_dir.startswith("\\\\") or ":" in scene_archive_dir:
+        if not ensure_nas_connection(scene_archive_dir):
+            nas_err = (
+                f"[NAS_ERROR] NAS path '{scene_archive_dir}' is unreachable or disconnected. "
+                "Sentinel-1 complete product download cancelled; local storage fallback is strictly prohibited."
+            )
+            logger.error(nas_err)
+            return False, [], nas_err
+
+    try:
+        os.makedirs(scene_archive_dir, exist_ok=True)
+    except Exception as mk_err:
+        nas_err = f"[STORAGE_ERROR] Cannot create Sentinel-1 archive directory '{scene_archive_dir}': {mk_err}."
+        logger.error(nas_err)
+        return False, [], nas_err
+
+    # 2. List all objects under the S3 prefix in sentinel-s1-l1c
+    paginator = s3_s1_client.get_paginator("list_objects_v2")
+    s3_items = []
+    try:
+        for page in paginator.paginate(Bucket=S1_BUCKET, Prefix=prefix_clean):
+            for item in page.get("Contents", []):
+                k = item["Key"]
+                if k != prefix_clean and not k.endswith("/"):
+                    s3_items.append(item)
+    except Exception as e:
+        err_msg = f"Failed listing S3 objects for Sentinel-1 scene '{scene.scene_id}' at '{prefix_clean}': {e}"
+        logger.error(err_msg)
+        return False, [], err_msg
+
+    if not s3_items:
+        err_msg = f"No objects found on S3 for Sentinel-1 scene '{scene.scene_id}' at prefix '{prefix_clean}'"
+        logger.error(err_msg)
+        return False, [], err_msg
+
+    # 3. Fast Deduplication / Cache check on NAS
+    meta_record = db.query(Sentinel1SceneMetadataModel).filter(
+        Sentinel1SceneMetadataModel.scene_path == scene.prefix
+    ).first()
+
+    meas_items = [it for it in s3_items if "measurement/" in it["Key"] and it["Key"].lower().endswith((".tif", ".tiff"))]
+    all_cached = True
+    cached_details = []
+
+    for item in s3_items:
+        rel = item["Key"][len(prefix_clean):]
+        t_path = os.path.join(scene_archive_dir, rel)
+        if not os.path.exists(t_path):
+            all_cached = False
+            break
+        if rel.lower().endswith((".tif", ".tiff")):
+            ok, sz, _ = verify_raster(t_path)
+            if not ok:
+                all_cached = False
+                break
+            b_clean = os.path.splitext(os.path.basename(rel))[0].upper()
+            b_name = "VV" if ("VV" in b_clean and "VH" not in b_clean) else ("VH" if ("VH" in b_clean and "VV" not in b_clean) else b_clean)
+            cached_details.append({
+                "band": b_name,
+                "filename": os.path.basename(rel),
+                "rel_path": rel,
+                "ok": True,
+                "size_bytes": sz,
+                "status": "cached",
+                "path": t_path
+            })
+        else:
+            exp_sz = item.get("Size", 0)
+            if exp_sz > 0 and os.path.getsize(t_path) != exp_sz:
+                all_cached = False
+                break
+
+    manifest_target = os.path.join(scene_archive_dir, "manifest.safe")
+    if not (os.path.exists(manifest_target) and os.path.getsize(manifest_target) > 0):
+        all_cached = False
+
+    is_already_held = (scene.status == "HELD") or (meta_record and meta_record.download_status == "DOWNLOADED")
+    if all_cached and is_already_held:
+        dl_time_str = "previously"
+        if meta_record and meta_record.downloaded_at:
+            dl_time_str = meta_record.downloaded_at.strftime("%Y-%m-%d %H:%M:%S UTC")
+        elif scene.held_at:
+            dl_time_str = scene.held_at.strftime("%Y-%m-%d %H:%M:%S UTC")
+
+        total_mb = sum(it.get("Size", 0) for it in s3_items) / (1024 * 1024)
+        log_msg = (
+            f"[ALREADY DOWNLOADED - SKIPPED] Scene '{scene.scene_id}' (Sentinel-1 complete product) "
+            f"was downloaded on {dl_time_str}. Local path: '{scene_archive_dir}' "
+            f"({len(s3_items)} files verified on NAS, {total_mb:.1f} MB). Skipping download."
+        )
+        logger.info(log_msg)
+        return True, cached_details, log_msg
+
+    # 4. Download Complete S3 Product Hierarchy
+    total_bytes = sum(it.get("Size", 0) for it in s3_items)
+    total_mb = total_bytes / (1024 * 1024)
+    start_msg = (
+        f"  ↳ Downloading COMPLETE Sentinel-1 product for '{scene.scene_id}': "
+        f"{len(s3_items)} files ({total_mb:.1f} MB) across annotation/, measurement/, preview/, support/..."
+    )
+    logger.info(start_msg)
+    if request_id:
+        try:
+            from scripts.download_district_tiles import append_request_log
+            append_request_log(db, request_id, start_msg)
+        except Exception:
+            pass
+
+    def download_s1_file(item):
+        try:
+            k = item["Key"]
+            rel = k[len(prefix_clean):].replace("\\", "/")
+            rel_parts = [p for p in rel.split("/") if p]
+            t_path = os.path.join(scene_archive_dir, *rel_parts)
+            s_path = os.path.join(staging_dir, folder, *rel_parts)
+            exp_sz = item.get("Size", 0)
+
+            # Skip if already exists and valid on NAS
+            if os.path.exists(t_path):
+                if rel.lower().endswith((".tif", ".tiff")):
+                    v_ok, sz, _ = verify_raster(t_path)
+                    if v_ok and (exp_sz == 0 or sz == exp_sz):
+                        return rel, True, sz, "cached", t_path
+                else:
+                    sz = os.path.getsize(t_path)
+                    if exp_sz == 0 or sz == exp_sz:
+                        return rel, True, sz, "cached", t_path
+
+            # If measurement raster is missing in measurement/ but already exists at scene root, reuse it
+            if not os.path.exists(t_path) and "measurement/" in rel and rel.lower().endswith((".tif", ".tiff")):
+                b_clean = os.path.splitext(os.path.basename(rel))[0].upper()
+                cand_root = None
+                if "VV" in b_clean and "VH" not in b_clean:
+                    for c_name in ("VV.tiff", "VV.tif", "s1-vv.tiff", "iw-vv.tiff"):
+                        cp = os.path.join(scene_archive_dir, c_name)
+                        if os.path.isfile(cp):
+                            cand_root = cp
+                            break
+                elif "VH" in b_clean and "VV" not in b_clean:
+                    for c_name in ("VH.tiff", "VH.tif", "s1-vh.tiff", "iw-vh.tiff"):
+                        cp = os.path.join(scene_archive_dir, c_name)
+                        if os.path.isfile(cp):
+                            cand_root = cp
+                            break
+                if cand_root and os.path.isfile(cand_root):
+                    v_ok, c_sz, _ = verify_raster(cand_root)
+                    if v_ok and (exp_sz == 0 or c_sz == exp_sz or abs(c_sz - exp_sz) < 4096):
+                        os.makedirs(os.path.dirname(t_path), exist_ok=True)
+                        try:
+                            os.link(cand_root, t_path)
+                        except Exception:
+                            try:
+                                shutil.copy2(cand_root, t_path)
+                            except Exception:
+                                pass
+                        if os.path.isfile(t_path):
+                            return rel, True, os.path.getsize(t_path), "cached", t_path
+
+            # Download to local staging directory
+            os.makedirs(os.path.dirname(s_path), exist_ok=True)
+            if not fetch_s3_object(k, s_path, bucket=S1_BUCKET, client=s3_s1_client):
+                if os.path.exists(s_path):
+                    try:
+                        os.remove(s_path)
+                    except Exception:
+                        pass
+                return rel, False, 0, "download failed from S3", t_path
+
+            # Verify integrity
+            if rel.lower().endswith((".tif", ".tiff")):
+                v_ok, sz, note = verify_raster(s_path)
+                if not v_ok:
+                    if os.path.exists(s_path):
+                        try:
+                            os.remove(s_path)
+                        except Exception:
+                            pass
+                    return rel, False, sz, f"raster verify failed ({note})", t_path
+            else:
+                sz = os.path.getsize(s_path)
+                if exp_sz > 0 and sz != exp_sz:
+                    if os.path.exists(s_path):
+                        try:
+                            os.remove(s_path)
+                        except Exception:
+                            pass
+                    return rel, False, sz, f"size mismatch ({sz} != {exp_sz})", t_path
+
+            # Move atomically from staging to NAS
+            os.makedirs(os.path.dirname(t_path), exist_ok=True)
+            if not safe_move_file(s_path, t_path):
+                return rel, False, sz, "failed moving to NAS", t_path
+
+            # Remove staging file after successful transfer (without touching parent directories)
+            if os.path.exists(s_path):
+                try:
+                    os.remove(s_path)
+                except Exception:
+                    pass
+
+            # Log individual band completion
+            if rel.lower().endswith((".tif", ".tiff")) and request_id:
+                try:
+                    from scripts.download_district_tiles import append_request_log
+                    sz_mb = sz / (1024 * 1024)
+                    append_request_log(db, request_id, f"     ↳ Band '{rel}' ({sz_mb:.1f} MB) downloaded & verified on NAS.")
+                except Exception:
+                    pass
+
+            return rel, True, sz, "ok", t_path
+        except Exception as err:
+            logger.error(f"Error downloading Sentinel-1 file {item.get('Key')}: {err}")
+            return item.get("Key", "unknown"), False, 0, str(err), ""
+
+    # Concurrently download all files
+    with ThreadPoolExecutor(max_workers=BAND_WORKERS) as pool:
+        results = list(pool.map(download_s1_file, s3_items))
+
+    failed_items = [r for r in results if not r[1]]
+    if failed_items:
+        fail_rels = [f[0] for f in failed_items]
+        err_msg = f"Incomplete Sentinel-1 product for '{scene.scene_id}'. Failed files: {fail_rels}"
+        logger.warning(err_msg)
+        return False, [], err_msg
+
+    # 5. Create convenience root links (VV.tiff, VH.tiff) for backward compatibility
+    for rel, ok, sz, note, t_path in results:
+        if "measurement/" in rel and rel.lower().endswith((".tif", ".tiff")):
+            b_clean = os.path.splitext(os.path.basename(rel))[0].upper()
+            std_name = None
+            if "VV" in b_clean and "VH" not in b_clean:
+                std_name = "VV.tiff"
+            elif "VH" in b_clean and "VV" not in b_clean:
+                std_name = "VH.tiff"
+            if std_name:
+                link_path = os.path.join(scene_archive_dir, std_name)
+                if not os.path.exists(link_path):
+                    try:
+                        os.link(t_path, link_path)
+                    except Exception:
+                        try:
+                            shutil.copy2(t_path, link_path)
+                        except Exception:
+                            pass
+
+    # 6. Record measurement band files in BandFileModel
+    now = datetime.utcnow()
+    band_details = []
+    for rel, ok, sz, note, t_path in results:
+        if "measurement/" in rel and rel.lower().endswith((".tif", ".tiff")):
+            b_clean = os.path.splitext(os.path.basename(rel))[0].upper()
+            b_name = "VV" if ("VV" in b_clean and "VH" not in b_clean) else ("VH" if ("VH" in b_clean and "VV" not in b_clean) else b_clean)
+            band_details.append({
+                "band": b_name,
+                "filename": os.path.basename(rel),
+                "rel_path": rel,
+                "ok": True,
+                "size_bytes": sz,
+                "status": "ok",
+                "path": t_path
+            })
+
+            # Sync primary band name (VV / VH)
+            existing_bf = db.query(BandFileModel).filter(
+                BandFileModel.scene_id == scene.scene_id,
+                BandFileModel.band == b_name
+            ).first()
+            if existing_bf:
+                existing_bf.path = t_path
+                existing_bf.size_bytes = sz
+                existing_bf.verified = 1
+                existing_bf.downloaded_at = now
+            else:
+                db.add(BandFileModel(
+                    scene_id=scene.scene_id,
+                    tile=tile,
+                    sensing_date=sensing_date,
+                    satellite=scene.satellite or "Sentinel-1",
+                    band=b_name,
+                    path=t_path,
+                    size_bytes=sz,
+                    verified=1,
+                    downloaded_at=now
+                ))
+
+            # Also register the exact filename (e.g. iw-vv.tiff) for direct path lookups
+            orig_fname = os.path.basename(rel)
+            if orig_fname != b_name:
+                existing_fn = db.query(BandFileModel).filter(
+                    BandFileModel.scene_id == scene.scene_id,
+                    BandFileModel.band == orig_fname
+                ).first()
+                if existing_fn:
+                    existing_fn.path = t_path
+                    existing_fn.size_bytes = sz
+                    existing_fn.verified = 1
+                    existing_fn.downloaded_at = now
+                else:
+                    db.add(BandFileModel(
+                        scene_id=scene.scene_id,
+                        tile=tile,
+                        sensing_date=sensing_date,
+                        satellite=scene.satellite or "Sentinel-1",
+                        band=orig_fname,
+                        path=t_path,
+                        size_bytes=sz,
+                        verified=1,
+                        downloaded_at=now
+                    ))
+
+    # 7. Parse metadata from local manifest.safe and productInfo.json into Sentinel1SceneMetadataModel
+    raw_xml_text = None
+    parsed_xml_data = {}
+    tileinfo_data = {}
+
+    local_manifest = os.path.join(scene_archive_dir, "manifest.safe")
+    if os.path.exists(local_manifest):
+        try:
+            with open(local_manifest, "r", encoding="utf-8", errors="ignore") as f:
+                raw_xml_text = f.read()
+            parsed_xml_data = parse_s1_manifest_xml(raw_xml_text)
+        except Exception as e:
+            logger.warning(f"Failed parsing local manifest.safe: {e}")
+
+    local_prod_json = os.path.join(scene_archive_dir, "productInfo.json")
+    if os.path.exists(local_prod_json):
+        try:
+            with open(local_prod_json, "r", encoding="utf-8", errors="ignore") as f:
+                tileinfo_data = json.load(f)
+        except Exception as e:
+            logger.warning(f"Failed parsing local productInfo.json: {e}")
+
+    combined_s1_metadata = {
+        "manifest": parsed_xml_data,
+        "productInfo": tileinfo_data,
+        "total_files_downloaded": len(s3_items),
+        "total_size_mb": round(total_mb, 2),
+        "directory_structure": {
+            "annotation": os.path.exists(os.path.join(scene_archive_dir, "annotation")),
+            "measurement": os.path.exists(os.path.join(scene_archive_dir, "measurement")),
+            "preview": os.path.exists(os.path.join(scene_archive_dir, "preview")),
+            "support": os.path.exists(os.path.join(scene_archive_dir, "support")),
+        }
+    }
+
+    try:
+        yr = int(sensing_date[0:4])
+        mo = int(sensing_date[5:7])
+        dy = int(sensing_date[8:10])
+    except Exception:
+        yr, mo, dy = 2026, 1, 1
+
+    s1_mode = parsed_xml_data.get("instrument_mode") or "IW"
+    s1_pol = parsed_xml_data.get("polarisation") or "DV"
+    s1_prod = parsed_xml_data.get("product_type") or "GRD"
+    s1_mission = parsed_xml_data.get("mission") or "S1"
+    s1_pols = parsed_xml_data.get("polarisation_channels") or ["VV", "VH"]
+    s1_direction = parsed_xml_data.get("orbit_direction") or tileinfo_data.get("direction")
+    s1_rel_orb = parsed_xml_data.get("relative_orbit") or tileinfo_data.get("relativeOrbitNumber")
+    s1_abs_orb = parsed_xml_data.get("absolute_orbit") or tileinfo_data.get("orbitNumber")
+    s1_slice = parsed_xml_data.get("slice_number")
+    s1_start = parsed_xml_data.get("start_time")
+    s1_stop = parsed_xml_data.get("stop_time")
+    s1_footprint = tileinfo_data.get("footprint") or parsed_xml_data.get("footprint_geojson")
+
+    s1_meta_rec = db.query(Sentinel1SceneMetadataModel).filter(
+        Sentinel1SceneMetadataModel.scene_path == prefix
+    ).first()
+
+    if not s1_meta_rec:
+        s1_meta_rec = Sentinel1SceneMetadataModel(
+            year=yr,
+            month=mo,
+            day=dy,
+            mode=s1_mode,
+            polarization=s1_pol,
+            product_name=s1_prod,
+            scene_path=prefix,
+            satellite_mission=s1_mission,
+            polarization_channels=str(s1_pols),
+            orbit_direction=s1_direction,
+            relative_orbit=s1_rel_orb,
+            absolute_orbit=s1_abs_orb,
+            slice_number=s1_slice,
+            sensing_date=sensing_date,
+            start_time=s1_start,
+            stop_time=s1_stop,
+            footprint_geojson=s1_footprint,
+            epsg_code="EPSG:4326",
+            download_status="DOWNLOADED",
+            downloaded_at=now,
+            downloaded_by_user_id=user_id,
+            archive_path=scene_archive_dir,
+            raw_manifest_xml=raw_xml_text,
+            parsed_metadata=combined_s1_metadata
+        )
+        db.add(s1_meta_rec)
+    else:
+        s1_meta_rec.download_status = "DOWNLOADED"
+        s1_meta_rec.downloaded_at = now
+        if user_id:
+            s1_meta_rec.downloaded_by_user_id = user_id
+        s1_meta_rec.archive_path = scene_archive_dir
+        if raw_xml_text:
+            s1_meta_rec.raw_manifest_xml = raw_xml_text
+        s1_meta_rec.parsed_metadata = combined_s1_metadata
+
+    scene.status = "HELD"
+    scene.archive_path = scene_archive_dir
+    scene.held_at = now
+    db.commit()
+
+    # Clean up temporary staging scene directory
+    try:
+        staged_scene_folder = os.path.join(staging_dir, folder)
+        if os.path.exists(staged_scene_folder):
+            shutil.rmtree(staged_scene_folder, ignore_errors=True)
+        prune_empty_dirs(staging_dir)
+    except Exception:
+        pass
+
+    complete_msg = (
+        f"✓ [SENTINEL-1 COMPLETE PRODUCT DOWNLOADED] Scene '{scene.scene_id}' "
+        f"({len(s3_items)} files, {total_mb:.1f} MB) saved to NAS in '{scene_archive_dir}' "
+        f"with complete annotation/, measurement/, preview/, support/ folders and metadata."
+    )
+    logger.info(complete_msg)
+    if request_id:
+        try:
+            from scripts.download_district_tiles import append_request_log
+            append_request_log(db, request_id, complete_msg)
+        except Exception:
+            pass
+
+    return True, band_details, complete_msg
+
 
 def download_and_verify_scene(
     db: Session,
@@ -599,15 +1144,18 @@ def download_and_verify_scene(
     Deduplication: verifies from DB and disk before attempting S3 download.
     If already downloaded by any user, skips download and reports previous details in logs.
     Stores metadata.xml both completely and as parsed JSON in tile_scene_metadata table.
+    For Sentinel-1 SAR scenes, downloads the complete product hierarchy from S3 to NAS.
     """
-    if bands is None:
-        bands = ["VV", "VH"] if (scene.satellite and "sentinel-1" in scene.satellite.lower()) else DEFAULT_BANDS
-
     tile = scene.tile
     sensing_date = scene.sensing_date
-    satellite = scene.satellite
+    satellite = scene.satellite or ""
     folder = scene.folder
-    prefix = scene.prefix
+    prefix = scene.prefix or ""
+
+    is_s1 = prefix.startswith("GRD/") or ("sentinel-1" in satellite.lower()) or (scene.satellite and "sentinel-1" in scene.satellite.lower())
+
+    if bands is None:
+        bands = ["VV", "VH"] if is_s1 else DEFAULT_BANDS
 
     year = sensing_date[0:4]
     month = str(int(sensing_date[5:7]))
@@ -615,7 +1163,13 @@ def download_and_verify_scene(
     staging_dir = settings.STAGING_DIR
     archive_dir = settings.RAW_ARCHIVE_DIR
 
-    scene_archive_dir = os.path.join(archive_dir, tile, year, month, folder)
+    sat_subfolder = "Sentinel-1" if is_s1 else "Sentinel-2"
+    scene_archive_dir = os.path.join(archive_dir, sat_subfolder, tile, year, month, folder)
+    if not os.path.exists(scene_archive_dir):
+        legacy = os.path.join(archive_dir, tile, year, month, folder)
+        if os.path.exists(legacy):
+            scene_archive_dir = legacy
+
     if scene_archive_dir.startswith("\\\\") or ":" in scene_archive_dir:
         if not ensure_nas_connection(scene_archive_dir):
             nas_err = (
@@ -645,17 +1199,24 @@ def download_and_verify_scene(
             return False, [], nas_err
 
     # ─────────────────────────────────────────────────────────────
-    # STEP 0: DB Deduplication Check before downloading
+    # SENTINEL-1: Complete Product Download Routing
     # ─────────────────────────────────────────────────────────────
-    is_s1 = prefix.startswith("GRD/") or (satellite and "sentinel-1" in satellite.lower()) or (scene.satellite and "sentinel-1" in scene.satellite.lower())
     if is_s1:
-        meta_record = db.query(Sentinel1SceneMetadataModel).filter(
-            Sentinel1SceneMetadataModel.scene_path == prefix
-        ).first()
-    else:
-        meta_record = db.query(TileSceneMetadataModel).filter(
-            TileSceneMetadataModel.tile_path == prefix
-        ).first()
+        return download_complete_s1_scene(
+            db=db,
+            scene=scene,
+            scene_archive_dir=scene_archive_dir,
+            staging_dir=staging_dir,
+            user_id=user_id,
+            request_id=request_id
+        )
+
+    # ─────────────────────────────────────────────────────────────
+    # SENTINEL-2: Deduplication Check & Band Acquisition
+    # ─────────────────────────────────────────────────────────────
+    meta_record = db.query(TileSceneMetadataModel).filter(
+        TileSceneMetadataModel.tile_path == prefix
+    ).first()
 
     # Check if files already exist on disk and verify them
     all_bands_cached = True
@@ -1129,14 +1690,24 @@ def get_downloaded_tifs_for_request(db: Session, request_id: int) -> dict:
         ).distinct().all()
     ]
 
-    # 2. Resolve mapped tiles for district/state to catch all cached scenes in the date window
+    # 1b. Fallback: extract any scene IDs recorded in the execution logs for this request
+    # only if no process job records are found
+    scene_ids_from_logs = set()
+    if not scene_ids_from_jobs and req.execution_logs:
+        import re
+        for m in re.finditer(r"Scene\s+'([A-Za-z0-9_]+)'", req.execution_logs):
+            scene_ids_from_logs.add(m.group(1))
+
+    matched_scene_ids = set(scene_ids_from_jobs) if scene_ids_from_jobs else scene_ids_from_logs
+
+    # 2. Resolve mapped tiles for district/state
     tiles = []
     if req.district:
         rows = db.execute(
             text("SELECT DISTINCT tile_id FROM district_tiles_mapping WHERE LOWER(district_name) = LOWER(:d)"),
             {"d": req.district}
         ).fetchall()
-        tiles = [r[0] for r in rows]
+        tiles = [r[0] for r in rows if r[0] != "S1_SAR"]
     elif req.state:
         rows = db.execute(
             text("""
@@ -1147,24 +1718,43 @@ def get_downloaded_tifs_for_request(db: Session, request_id: int) -> dict:
             """),
             {"s": req.state}
         ).fetchall()
-        tiles = [r[0] for r in rows]
+        tiles = [r[0] for r in rows if r[0] != "S1_SAR"]
 
     start_str = req.start_date.strftime("%Y-%m-%d")
     end_str = req.end_date.strftime("%Y-%m-%d")
 
-    if req.satellite and "Sentinel-1" in req.satellite and "S1_SAR" not in tiles:
-        tiles.append("S1_SAR")
-
-    matched_scene_ids = set(scene_ids_from_jobs)
+    # If request has not run yet (matched_scene_ids is empty), populate from spatial tiles within cloud threshold
     if not matched_scene_ids and tiles:
+        max_cld = float(req.max_cloud_cover) if req.max_cloud_cover is not None else 100.0
         spatial_scenes = db.query(SceneModel.scene_id).filter(
             SceneModel.tile.in_(tiles),
             SceneModel.sensing_date >= start_str,
             SceneModel.sensing_date <= end_str,
+            SceneModel.cloud_cover_percentage <= max_cld,
             SceneModel.status == "HELD"
         ).all()
         for s in spatial_scenes:
             matched_scene_ids.add(s[0])
+
+    # For Sentinel-1: ONLY include scenes if they are linked to this request in jobs/logs,
+    # OR if this is an unrun request, discover genuinely intersecting S1 scenes via spatial bounding box.
+    # NEVER do a blanket query on tile == 'S1_SAR' across all of India!
+    has_s1_request = bool((req.satellite and "Sentinel-1" in req.satellite) or (req.bands and any(b in ("VV", "VH", "VV_VH", "VV.tiff", "VH.tiff") for b in req.bands)))
+    s1_matched = [s for s in matched_scene_ids if s.startswith("S1")]
+    if has_s1_request and not s1_matched and not req.execution_logs:
+        try:
+            from app.services.gap_check_service import search_aws_scenes_for_s1
+            s1_candidates = search_aws_scenes_for_s1(
+                start_date=start_str,
+                end_date=end_str,
+                district_name=req.district,
+                state_name=req.state,
+                db=db
+            )
+            for sc in s1_candidates:
+                matched_scene_ids.add(sc["scene_id"])
+        except Exception as e:
+            logger.warning(f"Could not discover S1 candidate scenes for request #{request_id}: {e}")
 
     if not matched_scene_ids:
         return {
@@ -1190,29 +1780,139 @@ def get_downloaded_tifs_for_request(db: Session, request_id: int) -> dict:
         BandFileModel.verified == 1
     ).order_by(BandFileModel.tile, BandFileModel.sensing_date, BandFileModel.band).all()
 
+    # Pre-fetch district bounding box to safeguard against out-of-bounds Sentinel-1 scenes
+    d_bbox = None
+    if req.district:
+        try:
+            from app.services.delivery_service import get_district_geometry_from_db
+            from shapely.geometry import shape
+            geom, _ = get_district_geometry_from_db(db, req.district, state_name=req.state)
+            if geom:
+                d_bbox = shape(geom).bounds
+        except Exception:
+            pass
+
     tif_files = []
     tif_paths = []
     total_size = 0
+    scenes_indexed = set()
 
     for bf in band_records:
         raw_p = bf.path
         if not (raw_p.lower().endswith(".tif") or raw_p.lower().endswith(".tiff")):
             continue
-        path, exists = resolve_tif_path(raw_p)
-        actual_size = os.path.getsize(path) if exists else bf.size_bytes
-        total_size += actual_size
 
-        tif_paths.append(path)
+        # Enforce spatial validation for Sentinel-1 rasters so out-of-bounds scenes from other continents/regions are omitted
+        is_s1_band = (bf.tile == "S1_SAR" or bf.satellite == "Sentinel-1" or (bf.scene_id and bf.scene_id.startswith("S1")))
+        if d_bbox and is_s1_band:
+            if not is_raster_overlapping_district(raw_p, d_bbox):
+                continue
+
+        f_size = bf.size_bytes or 0
+        total_size += f_size
+
+        tif_paths.append(raw_p)
+        scenes_indexed.add(bf.scene_id)
         tif_files.append({
             "scene_id": bf.scene_id,
             "tile": bf.tile,
             "sensing_date": bf.sensing_date,
             "satellite": bf.satellite,
             "band": bf.band,
-            "path": path,
-            "size_bytes": actual_size,
-            "exists_on_disk": exists
+            "path": raw_p,
+            "size_bytes": f_size,
+            "exists_on_disk": True
         })
+
+    # 3b. Check if any matched scenes exist on NAS storage but have missing records in BandFileModel
+    unindexed_scenes = matched_scene_ids - scenes_indexed
+    if unindexed_scenes:
+        import re
+        for sc_id in unindexed_scenes:
+            sc_obj = db.query(SceneModel).filter(SceneModel.scene_id == sc_id).first()
+            arch_p = sc_obj.archive_path if sc_obj else None
+            if not arch_p and req.execution_logs:
+                m = re.search(rf"Scene '{sc_id}'[^\n]*cached at '([^']+)'", req.execution_logs)
+                if not m:
+                    m = re.search(rf"'{sc_id}'[^\n]*already on NAS at '([^']+)'", req.execution_logs)
+                if m:
+                    arch_p = m.group(1)
+
+            # Direct fallback check on NAS archive folder
+            if not arch_p:
+                try:
+                    s_date = (sc_obj.sensing_date if sc_obj else None) or (sc_id.split('_')[2][:8] if len(sc_id.split('_')) > 2 else start_str)
+                    s_yr = s_date[0:4]
+                    s_mo = str(int(s_date[5:7])) if len(s_date) >= 7 and s_date[5:7].isdigit() else "1"
+                    s_tile = (sc_obj.tile if sc_obj else None) or ("S1_SAR" if sc_id.startswith("S1") else (sc_id.split('_')[1] if len(sc_id.split('_')) > 1 else ""))
+                    s_folder = (sc_obj.folder if sc_obj else None) or sc_id
+                    if s_tile:
+                        cand = os.path.join(settings.RAW_ARCHIVE_DIR, s_tile, s_yr, s_mo, s_folder)
+                        cand_res, cand_ex = resolve_tif_path(cand)
+                        if cand_ex or os.path.isdir(cand_res):
+                            arch_p = cand_res
+                except Exception:
+                    pass
+
+            if arch_p:
+                resolved_dir, d_exists = resolve_tif_path(arch_p)
+                target_dir = resolved_dir if d_exists else arch_p
+                if os.path.isdir(target_dir):
+                    sc_date = sc_obj.sensing_date if sc_obj else (sc_id.split('_')[2][:8] if len(sc_id.split('_')) > 2 else start_str)
+                    sc_tile = sc_obj.tile if sc_obj else ("S1_SAR" if sc_id.startswith("S1") else (sc_id.split('_')[1] if len(sc_id.split('_')) > 1 else "AOI"))
+                    sc_sat = "Sentinel-1" if sc_id.startswith("S1") else "Sentinel-2"
+                    cand_files = []
+                    for fname in os.listdir(target_dir):
+                        if fname.lower().endswith((".tif", ".tiff")):
+                            cand_files.append((fname, os.path.join(target_dir, fname)))
+                    m_dir = os.path.join(target_dir, "measurement")
+                    if os.path.isdir(m_dir):
+                        for fname in os.listdir(m_dir):
+                            if fname.lower().endswith((".tif", ".tiff")):
+                                cand_files.append((fname, os.path.join(m_dir, fname)))
+
+                    for fname, f_path in cand_files:
+                        if not os.path.isfile(f_path):
+                            continue
+                        if d_bbox and (sc_tile == "S1_SAR" or sc_sat == "Sentinel-1" or sc_id.startswith("S1")):
+                            if not is_raster_overlapping_district(f_path, d_bbox):
+                                continue
+                        f_size = os.path.getsize(f_path)
+                        total_size += f_size
+                        tif_paths.append(f_path)
+
+                        f_upper = os.path.splitext(fname)[0].upper()
+                        b_canonical = "VV" if ("VV" in f_upper and "VH" not in f_upper) else ("VH" if ("VH" in f_upper and "VV" not in f_upper) else fname)
+
+                        tif_files.append({
+                            "scene_id": sc_id,
+                            "tile": sc_tile,
+                            "sensing_date": sc_date,
+                            "satellite": sc_sat,
+                            "band": b_canonical,
+                            "path": f_path,
+                            "size_bytes": f_size,
+                            "exists_on_disk": True
+                        })
+                        try:
+                            existing_bf = db.query(BandFileModel).filter(
+                                BandFileModel.scene_id == sc_id,
+                                BandFileModel.band == b_canonical
+                            ).first()
+                            if not existing_bf:
+                                db.add(BandFileModel(
+                                    scene_id=sc_id,
+                                    tile=sc_tile,
+                                    sensing_date=sc_date,
+                                    satellite=sc_sat,
+                                    band=b_canonical,
+                                    path=f_path,
+                                    size_bytes=f_size,
+                                    verified=1
+                                ))
+                                db.commit()
+                        except Exception:
+                            db.rollback()
 
     return {
         "request_id": req.id,
@@ -1353,6 +2053,40 @@ def search_downloaded_tifs_by_region(
 
         allowed_scene_ids = set(r[0] for r in pj_query.distinct().all() if r[0])
 
+        # Also extract scenes from execution logs of requests for this district/state to catch all cached scenes
+        req_q = db.query(RequestModel)
+        if district:
+            req_q = req_q.filter(func.lower(RequestModel.district) == clean_d)
+        if state:
+            req_q = req_q.filter(func.lower(RequestModel.state) == clean_s)
+        for r_obj in req_q.all():
+            if r_obj.execution_logs:
+                import re
+                for m in re.finditer(r"Scene\s+'([A-Za-z0-9_]+)'", r_obj.execution_logs):
+                    allowed_scene_ids.add(m.group(1))
+
+        # Also include held S1 scenes specifically for this district if none were found
+        s1_req_q = db.query(RequestModel).filter(RequestModel.satellite.ilike("%Sentinel-1%"))
+        if district:
+            s1_req_q = s1_req_q.filter(func.lower(RequestModel.district) == clean_d)
+        if state:
+            s1_req_q = s1_req_q.filter(func.lower(RequestModel.state) == clean_s)
+
+        if not allowed_scene_ids and (s1_req_q.first() or (satellite and "Sentinel-1" in satellite) or (band and any(sb in (band.upper()) for sb in ("VV", "VH", "SAR")))):
+            try:
+                from app.services.gap_check_service import search_aws_scenes_for_s1
+                s1_candidates = search_aws_scenes_for_s1(
+                    start_date=start_date or "2024-01-01",
+                    end_date=end_date or "2026-12-31",
+                    district_name=district,
+                    state_name=state,
+                    db=db
+                )
+                for sc in s1_candidates:
+                    allowed_scene_ids.add(sc["scene_id"])
+            except Exception as e:
+                logger.warning(f"Could not search S1 candidates by region: {e}")
+
         # If user explicitly filtered by district or state, but no scenes were acquired for it:
         if len(allowed_scene_ids) == 0:
             return {
@@ -1436,11 +2170,30 @@ def search_downloaded_tifs_by_region(
 
             band_records = bf_query.order_by(BandFileModel.tile, BandFileModel.sensing_date, BandFileModel.band).all()
 
+            # Pre-fetch district bounding box for spatial validation
+            d_bbox = None
+            if district:
+                try:
+                    from app.services.delivery_service import get_district_geometry_from_db
+                    from shapely.geometry import shape
+                    geom, _ = get_district_geometry_from_db(db, district, state_name=state)
+                    if geom:
+                        d_bbox = shape(geom).bounds
+                except Exception:
+                    pass
+
             for bf in band_records:
                 raw_p = bf.path
                 if not (raw_p.lower().endswith(".tif") or raw_p.lower().endswith(".tiff")):
                     continue
                 path, exists = resolve_tif_path(raw_p)
+
+                # Enforce spatial validation for S1 rasters
+                is_s1_band = (bf.tile == "S1_SAR" or bf.satellite == "Sentinel-1" or (bf.scene_id and bf.scene_id.startswith("S1")))
+                if d_bbox and is_s1_band:
+                    if not is_raster_overlapping_district(path, d_bbox):
+                        continue
+
                 actual_size = os.path.getsize(path) if exists else bf.size_bytes
                 total_size += actual_size
 

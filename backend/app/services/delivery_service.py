@@ -37,17 +37,47 @@ logger = logging.getLogger("sdap.delivery")
 DELIVERIES_DIR = settings.DELIVERY_DIR
 
 
-def get_district_geometry_from_db(db: Session, district_name: str) -> Tuple[Optional[dict], Optional[str]]:
+def get_district_geometry_from_db(
+    db: Session,
+    district_name: str,
+    state_name: Optional[str] = None
+) -> Tuple[Optional[dict], Optional[str]]:
     """Fetches GeoJSON geometry dict and state name for a district from district_boundaries."""
-    row = db.execute(
-        text("SELECT geometry, state_name FROM district_boundaries WHERE LOWER(district_name) = LOWER(:d_name) LIMIT 1;"),
-        {"d_name": district_name}
-    ).fetchone()
+    if not district_name:
+        return None, None
+    clean_d = district_name.strip()
+    clean_s = state_name.strip() if state_name and state_name.strip() and state_name.strip().upper() != "ALL" else None
+
+    row = None
+    if clean_s:
+        row = db.execute(
+            text("""
+                SELECT geometry, state_name FROM district_boundaries
+                WHERE LOWER(district_name) = LOWER(:d_name) AND LOWER(state_name) = LOWER(:s_name)
+                LIMIT 1;
+            """),
+            {"d_name": clean_d, "s_name": clean_s}
+        ).fetchone()
+        if not row:
+            row = db.execute(
+                text("""
+                    SELECT geometry, state_name FROM district_boundaries
+                    WHERE district_name ILIKE :d_like AND LOWER(state_name) = LOWER(:s_name)
+                    LIMIT 1;
+                """),
+                {"d_like": f"%{clean_d}%", "s_name": clean_s}
+            ).fetchone()
+
+    if not row:
+        row = db.execute(
+            text("SELECT geometry, state_name FROM district_boundaries WHERE LOWER(district_name) = LOWER(:d_name) LIMIT 1;"),
+            {"d_name": clean_d}
+        ).fetchone()
 
     if not row:
         row = db.execute(
             text("SELECT geometry, state_name FROM district_boundaries WHERE district_name ILIKE :d_like LIMIT 1;"),
-            {"d_like": f"%{district_name}%"}
+            {"d_like": f"%{clean_d}%"}
         ).fetchone()
 
     if not row:
@@ -131,9 +161,9 @@ def produce_district_delivery_output(
     if not reprojected_paths:
         raise FileNotFoundError("None of the specified index rasters could be reprojected.")
 
-    # 3. Join / Mosaic reprojected rasters
+    # 3. Join / Mosaic reprojected rasters (strictly bounded to district bounds to safeguard memory)
     opened_srcs = [rasterio.open(p) for p in reprojected_paths]
-    mosaic_array, mosaic_transform = merge(opened_srcs, nodata=np.nan)
+    mosaic_array, mosaic_transform = merge(opened_srcs, bounds=district_geom.bounds, nodata=np.nan)
     
     mosaic_meta = opened_srcs[0].meta.copy()
     mosaic_meta.update({
