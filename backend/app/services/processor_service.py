@@ -111,17 +111,16 @@ def compute_full_tile_index(
         # Apply cloud mask (set invalid pixels to NaN)
         if invalid_mask is not None:
             if invalid_mask.shape != ndvi.shape:
-                # Resize mask if SCL resolution differs (e.g. 20m vs 10m)
-                from rasterio.enums import Resampling
-                # Fast slice sampling if dimensions differ
-                invalid_mask = invalid_mask[::2, ::2] if ndvi.shape[0] > invalid_mask.shape[0] else invalid_mask
+                sy = max(1, ndvi.shape[0] // invalid_mask.shape[0])
+                sx = max(1, ndvi.shape[1] // invalid_mask.shape[1])
+                invalid_mask = np.repeat(np.repeat(invalid_mask, sy, axis=0), sx, axis=1)
             ndvi[invalid_mask[:ndvi.shape[0], :ndvi.shape[1]]] = np.nan
 
         valid_pixels = np.count_nonzero(~np.isnan(ndvi))
         coverage_pct = (valid_pixels / ndvi.size) * 100.0
 
         # Save indexed raster
-        profile.update(dtype=rasterio.float32, count=1, nodata=np.nan)
+        profile.update(dtype=rasterio.float32, count=1, nodata=np.nan, compress="lzw")
         with rasterio.open(output_path, "w", **profile) as dst:
             dst.write(ndvi.astype(np.float32), 1)
 
@@ -145,12 +144,16 @@ def compute_full_tile_index(
         lswi = (nir - swir) / denom
 
         if invalid_mask is not None:
+            if invalid_mask.shape != lswi.shape:
+                sy = max(1, lswi.shape[0] // invalid_mask.shape[0])
+                sx = max(1, lswi.shape[1] // invalid_mask.shape[1])
+                invalid_mask = np.repeat(np.repeat(invalid_mask, sy, axis=0), sx, axis=1)
             lswi[invalid_mask[:lswi.shape[0], :lswi.shape[1]]] = np.nan
 
         valid_pixels = np.count_nonzero(~np.isnan(lswi))
         coverage_pct = (valid_pixels / lswi.size) * 100.0
 
-        profile.update(dtype=rasterio.float32, count=1, nodata=np.nan)
+        profile.update(dtype=rasterio.float32, count=1, nodata=np.nan, compress="lzw")
         with rasterio.open(output_path, "w", **profile) as dst:
             dst.write(lswi.astype(np.float32), 1)
 

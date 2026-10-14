@@ -5,7 +5,8 @@ import {
   CheckCircle, Clock, AlertTriangle, XCircle, Plus, Search, Database,
   Calendar, MapPin, Sliders, Shield, Users, Check, ChevronRight, ChevronDown, Info,
   HelpCircle, X, Download, Play, Terminal, Eye, EyeOff, KeyRound, ArrowLeft, Square, Table,
-  Layers, ArrowUp, ArrowDown, TrendingUp, BarChart3, Filter, Trash2
+  Layers, ArrowUp, ArrowDown, TrendingUp, BarChart3, Filter, Trash2,
+  Minimize2, Maximize2, Package
 } from 'lucide-react';
 
 const API_BASE = '/api/v1';
@@ -150,10 +151,31 @@ export default function App() {
   // ---------------------------------------------------------------------------
   // 7. Data Retrieval & Export State & Handlers
   // ---------------------------------------------------------------------------
+  const RET_S1_BANDS = [
+    { id: 'VV', label: 'VV', tag: 'SAR Co-pol (10m)' },
+    { id: 'VH', label: 'VH', tag: 'SAR Cross-pol (10m)' },
+  ];
+
+  const RET_S2_BANDS = [
+    { id: 'B02', label: 'B02', tag: 'Blue (10m)' },
+    { id: 'B03', label: 'B03', tag: 'Green (10m)' },
+    { id: 'B04', label: 'B04', tag: 'Red (10m)' },
+    { id: 'B08', label: 'B08', tag: 'NIR (10m)' },
+    { id: 'B8A', label: 'B8A', tag: 'Red Edge (20m)' },
+    { id: 'B11', label: 'B11', tag: 'SWIR (20m)' },
+    { id: 'B12', label: 'B12', tag: 'SWIR-2 (20m)' },
+    { id: 'SCL', label: 'SCL', tag: 'Scene Class.' },
+    { id: 'TCI', label: 'TCI', tag: 'RGB True Color' },
+    { id: 'NDVI', label: 'NDVI', tag: 'Vegetation' },
+    { id: 'LSWI', label: 'LSWI', tag: 'Water Index' },
+    { id: 'Composite', label: 'Composite', tag: 'Clipped Rasters' },
+  ];
+
   const [retState, setRetState] = useState('');
   const [retDistrict, setRetDistrict] = useState('');
   const [retSatellite, setRetSatellite] = useState('ALL');
   const [retBand, setRetBand] = useState('ALL');
+  const [retSelectedBands, setRetSelectedBands] = useState([]);
   const [retCompositeInterval, setRetCompositeInterval] = useState('ALL');
   const [retStartDate, setRetStartDate] = useState('');
   const [retEndDate, setRetEndDate] = useState('');
@@ -167,12 +189,58 @@ export default function App() {
   const [retDownloadedDistricts, setRetDownloadedDistricts] = useState([]);
   const [loadingRetRegions, setLoadingRetRegions] = useState(false);
 
-  // ---------------------------------------------------------------------------
-  // 8. Downloaded Requests Info Overview State
-  // ---------------------------------------------------------------------------
-  const [dlSearchQuery, setDlSearchQuery] = useState('');
-  const [dlStatusFilter, setDlStatusFilter] = useState('ALL');
-  const [dlSatFilter, setDlSatFilter] = useState('ALL');
+  // Helper to determine active bands query parameter string
+  const getSelectedBandsQuery = () => {
+    let available = [];
+    if (retSatellite === 'Sentinel-1') {
+      available = RET_S1_BANDS.map(b => b.id);
+    } else if (retSatellite === 'Sentinel-2') {
+      available = RET_S2_BANDS.map(b => b.id);
+    } else {
+      available = [...RET_S1_BANDS.map(b => b.id), ...RET_S2_BANDS.map(b => b.id)];
+    }
+    const active = retSelectedBands.filter(b => available.includes(b));
+    if (active.length === 0) {
+      return 'ALL';
+    }
+    return active.join(',');
+  };
+
+  const handleToggleRetBand = (bandId) => {
+    setRetSelectedBands(prev => {
+      if (prev.includes(bandId)) {
+        return prev.filter(b => b !== bandId);
+      } else {
+        return [...prev, bandId];
+      }
+    });
+  };
+
+  const handleSelectAllRetBands = () => {
+    if (retSatellite === 'Sentinel-1') {
+      setRetSelectedBands(RET_S1_BANDS.map(b => b.id));
+    } else if (retSatellite === 'Sentinel-2') {
+      setRetSelectedBands(RET_S2_BANDS.map(b => b.id));
+    } else {
+      setRetSelectedBands([...RET_S1_BANDS.map(b => b.id), ...RET_S2_BANDS.map(b => b.id)]);
+    }
+  };
+
+  const handleClearAllRetBands = () => {
+    setRetSelectedBands([]);
+  };
+
+  const handleRetSatelliteChange = (newSat) => {
+    setRetSatellite(newSat);
+    if (newSat === 'Sentinel-1') {
+      const s1Ids = RET_S1_BANDS.map(b => b.id);
+      setRetSelectedBands(prev => prev.filter(b => s1Ids.includes(b)));
+    } else if (newSat === 'Sentinel-2') {
+      const s2Ids = RET_S2_BANDS.map(b => b.id);
+      setRetSelectedBands(prev => prev.filter(b => s2Ids.includes(b)));
+    }
+  };
+
 
   const handleVerifyNASData = async () => {
     setVerifyingNAS(true);
@@ -184,7 +252,8 @@ export default function App() {
       if (retState) params.state = retState;
       if (retDistrict) params.district = retDistrict;
       if (retSatellite && retSatellite !== 'ALL') params.satellite = retSatellite;
-      if (retBand && retBand !== 'ALL') params.band = retBand;
+      const bQuery = getSelectedBandsQuery();
+      if (bQuery && bQuery !== 'ALL') params.band = bQuery;
       if (retCompositeInterval && retCompositeInterval !== 'ALL') params.composite_interval = retCompositeInterval;
       if (retStartDate) params.start_date = retStartDate;
       if (retEndDate) params.end_date = retEndDate;
@@ -221,15 +290,20 @@ export default function App() {
 
   const [downloadingZip, setDownloadingZip] = useState(false);
   const [retNotice, setRetNotice] = useState(null);
+  const [downloadProgress, setDownloadProgress] = useState(null);
+  const [downloadWidgetMinimized, setDownloadWidgetMinimized] = useState(false);
 
-  const handleDownloadZip = () => {
-    setRetNotice(null);
+  const handleDownloadZip = async () => {
+    // 1. Close modal immediately so the user's workspace is not blocked
+    setShowDownloadPromptModal(false);
+
     const currentToken = token || localStorage.getItem('sdap_token');
     const params = new URLSearchParams();
     if (retState) params.append('state', retState);
     if (retDistrict) params.append('district', retDistrict);
     if (retSatellite && retSatellite !== 'ALL') params.append('satellite', retSatellite);
-    if (retBand && retBand !== 'ALL') params.append('band', retBand);
+    const bQuery = getSelectedBandsQuery();
+    if (bQuery && bQuery !== 'ALL') params.append('band', bQuery);
     if (retCompositeInterval && retCompositeInterval !== 'ALL') params.append('composite_interval', retCompositeInterval);
     if (retStartDate) params.append('start_date', retStartDate);
     if (retEndDate) params.append('end_date', retEndDate);
@@ -238,42 +312,132 @@ export default function App() {
     const downloadUrl = `${API_BASE}/requests/tifs/download-zip?${params.toString()}`;
     const fileName = `SDAP_GeoTIFF_${retDistrict || retState || 'Export'}.zip`;
 
-    // Native browser background download:
-    // Triggers download via detached anchor with target="_blank" so the browser's native
-    // download manager takes full control of the stream.
-    const link = document.createElement('a');
-    link.href = downloadUrl;
-    link.setAttribute('download', fileName);
-    link.setAttribute('target', '_blank');
-    link.rel = 'noopener noreferrer';
-    link.style.display = 'none';
-    document.body.appendChild(link);
-    link.click();
-    setTimeout(() => {
-      try { document.body.removeChild(link); } catch (e) {}
-    }, 1500);
+    setDownloadingZip(true);
+    setDownloadProgress({
+      fileName,
+      percent: 0,
+      loadedMB: '0.0',
+      totalMB: retResults?.total_size_mb ? String(retResults.total_size_mb) : null,
+      status: 'downloading'
+    });
 
-    // Close prompt modal and remove verified results card from the UI
-    setShowDownloadPromptModal(false);
-    setRetResults(null);
-
-    // Display download initiated status notice
     setRetNotice({
       type: 'info',
       status: 'initiated',
       fileName: fileName,
-      text: `✓ Download initiated! Your browser is downloading "${fileName}" in the background.`
+      text: `⏳ Downloading "${fileName}" in the background... You can freely continue your work.`
     });
 
-    // Automatically transition to download completed status
-    setTimeout(() => {
+    try {
+      const response = await axios.get(downloadUrl, {
+        responseType: 'blob',
+        headers: getAuthHeader(),
+        onDownloadProgress: (progressEvent) => {
+          if (progressEvent.total) {
+            const percentCompleted = Math.round((progressEvent.loaded * 100) / progressEvent.total);
+            const loadedMB = (progressEvent.loaded / (1024 * 1024)).toFixed(1);
+            const totalMB = (progressEvent.total / (1024 * 1024)).toFixed(1);
+            setDownloadProgress({
+              fileName,
+              percent: percentCompleted,
+              loadedMB,
+              totalMB,
+              status: 'downloading'
+            });
+            setRetNotice({
+              type: 'info',
+              status: 'initiated',
+              fileName: fileName,
+              text: `⏳ Downloading "${fileName}" in background (${percentCompleted}% - ${loadedMB} / ${totalMB} MB)... You can continue your work.`
+            });
+          } else if (progressEvent.loaded > 0) {
+            const loadedMB = (progressEvent.loaded / (1024 * 1024)).toFixed(1);
+            setDownloadProgress(prev => ({
+              fileName,
+              percent: null,
+              loadedMB,
+              totalMB: prev?.totalMB || null,
+              status: 'downloading'
+            }));
+            setRetNotice({
+              type: 'info',
+              status: 'initiated',
+              fileName: fileName,
+              text: `⏳ Downloading "${fileName}" in background (${loadedMB} MB downloaded)... You can continue your work.`
+            });
+          }
+        }
+      });
+
+      // Verify if response is a JSON error encapsulated in Blob
+      if (response.data && response.data.type === 'application/json') {
+        const text = await response.data.text();
+        const errObj = JSON.parse(text);
+        throw new Error(errObj.detail || 'Download failed');
+      }
+
+      // Stream to file download via blob object
+      const blob = new Blob([response.data], { type: 'application/zip' });
+      const blobUrl = window.URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = blobUrl;
+      link.setAttribute('download', fileName);
+      document.body.appendChild(link);
+      link.click();
+      setTimeout(() => {
+        try {
+          document.body.removeChild(link);
+          window.URL.revokeObjectURL(blobUrl);
+        } catch (e) {}
+      }, 2000);
+
+      // Transition to download completed status ONLY after download has fully completed
+      setDownloadProgress(prev => ({
+        fileName,
+        percent: 100,
+        loadedMB: prev?.totalMB || prev?.loadedMB || '',
+        totalMB: prev?.totalMB || null,
+        status: 'completed'
+      }));
+
       setRetNotice({
         type: 'success',
         status: 'completed',
         fileName: fileName,
         text: `✓ Download completed! "${fileName}" has been downloaded successfully.`
       });
-    }, 4500);
+
+      // Automatically dismiss the completed widget after 12 seconds
+      setTimeout(() => {
+        setDownloadProgress(prev => prev?.status === 'completed' ? null : prev);
+      }, 12000);
+
+    } catch (err) {
+      console.error('Failed to download ZIP archive:', err);
+      let errMsg = 'Failed to download ZIP file.';
+      if (err.response && err.response.data instanceof Blob) {
+        try {
+          const txt = await err.response.data.text();
+          const j = JSON.parse(txt);
+          if (j.detail) errMsg = j.detail;
+        } catch (e) {}
+      } else if (err.message) {
+        errMsg = err.message;
+      }
+      setDownloadProgress({
+        fileName,
+        status: 'error',
+        errorMsg: errMsg
+      });
+      setRetNotice({
+        type: 'error',
+        status: 'error',
+        fileName: fileName,
+        text: `⚠️ Download error: ${errMsg}`
+      });
+    } finally {
+      setDownloadingZip(false);
+    }
   };
 
   // ---------------------------------------------------------------------------
@@ -310,7 +474,6 @@ export default function App() {
   const [stackModalSearch, setStackModalSearch] = useState('');
 
   // Request-linked downloaded scenes & filename preservation state
-  const [stackSelectedRequestId, setStackSelectedRequestId] = useState('');
   const [stackDownloadedBandsData, setStackDownloadedBandsData] = useState({});
   const [stackSelectedScenes, setStackSelectedScenes] = useState({});
   const [loadingStackReqFiles, setLoadingStackReqFiles] = useState(false);
@@ -327,6 +490,7 @@ export default function App() {
   const stackPollIntervalRef = useRef(null);
   const stackLogsEndRef = useRef(null);
   const stackTerminalContainerRef = useRef(null);
+  const hasAutoLoadedStackRef = useRef(false);
 
   const AVAILABLE_OPTICAL_BANDS = [
     { id: 'B02', label: 'B02 - Blue (490nm, 10m)' },
@@ -340,8 +504,7 @@ export default function App() {
 
   const AVAILABLE_SAR_BANDS = [
     { id: 'VV', label: 'VV - Vertical-Vertical Co-polarization (10m)' },
-    { id: 'VH', label: 'VH - Vertical-Horizontal Cross-polarization (10m)' },
-    { id: 'VV_VH', label: 'VV_VH - Dual-polarization Composites (10m)' }
+    { id: 'VH', label: 'VH - Vertical-Horizontal Cross-polarization (10m)' }
   ];
 
   const AVAILABLE_INDICES = [
@@ -349,32 +512,58 @@ export default function App() {
     { id: 'LSWI', label: 'LSWI - Land Surface Water Index (B08 - B11)/(B08 + B11)' }
   ];
 
-  const loadBandsAndScenesForRegion = useCallback(async (stateVal, distVal, seasonVal, startVal, endVal, targetReqId = null) => {
-    if (!distVal && !stateVal && !targetReqId) {
+  const loadBandsAndScenesForRegion = useCallback(async (stateVal, distVal, seasonVal, startVal, endVal, specificRequestId) => {
+    if (!distVal && !stateVal && !specificRequestId) {
       setStackDownloadedBandsData({});
       setStackSelectedScenes({});
-      setStackSelectedRequestId('');
       return;
     }
 
     setLoadingStackReqFiles(true);
     try {
-      // 1. Find matching requests for this district / state / targetReqId
-      let matchingReq = null;
-      let matchingList = [];
-
-      if (targetReqId) {
-        matchingReq = requests.find(r => String(r.id) === String(targetReqId)) || null;
+      // 1. Fetch district requests from backend to ensure both admin & regular users discover jobs
+      let candidateRequests = [...requests];
+      if (distVal) {
+        try {
+          const distReqsRes = await axios.get(`${API_BASE}/requests/by-district/${encodeURIComponent(distVal)}`, { headers: getAuthHeader() });
+          if (Array.isArray(distReqsRes.data) && distReqsRes.data.length > 0) {
+            const newReqs = distReqsRes.data;
+            candidateRequests = [...newReqs, ...candidateRequests.filter(cr => !newReqs.some(nr => nr.id === cr.id))];
+          }
+        } catch (e) {
+          // fallback to local candidateRequests
+        }
       }
 
-      if (!matchingReq && distVal) {
-        matchingList = requests.filter(r => 
+      // If a specificRequestId is provided, prioritize it directly
+      let matchingReq = null;
+      if (specificRequestId) {
+        matchingReq = candidateRequests.find(r => String(r.id) === String(specificRequestId)) || null;
+        if (!matchingReq) {
+          try {
+            const reqRes = await axios.get(`${API_BASE}/requests/${specificRequestId}`, { headers: getAuthHeader() });
+            if (reqRes.data) {
+              matchingReq = reqRes.data;
+              candidateRequests.unshift(matchingReq);
+            }
+          } catch (e) {
+            console.warn('Could not fetch specific request details:', e);
+          }
+        }
+      }
+
+      // 2. Find matching requests for this district / state
+      let matchingList = matchingReq ? [matchingReq] : [];
+
+      if (distVal) {
+        const dList = candidateRequests.filter(r => 
           r.district && r.district.toLowerCase() === distVal.toLowerCase() &&
           (!stateVal || !r.state || r.state.toLowerCase() === stateVal.toLowerCase())
         );
+        matchingList = [...matchingList, ...dList.filter(d => !matchingList.some(m => m.id === d.id))];
       }
       if (!matchingReq && matchingList.length === 0 && stateVal) {
-        matchingList = requests.filter(r => 
+        matchingList = candidateRequests.filter(r => 
           r.state && r.state.toLowerCase() === stateVal.toLowerCase()
         );
       }
@@ -393,16 +582,17 @@ export default function App() {
       }
 
       let tifs = [];
-      if (matchingReq) {
-        setStackSelectedRequestId(matchingReq.id);
-        if (matchingReq.state && !stateVal) setStackState(matchingReq.state);
-        if (matchingReq.district && !distVal) setStackDistrict(matchingReq.district);
-        if (matchingReq.season) setStackSeason(matchingReq.season);
-        if (matchingReq.start_date) setStackStartDate(matchingReq.start_date.split('T')[0]);
-        if (matchingReq.end_date) setStackEndDate(matchingReq.end_date.split('T')[0]);
+      const reqsToTry = matchingList.length > 0 ? matchingList : (matchingReq ? [matchingReq] : []);
+      if (matchingReq || reqsToTry.length > 0) {
+        if (matchingReq) {
+          if (matchingReq.state && !stateVal) setStackState(matchingReq.state);
+          if (matchingReq.district && !distVal) setStackDistrict(matchingReq.district);
+          if (matchingReq.season) setStackSeason(matchingReq.season);
+          if (matchingReq.start_date && !startVal) setStackStartDate(matchingReq.start_date.split('T')[0]);
+          if (matchingReq.end_date && !endVal) setStackEndDate(matchingReq.end_date.split('T')[0]);
+        }
 
-        // Query candidate requests for tifs - use targetReqId if specified, or merge across matching requests
-        const reqsToTry = targetReqId ? [matchingReq] : (matchingList.length > 0 ? matchingList : [matchingReq]);
+        // Query candidate requests for tifs - merge across matching requests
         const allTifsMap = new Map();
         for (const r of reqsToTry) {
           try {
@@ -419,8 +609,6 @@ export default function App() {
           }
         }
         tifs = Array.from(allTifsMap.values());
-      } else {
-        setStackSelectedRequestId('');
       }
 
       // If direct request tifs yielded 0 or no matchingReq, fallback to region search
@@ -443,18 +631,36 @@ export default function App() {
 
       const grouped = {};
       tifs.forEach(item => {
+        const fPath = item.path || '';
+        // Skip previously generated layer stack outputs from raw input scenes
+        if (fPath.toLowerCase().includes('/composites/stack/') || fPath.toLowerCase().includes('\\composites\\stack\\')) {
+          return;
+        }
+
         let rawBand = (item.band || '').trim();
         let b = rawBand.replace(/\.tiff?$/i, '').toUpperCase().trim();
+        const fName = (item.filename || (fPath ? fPath.split(/[\\/]/).pop() : '')).toUpperCase();
+
         if (b.includes('LSWI')) {
           b = 'LSWI';
         } else if (b.includes('NDVI')) {
           b = 'NDVI';
         } else if (b.includes('VV_VH') || b.includes('VV/VH')) {
           b = 'VV_VH';
-        } else if (b.includes('_')) {
-          const parts = b.split('_');
+        } else if (
+          b === 'IW-VV' || b.endsWith('-VV') || b.endsWith('_VV') || b === 'VV' ||
+          ((b.includes('VV') || fName.includes('IW-VV') || fName.includes('-VV.') || fName.includes('_VV.')) && !b.includes('VH') && !fName.includes('VH'))
+        ) {
+          b = 'VV';
+        } else if (
+          b === 'IW-VH' || b.endsWith('-VH') || b.endsWith('_VH') || b === 'VH' ||
+          ((b.includes('VH') || fName.includes('IW-VH') || fName.includes('-VH.') || fName.includes('_VH.')) && !b.includes('VV') && !fName.includes('VV'))
+        ) {
+          b = 'VH';
+        } else if (b.includes('_') || b.includes('-')) {
+          const parts = b.split(/[_\-]+/);
           const lastPart = parts[parts.length - 1];
-          if (['B02', 'B03', 'B04', 'B08', 'B8A', 'B08A', 'B11', 'SCL', 'TCI', 'VV', 'VH'].includes(lastPart)) {
+          if (['B01', 'B02', 'B03', 'B04', 'B05', 'B06', 'B07', 'B08', 'B8A', 'B08A', 'B09', 'B11', 'B12', 'SCL', 'TCI', 'VV', 'VH'].includes(lastPart)) {
             b = lastPart;
           }
         }
@@ -572,13 +778,28 @@ export default function App() {
           let cleanB = b.toUpperCase().replace(/\.TIFF?$/i, '').trim();
           if (cleanB === 'B08A') cleanB = 'B8A';
           if (cleanB === 'VV/VH' || cleanB === 'VV-VH') cleanB = 'VV_VH';
+          if (cleanB === 'IW-VV' || cleanB.endsWith('-VV') || cleanB.endsWith('_VV') || (cleanB.includes('VV') && !cleanB.includes('VH'))) cleanB = 'VV';
+          if (cleanB === 'IW-VH' || cleanB.endsWith('-VH') || cleanB.endsWith('_VH') || (cleanB.includes('VH') && !cleanB.includes('VV'))) cleanB = 'VH';
           if (!initialLayers.includes(cleanB)) initialLayers.push(cleanB);
         });
       }
 
+      // Auto-select available SAR bands (VV, VH) and optical indices/bands if present in grouped
+      if (grouped['VV'] && !initialLayers.includes('VV')) initialLayers.push('VV');
+      if (grouped['VH'] && !initialLayers.includes('VH')) initialLayers.push('VH');
       if (grouped['NDVI'] && !initialLayers.includes('NDVI')) initialLayers.push('NDVI');
       if (grouped['LSWI'] && !initialLayers.includes('LSWI')) initialLayers.push('LSWI');
       if (grouped['VV_VH'] && !initialLayers.includes('VV_VH') && (matchingReq?.satellite?.includes('Sentinel-1') || matchingReq?.indices?.includes('VV/VH'))) initialLayers.push('VV_VH');
+
+      // Keep only layers that have actual scenes/rasters present in grouped
+      let validLayers = initialLayers.filter(l => grouped[l] && grouped[l].length > 0);
+
+      // If still empty, auto-select available bands from grouped (up to 4 bands)
+      if (validLayers.length === 0) {
+        Object.keys(grouped).slice(0, 4).forEach(k => {
+          if (!validLayers.includes(k)) validLayers.push(k);
+        });
+      }
 
       // Default selected stage: all downloaded scenes for EVERY band are selected by default
       Object.keys(grouped).forEach(bKey => {
@@ -586,8 +807,10 @@ export default function App() {
       });
 
       setStackSelectedScenes(initSelectedScenes);
-      if (initialLayers.length > 0) {
-        setStackSelectedLayers(initialLayers);
+      if (validLayers.length > 0) {
+        setStackSelectedLayers(validLayers);
+      } else {
+        setStackSelectedLayers([]);
       }
     } catch (err) {
       console.warn('Could not fetch tifs for selected region:', err);
@@ -930,7 +1153,7 @@ export default function App() {
         clip_to_district: stackClipToDistrict,
         selected_files: selectedPaths.length > 0 ? selectedPaths : null,
         selected_files_by_band: Object.keys(selectedFilesByBand).length > 0 ? selectedFilesByBand : null,
-        request_id: stackSelectedRequestId ? Number(stackSelectedRequestId) : null
+        request_id: null
       };
 
       const res = await axios.post(`${API_BASE}/requests/layer-stack`, payload, {
@@ -1147,6 +1370,60 @@ export default function App() {
       fetchStackHistory(stackDistrict);
     }
   }, [token, activeTab, fetchDownloadedRegions, fetchStackHistory, stackDistrict]);
+
+  // Reset autoload guard when token changes (login/logout)
+  useEffect(() => {
+    hasAutoLoadedStackRef.current = false;
+  }, [token, currentUser?.id]);
+
+  // Autoload initial Layer Stacking district ONCE when entering Tab 5
+  useEffect(() => {
+    if (!token || activeTab !== 'layer_stacking') return;
+    if (hasAutoLoadedStackRef.current) return;
+
+    // If district is already populated, mark as completed so user actions are not overridden
+    if (stackDistrict) {
+      hasAutoLoadedStackRef.current = true;
+      return;
+    }
+
+    // Determine initial default district ONCE:
+    let initialReq = null;
+    if (requests && requests.length > 0) {
+      initialReq = requests.find(r => r.district && ['COMPLETED', 'HELD', 'PROCESSING', 'SUCCESS'].includes(r.status)) ||
+                   requests.find(r => r.district) || null;
+    }
+
+    if (initialReq && initialReq.district) {
+      hasAutoLoadedStackRef.current = true;
+      const d = initialReq.district;
+      const s = initialReq.state || '';
+      const sea = initialReq.season || 'Kharif';
+      const sDate = initialReq.start_date ? initialReq.start_date.split('T')[0] : '2026-06-01';
+      const eDate = initialReq.end_date ? initialReq.end_date.split('T')[0] : '2026-10-31';
+      setStackDistrict(d);
+      setStackState(s);
+      setStackSeason(sea);
+      setStackStartDate(sDate);
+      setStackEndDate(eDate);
+      loadBandsAndScenesForRegion(s, d, sea, sDate, eDate, initialReq.id);
+      fetchStackHistory(d);
+      return;
+    }
+
+    if (retDownloadedDistricts && retDownloadedDistricts.length > 0) {
+      hasAutoLoadedStackRef.current = true;
+      const firstDist = retDownloadedDistricts[0];
+      const dName = typeof firstDist === 'string' ? firstDist : (firstDist.district_name || '');
+      const sName = typeof firstDist === 'string' ? '' : (firstDist.state_name || '');
+      if (dName) {
+        setStackDistrict(dName);
+        if (sName) setStackState(sName);
+        loadBandsAndScenesForRegion(sName, dName, stackSeason, stackStartDate, stackEndDate);
+        fetchStackHistory(dName);
+      }
+    }
+  }, [token, activeTab, requests, retDownloadedDistricts]);
 
   // Fetch Requests List (scoped to logged-in user, or all requests for administrators)
   const fetchRequests = useCallback(async (isSilent = false) => {
@@ -1769,13 +2046,13 @@ export default function App() {
       district: selectedReq?.district || selectedReq?.state || 'Auto',
       range: selectedReq ? `${(selectedReq.start_date || '').split('T')[0]} to ${(selectedReq.end_date || '').split('T')[0]}` : '—',
       satellite: selectedReq?.satellite || 'Sentinel-1, Sentinel-2',
-      indices: selectedReq?.indices ? selectedReq.indices.join(', ') : 'NDVI, LSWI, VV/VH',
+      indices: selectedReq?.indices ? selectedReq.indices.join(', ') : 'NDVI, LSWI',
       maxCloud: selectedReq?.max_cloud_cover ? `${selectedReq.max_cloud_cover}%` : '70.0%',
       level: selectedReq?.level ? selectedReq.level.toUpperCase() : 'MAX',
       composite: selectedReq?.composite_interval || 'WEEKLY'
     };
 
-    const S1_BANDS = ['VV', 'VH', 'VV_VH', 'VV/VH'];
+    const S1_BANDS = ['VV', 'VH'];
     const DEFAULT_S2_BANDS = ['B04', 'B08', 'B11', 'SCL'];
     const requestSatellite = selectedReq?.satellite || '';
     const hasS1 = requestSatellite.includes('Sentinel-1');
@@ -1785,15 +2062,27 @@ export default function App() {
     if (Array.isArray(selectedReq?.bands) && selectedReq.bands.length > 0) {
       reqBands = selectedReq.bands;
     } else if (hasS1 && !hasS2) {
-      reqBands = ['VV', 'VH', 'VV_VH'];
+      reqBands = ['VV', 'VH'];
     } else {
       reqBands = DEFAULT_S2_BANDS;
     }
 
     const warningsList = [];
 
-    if (rawLogs && rawLogs.trim().length > 0) {
-      const lines = rawLogs.split(/\r?\n/).map(l => l.trim());
+    // Isolate the real-time execution logs from the latest run to prevent previous run logs from polluting
+    let activeLogs = rawLogs || '';
+    if (activeLogs.includes('--- USER TRIGGERED RE-RUN')) {
+      const parts = activeLogs.split(/--- USER TRIGGERED RE-RUN[^-\n]*---/);
+      activeLogs = parts[parts.length - 1];
+    } else if (activeLogs) {
+      const execHeaders = activeLogs.split(/={40,}\r?\n\s*SDAP PIPELINE EXECUTION/);
+      if (execHeaders.length > 1) {
+        activeLogs = "SDAP PIPELINE EXECUTION" + execHeaders[execHeaders.length - 1];
+      }
+    }
+
+    if (activeLogs && activeLogs.trim().length > 0) {
+      const lines = activeLogs.split(/\r?\n/).map(l => l.trim());
 
       for (const line of lines) {
         // Extract timestamp: [YYYY-MM-DD HH:MM:SS] or HH:MM:SS
@@ -1993,16 +2282,26 @@ export default function App() {
         // Examples:
         // [NEW DOWNLOAD COMPLETED] Scene 'S2B_43PHS_20260502_0_L2A' (Tile 43PHS, Date 2026-05-02) downloaded to '...'
         //   (8 new bands, 1205.2 MB: B02.tif: 201.6MB, B03.tif: 208.1MB, B04.tif: 220.5MB, B08.tif: 222.2MB, B8A.tif: 57.5MB, B11.tif: 57.4MB, SCL.tif: 2.0MB, TCI.tif: 314.5MB, metadata.xml stored).
-        const compMatch = line.match(/✓?\s*\[NEW DOWNLOAD COMPLETED\]\s*Scene\s+['"]?(S[12][A-C]_[0-9A-Za-z_]+)['"]?/i);
+        const compMatch = line.match(/✓?\s*\[(?:NEW DOWNLOAD COMPLETED|SENTINEL-1 COMPLETE PRODUCT DOWNLOADED|ALREADY DOWNLOADED - SKIPPED)\]\s*Scene\s+['"]?(S[12][A-C0-9]_[0-9A-Za-z_]+)['"]?/i)
+          || line.match(/✓?\s*\[NAS VERIFIED - SKIPPED\]\s*['"]?(S[12][A-C0-9]_[0-9A-Za-z_]+)['"]?/i)
+          || line.match(/\[CACHE VERIFIED\]\s*Scene\s+['"]?(S[12][A-C0-9]_[0-9A-Za-z_]+)['"]?/i)
+          || line.match(/\[SAR POLARIZATIONS VERIFIED\].*Scene\s+['"]?(S[12][A-C0-9]_[0-9A-Za-z_]+)['"]?/i);
+
         if (compMatch) {
           const folderName = compMatch[1];
           if (scenesMap[folderName]) {
             scenesMap[folderName].status = 'COMPLETE';
             const sizeM = line.match(/(\d+(?:\.\d+)?\s*MB)/i);
             if (sizeM) scenesMap[folderName].totalSize = sizeM[1];
-            const destM = line.match(/downloaded to\s+'([^']+)'/i);
+            const destM = line.match(/(?:downloaded to|saved to NAS in|cached at|at)\s+'([^']+)'/i);
             if (destM) scenesMap[folderName].storagePath = destM[1];
             scenesMap[folderName].timestamp = timestamp;
+
+            // For Sentinel-1, ensure core VV & VH bands are marked
+            if (folderName.startsWith('S1')) {
+              if (!scenesMap[folderName].bands.includes('VV')) scenesMap[folderName].bands.push('VV');
+              if (!scenesMap[folderName].bands.includes('VH')) scenesMap[folderName].bands.push('VH');
+            }
 
             // Extract all bands mentioned in the summary list e.g. B02.tif: 201.6MB, B03.tif: ...
             const bandMatches = line.matchAll(/([A-Za-z0-9_]+)\.tiff?(?::\s*([\d.]+\s*MB))?/gi);
@@ -2294,20 +2593,22 @@ export default function App() {
         }
 
         if (!scenesMap[scId]) {
-          // If rawLogs is present and already discovered scenes, guard against injecting extraneous unlogged scenes
-          if (rawLogs && Object.keys(scenesMap).length > 0) {
-            const reqStart = (selectedReq?.start_date || '').split('T')[0];
-            const reqEnd = (selectedReq?.end_date || '').split('T')[0];
-            const isWithinDates = (!sDate || !reqStart || sDate >= reqStart) && (!sDate || !reqEnd || sDate <= reqEnd);
-            const isTileValid = !t.tile || t.tile === 'S1_SAR' || tilesSet.has(t.tile) || (gapSummary.tilesIdentified && gapSummary.tilesIdentified.includes(t.tile));
-            // For Sentinel-1, do not add if not mentioned in rawLogs
-            if (scId.startsWith('S1') && !rawLogs.includes(scId)) {
-              return;
-            }
-            if (!isWithinDates || !isTileValid) {
-              return;
-            }
+          // If real-time execution logs exist, ONLY scenes explicitly logged in the current run may be displayed.
+          // NEVER inject unlogged or previous historical scenes from the DB.
+          if (rawLogs && rawLogs.trim().length > 0) {
+            return;
           }
+
+          const reqSat = selectedReq?.satellite || '';
+          const isReqS1Only = reqSat.includes('Sentinel-1') && !reqSat.includes('Sentinel-2');
+          const isReqS2Only = reqSat.includes('Sentinel-2') && !reqSat.includes('Sentinel-1');
+          if (isReqS1Only && (sat.startsWith('S2') || scId.startsWith('S2') || t.tile !== 'S1_SAR')) return;
+          if (isReqS2Only && (sat.startsWith('S1') || scId.startsWith('S1') || t.tile === 'S1_SAR')) return;
+
+          const reqStart = (selectedReq?.start_date || '').split('T')[0];
+          const reqEnd = (selectedReq?.end_date || '').split('T')[0];
+          const isWithinDates = (!sDate || !reqStart || sDate >= reqStart) && (!sDate || !reqEnd || sDate <= reqEnd);
+          if (!isWithinDates) return;
 
           scenesMap[scId] = {
             folder: scId,
@@ -2329,9 +2630,7 @@ export default function App() {
             scenesMap[scId].bands.push(bClean);
           }
           if (!scenesMap[scId].warning && !scenesMap[scId].isFailedDownload) {
-            if (scenesMap[scId].status !== 'DOWNLOADING' && scenesMap[scId].status !== 'SKIPPED') {
-              scenesMap[scId].status = 'COMPLETE';
-            }
+            scenesMap[scId].status = 'COMPLETE';
           }
           if (sDate && scenesMap[scId].date === '—') {
             scenesMap[scId].date = sDate;
@@ -2345,6 +2644,37 @@ export default function App() {
         }
       });
     }
+
+    // Global completion reconciliation:
+    // If the pipeline or Stage 2 has finished (or if bands are verified on NAS),
+    // mark scenes as COMPLETE rather than leaving them stuck in DOWNLOADING.
+    const isPipelineFinished = Boolean(
+      (selectedReq?.status === 'COMPLETED') ||
+      (activeLogs && (
+        /DATA ACQUISITION & PROCESSING FINISHED/i.test(activeLogs) ||
+        /DATA ACQUISITION & RAW BAND DOWNLOAD COMPLETED/i.test(activeLogs) ||
+        /DATA DOWNLOAD & SPECTRAL INDEX PROCESSING COMPLETED/i.test(activeLogs) ||
+        /Stage 2 Complete/i.test(activeLogs)
+      ))
+    );
+
+    Object.values(scenesMap).forEach(sc => {
+      const isFailed = sc.status === 'FAILED' || sc.isFailedDownload || sc.status === 'WARNING';
+      const hasBands = sc.bands && sc.bands.length > 0;
+      if (!isFailed) {
+        if (sc.status === 'DOWNLOADING' && (hasBands || isPipelineFinished)) {
+          sc.status = 'COMPLETE';
+        }
+      }
+      if (sc.folder?.startsWith('S1') || sc.satellite?.startsWith('S1')) {
+        const hasS1Band = (sc.bands || []).some(b => ['VV', 'VH', 'IW-VV', 'IW-VH'].includes(b));
+        if (hasS1Band) {
+          if (!sc.bands.includes('VV')) sc.bands.push('VV');
+          if (!sc.bands.includes('VH')) sc.bands.push('VH');
+          if (!isFailed) sc.status = 'COMPLETE';
+        }
+      }
+    });
 
     const sceneList = Object.values(scenesMap);
 
@@ -2444,7 +2774,15 @@ export default function App() {
       warningsList = []
     } = parseAcquisitionScenes(rawLogs, selectedReq, verifiedTifs);
 
+    const reqSat = selectedReq?.satellite || '';
+    const isReqS1Only = reqSat.includes('Sentinel-1') && !reqSat.includes('Sentinel-2');
+    const isReqS2Only = reqSat.includes('Sentinel-2') && !reqSat.includes('Sentinel-1');
+
     const filteredScenes = scenes.filter(s => {
+      // Prevent cross-satellite bleeding: Sentinel-1 request must NEVER show Sentinel-2 scenes, and vice versa
+      if (isReqS1Only && (s.satellite?.startsWith('S2') || s.folder?.startsWith('S2') || (s.tile && s.tile !== 'S1_SAR' && s.tile !== '—'))) return false;
+      if (isReqS2Only && (s.satellite?.startsWith('S1') || s.folder?.startsWith('S1') || s.tile === 'S1_SAR')) return false;
+
       if (logFilter === 'downloads' && s.status !== 'COMPLETE') return false;
       if (logFilter === 'errors') {
         const isErr = s.status === 'FAILED' || s.status === 'SKIPPED' || s.status === 'WARNING' || s.status === 'INCOMPLETE';
@@ -2477,7 +2815,7 @@ export default function App() {
     // Natural band sort order
     const BAND_SORT_ORDER = [
       'B01', 'B02', 'B03', 'B04', 'B05', 'B06', 'B07', 'B08', 'B8A', 'B09', 'B11', 'B12',
-      'SCL', 'TCI', 'NDVI', 'LSWI', 'VV', 'VH', 'VV_VH'
+      'SCL', 'TCI', 'NDVI', 'LSWI', 'VV', 'VH'
     ];
 
     const sortBands = (bandsArr) => {
@@ -2500,11 +2838,11 @@ export default function App() {
       return ['B02', 'B03', 'B04', 'B08', 'B8A', 'B11', 'SCL', 'TCI'];
     };
 
-    // Step 2: Strictly raw spectral bands ONLY (no NDVI, no LSWI, no VV_VH)
+    // Step 2: Strictly raw spectral bands ONLY (no NDVI, no LSWI)
     const getRawBandsForScene = (sc) => {
       const isS1 = sc.satellite?.startsWith('S1') || sc.folder?.startsWith('S1') || sc.tile === 'S1_SAR';
       const defaultRaw = isS1 ? ['VV', 'VH'] : ['B02', 'B03', 'B04', 'B08', 'B8A', 'B11', 'SCL', 'TCI'];
-      const rawVerified = (sc.bands || []).filter(b => !['NDVI', 'LSWI', 'VV_VH'].includes(b));
+      const rawVerified = (sc.bands || []).filter(b => !['NDVI', 'LSWI'].includes(b));
       if (rawVerified.length > 0) {
         return sortBands(rawVerified);
       }
@@ -2514,11 +2852,14 @@ export default function App() {
       return [];
     };
 
-    // Step 3: Strictly surface reflectance indices ONLY (NDVI, LSWI, VV_VH)
+    // Step 3: Strictly surface reflectance indices ONLY (NDVI, LSWI)
     const getIndicesBandsForScene = (sc) => {
       const isS1 = sc.satellite?.startsWith('S1') || sc.folder?.startsWith('S1') || sc.tile === 'S1_SAR';
-      const defaultIndices = isS1 ? ['VV_VH'] : ['NDVI', 'LSWI'];
-      const indVerified = (sc.bands || []).filter(b => ['NDVI', 'LSWI', 'VV_VH'].includes(b));
+      if (isS1) {
+        return [];
+      }
+      const defaultIndices = ['NDVI', 'LSWI'];
+      const indVerified = (sc.bands || []).filter(b => ['NDVI', 'LSWI'].includes(b));
       if (indVerified.length > 0) {
         return indVerified;
       }
@@ -3558,7 +3899,9 @@ export default function App() {
       (selectedReq?.status === 'COMPLETED')
     );
 
-    const hasReachedStep3 = Boolean(
+    const isPureS1Req = (selectedReq?.satellite || '').includes('Sentinel-1') && !(selectedReq?.satellite || '').includes('Sentinel-2');
+
+    const hasReachedStep3 = !isPureS1Req && Boolean(
       hasReachedStep2 && (
         (rawLogs && (
           /STAGE\s*3/i.test(rawLogs) ||
@@ -3566,20 +3909,17 @@ export default function App() {
           /CLOUD MASKING/i.test(rawLogs) ||
           /INDICES COMPUTED/i.test(rawLogs) ||
           /INDICES VERIFIED/i.test(rawLogs) ||
-          /SAR.*RATIO/i.test(rawLogs) ||
           /NDVI\.tif/i.test(rawLogs) ||
-          /LSWI\.tif/i.test(rawLogs) ||
-          /VV_VH\.tif/i.test(rawLogs)
+          /LSWI\.tif/i.test(rawLogs)
         )) ||
-        displayScenes.some(s => (s.bands || []).some(b => ['NDVI', 'LSWI', 'VV_VH', 'EVI', 'NDWI'].includes(b))) ||
-        (selectedReq?.status === 'COMPLETED')
+        displayScenes.some(s => (s.bands || []).some(b => ['NDVI', 'LSWI', 'EVI', 'NDWI'].includes(b))) ||
+        (selectedReq?.status === 'COMPLETED' && !isPureS1Req)
       )
     );
 
     const hasReachedStep4 = Boolean(
-      hasCompositeInterval && hasReachedStep3 && (
+      hasCompositeInterval && (hasReachedStep3 || isPureS1Req) && (
         (rawLogs && (
-          /STAGE\s*4/i.test(rawLogs) ||
           /TEMPORAL COMPOSITING/i.test(rawLogs) ||
           /DELIVERY_CLIP/i.test(rawLogs)
         )) ||
@@ -3600,7 +3940,8 @@ export default function App() {
       stepTabs.push({ id: 'step3', label: `Step-3: Indices & Masking (${displayScenes.length})` });
     }
     if (hasReachedStep4) {
-      stepTabs.push({ id: 'step4', label: `Step-4: ${intervalLabel} Composites (${step4Rows.length} windows)` });
+      const compStepLabel = isPureS1Req ? `Step-3: ${intervalLabel} Composites (${step4Rows.length} windows)` : `Step-4: ${intervalLabel} Composites (${step4Rows.length} windows)`;
+      stepTabs.push({ id: 'step4', label: compStepLabel });
     }
     stepTabs.push({ id: 'warnings', label: `Warnings (${allIssueItems.length})`, isWarning: true });
 
@@ -3851,20 +4192,22 @@ export default function App() {
                       {renderStepHeader(
                         2,
                         'Raw Band Acquisition & NAS Download',
-                        'Downloading spectral bands (B02-B11, SCL, TCI / VV, VH) to local NAS storage',
+                        isPureS1Req
+                          ? 'Downloading SAR polarizations (VV, VH) to local NAS storage'
+                          : 'Downloading spectral bands (B02-B11, SCL, TCI) to local NAS storage',
                         `✓ STEP-2 · ALL BANDS VERIFIED`
                       )}
                       {displayScenes.map((sc, idx) => renderStep2SceneRow(sc, idx))}
                     </>
                   )}
 
-                  {/* STEP 3: Masking & Surface Reflectance Indices Calculation (Only shown if reached in real time) */}
+                  {/* STEP 3: Masking & Surface Reflectance Indices Calculation (Optical Sentinel-2 Only) */}
                   {hasReachedStep3 && (activeStepFilter === 'all' || activeStepFilter === 'step3') && (
                     <>
                       {renderStepHeader(
                         3,
                         'Masking & Surface Reflectance Indices Calculation',
-                        'SCL cloud masking evaluated · Computing NDVI, LSWI, VV/VH ratio',
+                        'SCL cloud masking evaluated · Computing NDVI, LSWI',
                         `✓ STEP-3 · INDICES COMPUTED`
                       )}
                       {displayScenes.map((sc, idx) => renderStep3SceneRow(sc, idx))}
@@ -4635,24 +4978,6 @@ export default function App() {
             </button>
           )}
 
-          <button
-            onClick={() => setActiveTab('downloaded_info')}
-            style={{
-              display: 'flex',
-              alignItems: 'center',
-              gap: '0.5rem',
-              padding: '0.65rem 1.25rem',
-              fontSize: '0.9rem',
-              fontWeight: 600,
-              border: 'none',
-              borderBottom: activeTab === 'downloaded_info' ? '2px solid #2563eb' : '2px solid transparent',
-              color: activeTab === 'downloaded_info' ? '#2563eb' : '#64748b',
-              backgroundColor: 'transparent',
-              cursor: 'pointer'
-            }}
-          >
-            <Database size={16} /> Downloaded Info & Requests
-          </button>
 
           <button
             onClick={() => {
@@ -4857,6 +5182,41 @@ export default function App() {
                               >
                                 <Terminal size={12} /> Logs
                               </button>
+
+                              {['COMPLETED', 'HELD', 'SUCCESS'].includes(req.status) && (
+                                <button
+                                  onClick={() => {
+                                    closeLogsModal();
+                                    setActiveTab('layer_stacking');
+                                    setStackState(req.state || '');
+                                    setStackDistrict(req.district || '');
+                                    setStackSeason(req.season || 'Kharif');
+                                    const sDate = req.start_date ? req.start_date.split('T')[0] : '2026-06-01';
+                                    const eDate = req.end_date ? req.end_date.split('T')[0] : '2026-10-31';
+                                    setStackStartDate(sDate);
+                                    setStackEndDate(eDate);
+                                    hasAutoLoadedStackRef.current = true;
+                                    loadBandsAndScenesForRegion(req.state, req.district, req.season, sDate, eDate, req.id);
+                                    fetchStackHistory(req.district);
+                                  }}
+                                  style={{
+                                    display: 'inline-flex',
+                                    alignItems: 'center',
+                                    gap: '0.25rem',
+                                    padding: '0.35rem 0.6rem',
+                                    borderRadius: '0.375rem',
+                                    border: '1px solid #bfdbfe',
+                                    backgroundColor: '#eff6ff',
+                                    fontSize: '0.75rem',
+                                    fontWeight: 600,
+                                    color: '#1d4ed8',
+                                    cursor: 'pointer'
+                                  }}
+                                  title="Open Multi-Band Layer Stacking Studio for this request"
+                                >
+                                  <Layers size={12} /> Stacking
+                                </button>
+                              )}
 
                               {req.status === 'PROCESSING' ? (
                                 <button
@@ -5130,13 +5490,9 @@ export default function App() {
                         onChange={(e) => {
                           if (e.target.checked) {
                             setSelectedSatellites([...selectedSatellites, 'Sentinel-1']);
-                            if (!selectedIndices.includes('VV/VH')) {
-                              setSelectedIndices([...selectedIndices, 'VV/VH']);
-                            }
                           } else {
                             if (selectedSatellites.length > 1) {
                               setSelectedSatellites(selectedSatellites.filter(s => s !== 'Sentinel-1'));
-                              setSelectedIndices(selectedIndices.filter(i => i !== 'VV/VH'));
                             }
                           }
                         }}
@@ -5170,7 +5526,7 @@ export default function App() {
                           } else {
                             if (selectedSatellites.length > 1) {
                               setSelectedSatellites(selectedSatellites.filter(s => s !== 'Sentinel-2'));
-                              setSelectedIndices(selectedIndices.filter(i => i === 'VV/VH'));
+                              setSelectedIndices([]);
                             }
                           }
                         }}
@@ -5183,19 +5539,14 @@ export default function App() {
                   </div>
                 </div>
 
-                {/* Spectral & SAR Indices */}
-                <div>
-                  <label style={{ display: 'block', fontSize: '0.8rem', fontWeight: 600, color: '#334155', marginBottom: '0.5rem' }}>
-                    Target Spectral & SAR Indices <span style={{ color: '#ef4444' }}>*</span>
-                  </label>
-                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.75rem' }}>
-                    {(() => {
-                      const desiredOrder = ['VV/VH', 'NDVI', 'LSWI', 'EVI', 'NDWI'];
-                      const available = desiredOrder.filter(idx => {
-                        if (idx === 'VV/VH') return selectedSatellites.includes('Sentinel-1');
-                        return selectedSatellites.includes('Sentinel-2');
-                      });
-                      return available.map((idx) => {
+                {/* Spectral Indices (Sentinel-2) */}
+                {selectedSatellites.includes('Sentinel-2') && (
+                  <div>
+                    <label style={{ display: 'block', fontSize: '0.8rem', fontWeight: 600, color: '#334155', marginBottom: '0.5rem' }}>
+                      Target Spectral Indices (Sentinel-2) <span style={{ color: '#ef4444' }}>*</span>
+                    </label>
+                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.75rem' }}>
+                      {['NDVI', 'LSWI', 'EVI', 'NDWI'].map((idx) => {
                         const checked = selectedIndices.includes(idx);
                         return (
                           <label key={idx} style={{ display: 'inline-flex', alignItems: 'center', gap: '0.35rem', padding: '0.4rem 0.75rem', borderRadius: '0.375rem', border: checked ? '1px solid #2563eb' : '1px solid #cbd5e1', backgroundColor: checked ? '#eff6ff' : '#ffffff', fontSize: '0.82rem', fontWeight: 600, color: checked ? '#1d4ed8' : '#475569', cursor: 'pointer' }}>
@@ -5206,10 +5557,10 @@ export default function App() {
                             {idx}
                           </label>
                         );
-                      });
-                    })()}
+                      })}
+                    </div>
                   </div>
-                </div>
+                )}
 
                 {/* Composite Interval + Level Row */}
                 <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: '1rem' }}>
@@ -6356,6 +6707,40 @@ export default function App() {
                                                       <Terminal size={12} color="#2563eb" /> Logs
                                                     </button>
 
+                                                    {['COMPLETED', 'HELD', 'SUCCESS'].includes(req.status) && (
+                                                      <button
+                                                        onClick={() => {
+                                                          setActiveTab('layer_stacking');
+                                                          setStackState(req.state || '');
+                                                          setStackDistrict(req.district || '');
+                                                          setStackSeason(req.season || 'Kharif');
+                                                          const sDate = req.start_date ? req.start_date.split('T')[0] : '2026-06-01';
+                                                          const eDate = req.end_date ? req.end_date.split('T')[0] : '2026-10-31';
+                                                          setStackStartDate(sDate);
+                                                          setStackEndDate(eDate);
+                                                          hasAutoLoadedStackRef.current = true;
+                                                          loadBandsAndScenesForRegion(req.state, req.district, req.season, sDate, eDate, req.id);
+                                                          fetchStackHistory(req.district);
+                                                        }}
+                                                        title="Open Multi-Band Layer Stacking Studio for this request"
+                                                        style={{
+                                                          display: 'inline-flex',
+                                                          alignItems: 'center',
+                                                          gap: '0.25rem',
+                                                          padding: '0.3rem 0.55rem',
+                                                          borderRadius: '0.375rem',
+                                                          border: '1px solid #bfdbfe',
+                                                          backgroundColor: '#eff6ff',
+                                                          fontSize: '0.75rem',
+                                                          fontWeight: 600,
+                                                          color: '#1d4ed8',
+                                                          cursor: 'pointer'
+                                                        }}
+                                                      >
+                                                        <Layers size={12} color="#1d4ed8" /> Stacking
+                                                      </button>
+                                                    )}
+
                                                     {/* Approve if Hold for Approval */}
                                                     {req.status === 'HOLD_FOR_APPROVAL' && (
                                                       <button
@@ -6532,7 +6917,7 @@ export default function App() {
                   </label>
                   <select
                     value={retSatellite}
-                    onChange={(e) => setRetSatellite(e.target.value)}
+                    onChange={(e) => handleRetSatelliteChange(e.target.value)}
                     style={{ width: '100%', padding: '0.5rem 0.75rem', borderRadius: '0.375rem', border: '1px solid #cbd5e1', fontSize: '0.875rem', backgroundColor: '#ffffff' }}
                   >
                     <option value="ALL">All Sensors (Sentinel-1 & Sentinel-2)</option>
@@ -6541,38 +6926,10 @@ export default function App() {
                   </select>
                 </div>
 
-                {/* Band Select */}
-                <div>
-                  <label style={{ display: 'block', fontSize: '0.8rem', fontWeight: 600, color: '#334155', marginBottom: '0.35rem' }}>
-                    Spectral / SAR Band
-                  </label>
-                  <select
-                    value={retBand}
-                    onChange={(e) => setRetBand(e.target.value)}
-                    style={{ width: '100%', padding: '0.5rem 0.75rem', borderRadius: '0.375rem', border: '1px solid #cbd5e1', fontSize: '0.875rem', backgroundColor: '#ffffff' }}
-                  >
-                    <option value="ALL">All Available Bands (.tif)</option>
-                    <option value="B02">B02 (Blue 10m)</option>
-                    <option value="B03">B03 (Green 10m)</option>
-                    <option value="B04">B04 (Red 10m)</option>
-                    <option value="B08">B08 (NIR 10m)</option>
-                    <option value="B8A">B8A (Red Edge 20m)</option>
-                    <option value="B11">B11 (SWIR 20m)</option>
-                    <option value="SCL">SCL (Scene Classification Layer)</option>
-                    <option value="TCI">TCI (True Color RGB Image)</option>
-                    <option value="VV">VV (Sentinel-1 C-band Co-pol)</option>
-                    <option value="VH">VH (Sentinel-1 C-band Cross-pol)</option>
-                    <option value="VV_VH">VV_VH (Sentinel-1 SAR Ratio 10m)</option>
-                    <option value="NDVI">NDVI (Normalized Difference Veg Index)</option>
-                    <option value="LSWI">LSWI (Land Surface Water Index)</option>
-                    <option value="Composite">Composite / Clipped Rasters (.tif)</option>
-                  </select>
-                </div>
-
                 {/* Temporal Composite Interval */}
                 <div>
                   <label style={{ display: 'block', fontSize: '0.8rem', fontWeight: 600, color: '#334155', marginBottom: '0.35rem' }}>
-                    Temporal Composite Interval {retBand !== 'ALL' && <span style={{ color: '#2563eb', fontSize: '0.72rem', fontWeight: 700 }}>• Active</span>}
+                    Temporal Composite Interval {retSelectedBands.length > 0 && <span style={{ color: '#2563eb', fontSize: '0.72rem', fontWeight: 700 }}>• Active</span>}
                   </label>
                   <select
                     value={retCompositeInterval}
@@ -6581,9 +6938,9 @@ export default function App() {
                       width: '100%',
                       padding: '0.5rem 0.75rem',
                       borderRadius: '0.375rem',
-                      border: retBand !== 'ALL' ? '1px solid #93c5fd' : '1px solid #cbd5e1',
+                      border: retSelectedBands.length > 0 ? '1px solid #93c5fd' : '1px solid #cbd5e1',
                       fontSize: '0.875rem',
-                      backgroundColor: retBand !== 'ALL' ? '#f0f9ff' : '#ffffff'
+                      backgroundColor: retSelectedBands.length > 0 ? '#f0f9ff' : '#ffffff'
                     }}
                   >
                     <option value="ALL">All Intervals / Any</option>
@@ -6618,6 +6975,278 @@ export default function App() {
                     onChange={(e) => setRetEndDate(e.target.value)}
                     style={{ width: '100%', padding: '0.5rem 0.75rem', borderRadius: '0.375rem', border: '1px solid #cbd5e1', fontSize: '0.875rem' }}
                   />
+                </div>
+
+                {/* Spectral / SAR Band Checkboxes (Filtered by Satellite) */}
+                <div style={{ gridColumn: '1 / -1', marginTop: '0.35rem' }}>
+                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '0.5rem', flexWrap: 'wrap', gap: '0.5rem' }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                      <label style={{ fontSize: '0.825rem', fontWeight: 700, color: '#1e293b' }}>
+                        Spectral / SAR Band
+                      </label>
+                      <span style={{
+                        fontSize: '0.72rem',
+                        fontWeight: 600,
+                        padding: '0.15rem 0.55rem',
+                        borderRadius: '0.25rem',
+                        backgroundColor: retSatellite === 'Sentinel-1' ? '#f0fdf4' : retSatellite === 'Sentinel-2' ? '#eff6ff' : '#f8fafc',
+                        color: retSatellite === 'Sentinel-1' ? '#166534' : retSatellite === 'Sentinel-2' ? '#1d4ed8' : '#475569',
+                        border: '1px solid #cbd5e1'
+                      }}>
+                        {retSatellite === 'Sentinel-1' ? 'Sentinel-1 SAR Radar' : retSatellite === 'Sentinel-2' ? 'Sentinel-2 MSI Optical' : 'All Sensors (S1 + S2)'}
+                      </span>
+                      {retSelectedBands.length > 0 ? (
+                        <span style={{ fontSize: '0.72rem', fontWeight: 700, color: '#2563eb' }}>
+                          • {retSelectedBands.length} band{retSelectedBands.length > 1 ? 's' : ''} selected
+                        </span>
+                      ) : (
+                        <span style={{ fontSize: '0.72rem', color: '#64748b' }}>
+                          (All bands included by default, or check required bands below)
+                        </span>
+                      )}
+                    </div>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                      <button
+                        type="button"
+                        onClick={handleSelectAllRetBands}
+                        style={{
+                          fontSize: '0.72rem',
+                          fontWeight: 600,
+                          padding: '0.2rem 0.6rem',
+                          borderRadius: '0.25rem',
+                          border: '1px solid #cbd5e1',
+                          backgroundColor: '#ffffff',
+                          color: '#2563eb',
+                          cursor: 'pointer'
+                        }}
+                      >
+                        Select All
+                      </button>
+                      <button
+                        type="button"
+                        onClick={handleClearAllRetBands}
+                        style={{
+                          fontSize: '0.72rem',
+                          fontWeight: 600,
+                          padding: '0.2rem 0.6rem',
+                          borderRadius: '0.25rem',
+                          border: '1px solid #cbd5e1',
+                          backgroundColor: '#ffffff',
+                          color: '#64748b',
+                          cursor: 'pointer'
+                        }}
+                      >
+                        Clear Selection
+                      </button>
+                    </div>
+                  </div>
+
+                  {/* Sentinel-1 Only Bands */}
+                  {retSatellite === 'Sentinel-1' && (
+                    <div style={{
+                      display: 'grid',
+                      gridTemplateColumns: 'repeat(auto-fill, minmax(210px, 1fr))',
+                      gap: '0.6rem',
+                      padding: '0.75rem',
+                      backgroundColor: '#ffffff',
+                      borderRadius: '0.5rem',
+                      border: '1px solid #cbd5e1'
+                    }}>
+                      {RET_S1_BANDS.map(b => {
+                        const isChecked = retSelectedBands.includes(b.id);
+                        return (
+                          <label
+                            key={b.id}
+                            style={{
+                              display: 'flex',
+                              alignItems: 'center',
+                              gap: '0.6rem',
+                              padding: '0.5rem 0.75rem',
+                              borderRadius: '0.375rem',
+                              border: `1px solid ${isChecked ? '#86efac' : '#e2e8f0'}`,
+                              backgroundColor: isChecked ? '#f0fdf4' : '#fafafa',
+                              cursor: 'pointer',
+                              userSelect: 'none'
+                            }}
+                          >
+                            <input
+                              type="checkbox"
+                              checked={isChecked}
+                              onChange={() => handleToggleRetBand(b.id)}
+                              style={{ width: '16px', height: '16px', accentColor: '#16a34a', cursor: 'pointer' }}
+                            />
+                            <div>
+                              <div style={{ fontSize: '0.85rem', fontWeight: 700, color: isChecked ? '#14532d' : '#1e293b' }}>
+                                {b.label}
+                              </div>
+                              <div style={{ fontSize: '0.72rem', color: isChecked ? '#166534' : '#64748b' }}>
+                                {b.tag}
+                              </div>
+                            </div>
+                          </label>
+                        );
+                      })}
+                    </div>
+                  )}
+
+                  {/* Sentinel-2 Only Bands */}
+                  {retSatellite === 'Sentinel-2' && (
+                    <div style={{
+                      display: 'grid',
+                      gridTemplateColumns: 'repeat(auto-fill, minmax(180px, 1fr))',
+                      gap: '0.6rem',
+                      padding: '0.75rem',
+                      backgroundColor: '#ffffff',
+                      borderRadius: '0.5rem',
+                      border: '1px solid #cbd5e1'
+                    }}>
+                      {RET_S2_BANDS.map(b => {
+                        const isChecked = retSelectedBands.includes(b.id);
+                        return (
+                          <label
+                            key={b.id}
+                            style={{
+                              display: 'flex',
+                              alignItems: 'center',
+                              gap: '0.6rem',
+                              padding: '0.5rem 0.75rem',
+                              borderRadius: '0.375rem',
+                              border: `1px solid ${isChecked ? '#93c5fd' : '#e2e8f0'}`,
+                              backgroundColor: isChecked ? '#eff6ff' : '#fafafa',
+                              cursor: 'pointer',
+                              userSelect: 'none'
+                            }}
+                          >
+                            <input
+                              type="checkbox"
+                              checked={isChecked}
+                              onChange={() => handleToggleRetBand(b.id)}
+                              style={{ width: '16px', height: '16px', accentColor: '#2563eb', cursor: 'pointer' }}
+                            />
+                            <div>
+                              <div style={{ fontSize: '0.85rem', fontWeight: 700, color: isChecked ? '#1e3a8a' : '#1e293b' }}>
+                                {b.label}
+                              </div>
+                              <div style={{ fontSize: '0.72rem', color: isChecked ? '#1d4ed8' : '#64748b' }}>
+                                {b.tag}
+                              </div>
+                            </div>
+                          </label>
+                        );
+                      })}
+                    </div>
+                  )}
+
+                  {/* Both Sensors (ALL) */}
+                  {retSatellite === 'ALL' && (
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
+                      {/* Sentinel-1 Group */}
+                      <div style={{
+                        padding: '0.75rem',
+                        backgroundColor: '#ffffff',
+                        borderRadius: '0.5rem',
+                        border: '1px solid #e2e8f0'
+                      }}>
+                        <div style={{ fontSize: '0.78rem', fontWeight: 700, color: '#166534', marginBottom: '0.5rem', display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
+                          <span style={{ width: '8px', height: '8px', borderRadius: '50%', backgroundColor: '#16a34a', display: 'inline-block' }}></span>
+                          Sentinel-1 SAR Radar Bands
+                        </div>
+                        <div style={{
+                          display: 'grid',
+                          gridTemplateColumns: 'repeat(auto-fill, minmax(210px, 1fr))',
+                          gap: '0.5rem'
+                        }}>
+                          {RET_S1_BANDS.map(b => {
+                            const isChecked = retSelectedBands.includes(b.id);
+                            return (
+                              <label
+                                key={b.id}
+                                style={{
+                                  display: 'flex',
+                                  alignItems: 'center',
+                                  gap: '0.55rem',
+                                  padding: '0.45rem 0.65rem',
+                                  borderRadius: '0.375rem',
+                                  border: `1px solid ${isChecked ? '#86efac' : '#e2e8f0'}`,
+                                  backgroundColor: isChecked ? '#f0fdf4' : '#fafafa',
+                                  cursor: 'pointer',
+                                  userSelect: 'none'
+                                }}
+                              >
+                                <input
+                                  type="checkbox"
+                                  checked={isChecked}
+                                  onChange={() => handleToggleRetBand(b.id)}
+                                  style={{ width: '15px', height: '15px', accentColor: '#16a34a', cursor: 'pointer' }}
+                                />
+                                <div>
+                                  <span style={{ fontSize: '0.825rem', fontWeight: 700, color: isChecked ? '#14532d' : '#1e293b' }}>
+                                    {b.label}
+                                  </span>{' '}
+                                  <span style={{ fontSize: '0.7rem', color: isChecked ? '#166534' : '#64748b' }}>
+                                    ({b.tag})
+                                  </span>
+                                </div>
+                              </label>
+                            );
+                          })}
+                        </div>
+                      </div>
+
+                      {/* Sentinel-2 Group */}
+                      <div style={{
+                        padding: '0.75rem',
+                        backgroundColor: '#ffffff',
+                        borderRadius: '0.5rem',
+                        border: '1px solid #e2e8f0'
+                      }}>
+                        <div style={{ fontSize: '0.78rem', fontWeight: 700, color: '#1d4ed8', marginBottom: '0.5rem', display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
+                          <span style={{ width: '8px', height: '8px', borderRadius: '50%', backgroundColor: '#2563eb', display: 'inline-block' }}></span>
+                          Sentinel-2 MSI Optical Spectral Bands & Indices
+                        </div>
+                        <div style={{
+                          display: 'grid',
+                          gridTemplateColumns: 'repeat(auto-fill, minmax(180px, 1fr))',
+                          gap: '0.5rem'
+                        }}>
+                          {RET_S2_BANDS.map(b => {
+                            const isChecked = retSelectedBands.includes(b.id);
+                            return (
+                              <label
+                                key={b.id}
+                                style={{
+                                  display: 'flex',
+                                  alignItems: 'center',
+                                  gap: '0.55rem',
+                                  padding: '0.45rem 0.65rem',
+                                  borderRadius: '0.375rem',
+                                  border: `1px solid ${isChecked ? '#93c5fd' : '#e2e8f0'}`,
+                                  backgroundColor: isChecked ? '#eff6ff' : '#fafafa',
+                                  cursor: 'pointer',
+                                  userSelect: 'none'
+                                }}
+                              >
+                                <input
+                                  type="checkbox"
+                                  checked={isChecked}
+                                  onChange={() => handleToggleRetBand(b.id)}
+                                  style={{ width: '15px', height: '15px', accentColor: '#2563eb', cursor: 'pointer' }}
+                                />
+                                <div>
+                                  <span style={{ fontSize: '0.825rem', fontWeight: 700, color: isChecked ? '#1e3a8a' : '#1e293b' }}>
+                                    {b.label}
+                                  </span>{' '}
+                                  <span style={{ fontSize: '0.7rem', color: isChecked ? '#1d4ed8' : '#64748b' }}>
+                                    ({b.tag})
+                                  </span>
+                                </div>
+                              </label>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    </div>
+                  )}
                 </div>
               </div>
 
@@ -6668,7 +7297,7 @@ export default function App() {
                   {downloadingZip ? 'Downloading data from NAS...' : 'Download GeoTIFF Data (.zip)'}
                 </button>
 
-                {(retState || retDistrict || retBand !== 'ALL' || retCompositeInterval !== 'ALL' || retSatellite !== 'ALL' || retStartDate || retEndDate) && (
+                {(retState || retDistrict || retSelectedBands.length > 0 || retBand !== 'ALL' || retCompositeInterval !== 'ALL' || retSatellite !== 'ALL' || retStartDate || retEndDate) && (
                   <button
                     type="button"
                     onClick={() => {
@@ -6676,6 +7305,7 @@ export default function App() {
                       setRetDistrict('');
                       setRetSatellite('ALL');
                       setRetBand('ALL');
+                      setRetSelectedBands([]);
                       setRetCompositeInterval('ALL');
                       setRetStartDate('');
                       setRetEndDate('');
@@ -6872,33 +7502,9 @@ export default function App() {
                         Data is available on NAS. Do you want to download this data?
                       </p>
                       <p style={{ fontSize: '0.8rem', color: '#64748b', margin: '0.35rem 0 0 0' }}>
-                        The system will archive all verified GeoTIFF raster files matching your query into a ZIP package.
+                        The download will run in the background so you can freely continue your work.
                       </p>
                     </div>
-
-                    {/* Progress indicator inside modal */}
-                    {downloadingZip && (
-                      <div style={{
-                        backgroundColor: '#eff6ff',
-                        border: '1px solid #bfdbfe',
-                        borderRadius: '0.5rem',
-                        padding: '0.85rem 1rem',
-                        marginBottom: '1.25rem',
-                        display: 'flex',
-                        alignItems: 'center',
-                        gap: '0.75rem'
-                      }}>
-                        <RefreshCw size={20} className="animate-spin" color="#2563eb" />
-                        <div>
-                          <div style={{ fontSize: '0.875rem', fontWeight: 700, color: '#1d4ed8' }}>
-                            Downloading data in progress...
-                          </div>
-                          <div style={{ fontSize: '0.78rem', color: '#3b82f6' }}>
-                            Retrieving rasters from NAS and streaming ZIP archive.
-                          </div>
-                        </div>
-                      </div>
-                    )}
 
                     {/* Modal Action Buttons */}
                     <div style={{ display: 'flex', gap: '0.75rem', justifyContent: 'flex-end' }}>
@@ -7395,233 +8001,6 @@ export default function App() {
         )}
 
         {/* ========================================================================= */}
-        {/* TAB 5: Downloaded Requests Information & Spatial Archive Overview */}
-        {/* ========================================================================= */}
-        {activeTab === 'downloaded_info' && (
-          <div style={{ display: 'flex', flexDirection: 'column', gap: '1.25rem' }}>
-            
-            {/* Page Title & Context Header */}
-            <div style={{
-              backgroundColor: '#ffffff',
-              borderRadius: '0.75rem',
-              border: '1px solid #e2e8f0',
-              padding: '1.25rem 1.5rem',
-              display: 'flex',
-              alignItems: 'center',
-              justifyContent: 'space-between',
-              flexWrap: 'wrap',
-              gap: '1rem',
-              boxShadow: '0 1px 3px rgba(0,0,0,0.03)'
-            }}>
-              <div>
-                <h2 style={{ fontSize: '1.2rem', fontWeight: 700, color: '#0f172a', margin: 0, display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-                  <Database size={22} color="#2563eb" /> Downloaded Info & Acquisition Requests Overview
-                </h2>
-              </div>
-
-              <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', fontSize: '0.78rem', color: '#2563eb', backgroundColor: '#eff6ff', padding: '0.4rem 0.75rem', borderRadius: '0.375rem', border: '1px solid #bfdbfe', fontWeight: 600 }}>
-                <RefreshCw size={14} className="animate-spin" /> Live Auto-Updating (2s)
-              </div>
-            </div>
-
-            {/* Filter & Search Bar */}
-            <div style={{
-              backgroundColor: '#ffffff',
-              padding: '1rem 1.25rem',
-              borderRadius: '0.5rem',
-              border: '1px solid #e2e8f0',
-              display: 'flex',
-              alignItems: 'center',
-              justifyContent: 'space-between',
-              gap: '1rem',
-              flexWrap: 'wrap'
-            }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem', flex: 1, minWidth: '280px' }}>
-                <div style={{ position: 'relative', width: '100%' }}>
-                  <Search size={16} style={{ position: 'absolute', left: '0.75rem', top: '50%', transform: 'translateY(-50%)', color: '#94a3b8' }} />
-                  <input
-                    type="text"
-                    value={dlSearchQuery}
-                    onChange={(e) => setDlSearchQuery(e.target.value)}
-                    placeholder="Search by State, District, Season, Satellite, Bands, or Title..."
-                    style={{
-                      width: '100%',
-                      padding: '0.55rem 0.75rem 0.55rem 2.25rem',
-                      borderRadius: '0.375rem',
-                      border: '1px solid #cbd5e1',
-                      fontSize: '0.85rem',
-                      outline: 'none'
-                    }}
-                  />
-                </div>
-              </div>
-
-              <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem', flexWrap: 'wrap' }}>
-                {/* Status Filter */}
-                <select
-                  value={dlStatusFilter}
-                  onChange={(e) => setDlStatusFilter(e.target.value)}
-                  style={{ padding: '0.55rem 0.75rem', borderRadius: '0.375rem', border: '1px solid #cbd5e1', fontSize: '0.85rem', backgroundColor: '#ffffff' }}
-                >
-                  <option value="ALL">All Statuses</option>
-                  <option value="COMPLETED">COMPLETED</option>
-                  <option value="PROCESSING">PROCESSING</option>
-                  <option value="ACCEPTED">ACCEPTED</option>
-                  <option value="HOLD_FOR_APPROVAL">HOLD FOR APPROVAL</option>
-                  <option value="FAILED">FAILED</option>
-                </select>
-
-                {/* Satellite Filter */}
-                <select
-                  value={dlSatFilter}
-                  onChange={(e) => setDlSatFilter(e.target.value)}
-                  style={{ padding: '0.55rem 0.75rem', borderRadius: '0.375rem', border: '1px solid #cbd5e1', fontSize: '0.85rem', backgroundColor: '#ffffff' }}
-                >
-                  <option value="ALL">All Satellites</option>
-                  <option value="Sentinel-1">Sentinel-1 (SAR)</option>
-                  <option value="Sentinel-2">Sentinel-2 (MSI)</option>
-                </select>
-              </div>
-            </div>
-
-            {/* Structured Downloaded Info Table */}
-            <div style={{ backgroundColor: '#ffffff', borderRadius: '0.5rem', border: '1px solid #e2e8f0', overflow: 'hidden', boxShadow: '0 1px 3px rgba(0,0,0,0.03)' }}>
-              <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.82rem', textAlign: 'left' }}>
-                <thead>
-                  <tr style={{ backgroundColor: '#f8fafc', borderBottom: '1px solid #e2e8f0', color: '#475569', fontWeight: 700 }}>
-                    <th style={{ padding: '0.75rem 1rem', width: '70px' }}>ID</th>
-                    <th style={{ padding: '0.75rem 1rem', minWidth: '150px' }}>Request Title</th>
-                    <th style={{ padding: '0.75rem 1rem', width: '130px' }}>State</th>
-                    <th style={{ padding: '0.75rem 1rem', width: '130px' }}>District</th>
-                    <th style={{ padding: '0.75rem 1rem', width: '110px' }}>Season</th>
-                    <th style={{ padding: '0.75rem 1rem', width: '180px' }}>Sensing Date Range</th>
-                    <th style={{ padding: '0.75rem 1rem', width: '130px' }}>Satellite Sensor</th>
-                    <th style={{ padding: '0.75rem 1rem', minWidth: '180px' }}>Bands</th>
-                    <th style={{ padding: '0.75rem 1rem', minWidth: '140px' }}>Indices</th>
-                    <th style={{ padding: '0.75rem 1rem', width: '130px' }}>Composite Interval</th>
-                    <th style={{ padding: '0.75rem 1rem', width: '110px' }}>Status</th>
-                    <th style={{ padding: '0.75rem 1rem', width: '130px', textAlign: 'center' }}>Actions</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {(() => {
-                    const filtered = requests.filter(r => {
-                      if (dlStatusFilter !== 'ALL' && r.status !== dlStatusFilter) return false;
-                      if (dlSatFilter !== 'ALL' && !r.satellite.includes(dlSatFilter)) return false;
-                      if (dlSearchQuery.trim()) {
-                        const q = dlSearchQuery.toLowerCase();
-                        const titleStr = (r.request_title || '').toLowerCase();
-                        const stateStr = (r.state || '').toLowerCase();
-                        const distStr = (r.district || '').toLowerCase();
-                        const seasonStr = (r.season || '').toLowerCase();
-                        const satStr = (r.satellite || '').toLowerCase();
-                        const bandsStr = Array.isArray(r.bands) ? r.bands.join(' ').toLowerCase() : '';
-                        const indicesStr = Array.isArray(r.indices) ? r.indices.join(' ').toLowerCase() : '';
-                        return (
-                          titleStr.includes(q) ||
-                          stateStr.includes(q) ||
-                          distStr.includes(q) ||
-                          seasonStr.includes(q) ||
-                          satStr.includes(q) ||
-                          bandsStr.includes(q) ||
-                          indicesStr.includes(q) ||
-                          String(r.id).includes(q)
-                        );
-                      }
-                      return true;
-                    });
-
-                    if (filtered.length === 0) {
-                      return (
-                        <tr>
-                          <td colSpan={12} style={{ padding: '3rem 1rem', textAlign: 'center', color: '#94a3b8' }}>
-                            <Database size={24} style={{ margin: '0 auto 0.5rem auto', color: '#94a3b8' }} />
-                            <div>No request entries matched the specified criteria.</div>
-                          </td>
-                        </tr>
-                      );
-                    }
-
-                    return filtered.map((req) => (
-                      <tr key={req.id} style={{ borderBottom: '1px solid #f1f5f9' }}>
-                        <td style={{ padding: '0.75rem 1rem', fontWeight: 700, color: '#0f172a', fontFamily: 'monospace' }}>
-                          #{req.id}
-                        </td>
-                        <td style={{ padding: '0.75rem 1rem', fontWeight: 600, color: '#0f172a' }}>
-                          {req.request_title}
-                          {currentUser?.role === 'ADMIN' && req.user_email && (
-                            <div style={{ fontSize: '0.72rem', color: '#64748b', fontWeight: 400 }}>{req.user_email}</div>
-                          )}
-                        </td>
-                        <td style={{ padding: '0.75rem 1rem', color: '#334155', fontWeight: 600 }}>
-                          {req.state || '—'}
-                        </td>
-                        <td style={{ padding: '0.75rem 1rem', color: '#2563eb', fontWeight: 700, fontFamily: 'monospace' }}>
-                          {req.district || '—'}
-                        </td>
-                        <td style={{ padding: '0.75rem 1rem', color: '#475569' }}>
-                          {req.season || '—'}
-                        </td>
-                        <td style={{ padding: '0.75rem 1rem', fontFamily: 'monospace', color: '#334155', fontSize: '0.78rem' }}>
-                          {req.start_date} → {req.end_date}
-                        </td>
-                        <td style={{ padding: '0.75rem 1rem', fontWeight: 600, color: '#0f172a' }}>
-                          <span style={{ backgroundColor: '#eff6ff', border: '1px solid #bfdbfe', color: '#1d4ed8', padding: '0.15rem 0.45rem', borderRadius: '0.25rem', fontSize: '0.75rem' }}>
-                            {req.satellite}
-                          </span>
-                        </td>
-                        <td style={{ padding: '0.75rem 1rem' }}>
-                          <div style={{ display: 'flex', gap: '0.25rem', flexWrap: 'wrap' }}>
-                            {Array.isArray(req.bands) && req.bands.length > 0 ? (
-                              req.bands.map((b, bIdx) => (
-                                <span key={bIdx} style={{ padding: '0.1rem 0.35rem', borderRadius: '0.2rem', fontSize: '0.7rem', fontWeight: 700, fontFamily: 'monospace', backgroundColor: '#f0fdf4', border: '1px solid #a7f3d0', color: '#047857' }}>
-                                  {b}
-                                </span>
-                              ))
-                            ) : (
-                              <span style={{ color: '#94a3b8' }}>All Bands</span>
-                            )}
-                          </div>
-                        </td>
-                        <td style={{ padding: '0.75rem 1rem' }}>
-                          <div style={{ display: 'flex', gap: '0.25rem', flexWrap: 'wrap' }}>
-                            {Array.isArray(req.indices) && req.indices.length > 0 ? (
-                              req.indices.map((idx, iIdx) => (
-                                <span key={iIdx} style={{ padding: '0.1rem 0.35rem', borderRadius: '0.2rem', fontSize: '0.7rem', fontWeight: 700, fontFamily: 'monospace', backgroundColor: '#eff6ff', border: '1px solid #bfdbfe', color: '#1d4ed8' }}>
-                                  {idx}
-                                </span>
-                              ))
-                            ) : (
-                              <span style={{ color: '#94a3b8' }}>—</span>
-                            )}
-                          </div>
-                        </td>
-                        <td style={{ padding: '0.75rem 1rem', textTransform: 'uppercase', fontFamily: 'monospace', fontSize: '0.75rem', fontWeight: 700, color: '#475569' }}>
-                          {req.composite_interval || 'NONE'}
-                        </td>
-                        <td style={{ padding: '0.75rem 1rem' }}>
-                          {renderStatusBadge(req.status)}
-                        </td>
-                        <td style={{ padding: '0.75rem 1rem', textAlign: 'center' }}>
-                          <button
-                            onClick={() => openLogsModal(req)}
-                            title="View Execution Logs"
-                            style={{ padding: '0.35rem 0.75rem', border: '1px solid #cbd5e1', borderRadius: '0.375rem', backgroundColor: '#ffffff', color: '#334155', cursor: 'pointer', display: 'inline-flex', alignItems: 'center', gap: '0.35rem', fontSize: '0.78rem', fontWeight: 600 }}
-                          >
-                            <Terminal size={13} color="#2563eb" /> Logs
-                          </button>
-                        </td>
-                      </tr>
-                    ));
-                  })()}
-                </tbody>
-              </table>
-            </div>
-
-          </div>
-        )}
-
-        {/* ========================================================================= */}
         {/* TAB: Layer Stacking Studio */}
         {/* ========================================================================= */}
         {activeTab === 'layer_stacking' && (
@@ -7686,15 +8065,31 @@ export default function App() {
                     onChange={(e) => {
                       const st = e.target.value;
                       setStackState(st);
-                      setStackDistrict('');
-                      setStackDownloadedBandsData({});
-                      setStackSelectedScenes({});
-                      fetchStackHistory('');
+                      // Look for downloaded districts in this state first
+                      const matchedDownloaded = (retDownloadedDistricts || []).filter(d => {
+                        const dState = typeof d === 'string' ? '' : (d.state_name || '');
+                        return st && dState.toLowerCase() === st.toLowerCase();
+                      });
+                      const nextDist = matchedDownloaded.length > 0
+                        ? (typeof matchedDownloaded[0] === 'string' ? matchedDownloaded[0] : (matchedDownloaded[0].district_name || ''))
+                        : '';
+                      setStackDistrict(nextDist);
+                      fetchStackHistory(nextDist);
+                      if (nextDist) {
+                        loadBandsAndScenesForRegion(st, nextDist, stackSeason, stackStartDate, stackEndDate);
+                      } else {
+                        setStackDownloadedBandsData({});
+                        setStackSelectedScenes({});
+                        setStackSelectedLayers([]);
+                      }
                     }}
                     style={{ width: '100%', padding: '0.5rem 0.75rem', borderRadius: '0.375rem', border: '1px solid #cbd5e1', fontSize: '0.875rem', backgroundColor: '#ffffff' }}
                   >
                     <option value="">-- All States / Select State --</option>
-                    {(retDownloadedStates.length > 0 ? retDownloadedStates : statesList).map((s, i) => {
+                    {stackState && !(retDownloadedStates || []).some(s => (typeof s === 'string' ? s : s.state_name || '').toLowerCase() === stackState.toLowerCase()) && (
+                      <option value={stackState}>{stackState}</option>
+                    )}
+                    {(retDownloadedStates || []).map((s, i) => {
                       const stName = typeof s === 'string' ? s : (s.state_name || '');
                       return <option key={i} value={stName}>{stName}</option>;
                     })}
@@ -7713,16 +8108,31 @@ export default function App() {
                       setStackDistrict(d);
                       fetchStackHistory(d);
                       if (d) {
-                        loadBandsAndScenesForRegion(stackState, d, stackSeason, stackStartDate, stackEndDate);
+                        let st = stackState;
+                        if (!st) {
+                          const matchItem = (retDownloadedDistricts || []).find(item => {
+                            const dName = typeof item === 'string' ? item : (item.district_name || '');
+                            return dName.toLowerCase() === d.toLowerCase();
+                          });
+                          if (matchItem && typeof matchItem !== 'string' && matchItem.state_name) {
+                            st = matchItem.state_name;
+                            setStackState(st);
+                          }
+                        }
+                        loadBandsAndScenesForRegion(st, d, stackSeason, stackStartDate, stackEndDate);
                       } else {
                         setStackDownloadedBandsData({});
                         setStackSelectedScenes({});
+                        setStackSelectedLayers([]);
                       }
                     }}
                     style={{ width: '100%', padding: '0.5rem 0.75rem', borderRadius: '0.375rem', border: '1px solid #cbd5e1', fontSize: '0.875rem', backgroundColor: '#ffffff', fontWeight: 600 }}
                   >
                     <option value="">-- Select Target District --</option>
-                    {(retDownloadedDistricts.length > 0 ? retDownloadedDistricts : districtsList)
+                    {stackDistrict && !(retDownloadedDistricts || []).some(d => (typeof d === 'string' ? d : d.district_name || '').toLowerCase() === stackDistrict.toLowerCase()) && (
+                      <option value={stackDistrict}>{stackDistrict}</option>
+                    )}
+                    {(retDownloadedDistricts || [])
                       .filter(d => {
                         const dState = typeof d === 'string' ? '' : (d.state_name || '');
                         return !stackState || (dState && dState.toLowerCase() === stackState.toLowerCase());
@@ -7731,31 +8141,6 @@ export default function App() {
                         const dName = typeof d === 'string' ? d : (d.district_name || '');
                         return <option key={i} value={dName}>{dName}</option>;
                       })}
-                  </select>
-                </div>
-
-                {/* Acquisition Job / Request Select */}
-                <div>
-                  <label style={{ display: 'block', fontSize: '0.8rem', fontWeight: 600, color: '#334155', marginBottom: '0.35rem' }}>
-                    Acquisition Job / Request
-                  </label>
-                  <select
-                    value={stackSelectedRequestId || ''}
-                    onChange={(e) => {
-                      const reqId = e.target.value;
-                      setStackSelectedRequestId(reqId);
-                      loadBandsAndScenesForRegion(stackState, stackDistrict, stackSeason, stackStartDate, stackEndDate, reqId ? Number(reqId) : null);
-                    }}
-                    style={{ width: '100%', padding: '0.5rem 0.75rem', borderRadius: '0.375rem', border: '1px solid #cbd5e1', fontSize: '0.875rem', backgroundColor: '#ffffff' }}
-                  >
-                    <option value="">-- Auto-Select / All Matching Requests --</option>
-                    {requests
-                      .filter(r => stackDistrict && r.district && r.district.toLowerCase() === stackDistrict.toLowerCase())
-                      .map((r, i) => (
-                        <option key={r.id || i} value={r.id}>
-                          {r.request_title || 'Untitled Request'} ({r.satellite || 'Sentinel'} • {r.season || 'Custom'})
-                        </option>
-                      ))}
                   </select>
                 </div>
 
@@ -7881,7 +8266,7 @@ export default function App() {
                   <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.5rem', alignItems: 'center' }}>
                     {stackSelectedLayers.map((layer, idx) => {
                       const isIndex = ['NDVI', 'LSWI'].includes(layer);
-                      const isSar = ['VV', 'VH', 'VV_VH'].includes(layer);
+                      const isSar = ['VV', 'VH'].includes(layer);
                       const badgeColor = isIndex ? '#2563eb' : (isSar ? '#d97706' : '#059669');
                       const borderColor = isIndex ? '#93c5fd' : (isSar ? '#fde68a' : '#86efac');
                       return (
@@ -8032,7 +8417,7 @@ export default function App() {
                                 gap: '0.35rem'
                               }}>
                                 <span>
-                                  Downloaded Scenes (<strong style={{ color: selectedCount > 0 ? '#16a34a' : '#dc2626' }}>{selectedCount}</strong>/{scenes.length} selected):
+                                  {scenes.some(s => (s.filename && s.filename.toLowerCase().includes('composite')) || (s.path && s.path.toLowerCase().includes('composite'))) ? 'Downloaded Composite Files' : 'Downloaded Scenes'} (<strong style={{ color: selectedCount > 0 ? '#16a34a' : '#dc2626' }}>{selectedCount}</strong>/{scenes.length} selected):
                                 </span>
                                 <div style={{ display: 'flex', gap: '0.35rem' }}>
                                   <button
@@ -8089,6 +8474,11 @@ export default function App() {
                                 {scenes.map((s, sIdx) => {
                                   const sceneKey = s.path || s.scene_id;
                                   const isSceneSelected = bandSelectedSet !== undefined ? bandSelectedSet.has(sceneKey) : true;
+                                  const fnLower = (s.filename || '').toLowerCase();
+                                  const pathLower = (s.path || '').toLowerCase();
+                                  const isRealCompositeFile = fnLower.includes('composite') || pathLower.includes('/composites/') || pathLower.includes('\\composites\\');
+                                  const fullFileName = s.filename || (s.path ? s.path.split(/[\\/]/).pop() : '') || (s.scene_id ? `${s.scene_id}.tif` : `${item.id}.tif`);
+
                                   return (
                                     <div
                                       key={sceneKey || sIdx}
@@ -8119,36 +8509,64 @@ export default function App() {
                                             cursor: 'pointer',
                                             width: '16px',
                                             height: '16px',
+                                            flexShrink: 0,
                                             accentColor: groupColor
                                           }}
                                         />
-                                        <div style={{ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                                          <span style={{ fontWeight: 600, color: isSceneSelected ? '#0f172a' : '#64748b' }}>
-                                            📅 {s.sensing_date ? s.sensing_date.split('T')[0] : 'N/A'}
-                                          </span>
-                                          {s.tile && (
-                                            <span style={{ backgroundColor: isSceneSelected ? '#e2e8f0' : '#f1f5f9', color: isSceneSelected ? '#1e293b' : '#64748b', borderRadius: '0.2rem', padding: '0.05rem 0.35rem', fontSize: '0.68rem', fontWeight: 700, marginLeft: '0.35rem' }}>
-                                              {s.tile}
+
+                                        {isRealCompositeFile ? (
+                                          /* Complete clearly visible file name ONLY for actual composite files */
+                                          <div style={{ minWidth: 0, flex: 1, display: 'flex', alignItems: 'center', gap: '0.45rem', flexWrap: 'wrap' }}>
+                                            <span
+                                              title={fullFileName}
+                                              style={{
+                                                fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace',
+                                                fontSize: '0.73rem',
+                                                fontWeight: 700,
+                                                color: isSceneSelected ? '#0f172a' : '#64748b',
+                                                wordBreak: 'break-all',
+                                                lineHeight: 1.35
+                                              }}
+                                            >
+                                              📄 {fullFileName}
                                             </span>
-                                          )}
-                                          {s.is_composite ? (
-                                            <span style={{ backgroundColor: '#fef3c7', color: '#92400e', border: '1px solid #fde68a', borderRadius: '0.2rem', padding: '0.05rem 0.35rem', fontSize: '0.66rem', fontWeight: 700, marginLeft: '0.35rem' }}>
+                                            <span style={{
+                                              backgroundColor: '#fef3c7',
+                                              color: '#92400e',
+                                              border: '1px solid #fde68a',
+                                              borderRadius: '0.2rem',
+                                              padding: '0.05rem 0.35rem',
+                                              fontSize: '0.63rem',
+                                              fontWeight: 700,
+                                              flexShrink: 0
+                                            }}>
                                               COMPOSITE
                                             </span>
-                                          ) : (
+                                          </div>
+                                        ) : (
+                                          /* Standard raw scenes (B02, B03, B04, etc.) */
+                                          <div style={{ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                                            <span style={{ fontWeight: 600, color: isSceneSelected ? '#0f172a' : '#64748b' }}>
+                                              📅 {s.sensing_date ? s.sensing_date.split('T')[0] : 'N/A'}
+                                            </span>
+                                            {s.tile && (
+                                              <span style={{ backgroundColor: isSceneSelected ? '#e2e8f0' : '#f1f5f9', color: isSceneSelected ? '#1e293b' : '#64748b', borderRadius: '0.2rem', padding: '0.05rem 0.35rem', fontSize: '0.68rem', fontWeight: 700, marginLeft: '0.35rem' }}>
+                                                {s.tile}
+                                              </span>
+                                            )}
                                             <span style={{ backgroundColor: '#e0f2fe', color: '#0369a1', border: '1px solid #bae6fd', borderRadius: '0.2rem', padding: '0.05rem 0.35rem', fontSize: '0.66rem', fontWeight: 700, marginLeft: '0.35rem' }}>
                                               RAW SCENE
                                             </span>
-                                          )}
-                                          <span style={{ color: isSceneSelected ? '#334155' : '#94a3b8', marginLeft: '0.35rem' }}>
-                                            🛰️ {s.scene_id ? (s.scene_id.length > 25 ? s.scene_id.substring(0, 22) + '...' : s.scene_id) : 'Scene'}
-                                          </span>
-                                          {s.filename && (
-                                            <span style={{ color: isSceneSelected ? groupColor : '#94a3b8', marginLeft: '0.45rem', fontFamily: 'monospace', fontSize: '0.7rem' }}>
-                                              ({s.filename})
+                                            <span style={{ color: isSceneSelected ? '#334155' : '#94a3b8', marginLeft: '0.35rem' }}>
+                                              🛰️ {s.scene_id ? (s.scene_id.length > 25 ? s.scene_id.substring(0, 22) + '...' : s.scene_id) : 'Scene'}
                                             </span>
-                                          )}
-                                        </div>
+                                            {s.filename && (
+                                              <span style={{ color: isSceneSelected ? groupColor : '#94a3b8', marginLeft: '0.45rem', fontFamily: 'monospace', fontSize: '0.7rem' }}>
+                                                ({s.filename})
+                                              </span>
+                                            )}
+                                          </div>
+                                        )}
                                       </div>
                                       <button
                                         type="button"
@@ -8166,7 +8584,8 @@ export default function App() {
                                           borderRadius: '0.25rem',
                                           display: 'flex',
                                           alignItems: 'center',
-                                          marginLeft: '0.4rem'
+                                          marginLeft: '0.4rem',
+                                          flexShrink: 0
                                         }}
                                       >
                                         <X size={14} />
@@ -8957,25 +9376,64 @@ export default function App() {
                 </span>
               </div>
 
-              <button
-                onClick={closeLogsModal}
-                style={{
-                  border: 'none',
-                  background: 'none',
-                  color: '#64748b',
-                  cursor: 'pointer',
-                  padding: '0.25rem',
-                  borderRadius: '0.375rem',
-                  display: 'flex',
-                  alignItems: 'center',
-                  justifyContent: 'center',
-                  transition: 'color 0.15s ease'
-                }}
-                onMouseEnter={(e) => e.currentTarget.style.color = '#0f172a'}
-                onMouseLeave={(e) => e.currentTarget.style.color = '#64748b'}
-              >
-                <X size={22} />
-              </button>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '0.65rem' }}>
+                {['COMPLETED', 'HELD', 'SUCCESS'].includes(selectedReqForLogs.status) && (
+                  <button
+                    onClick={() => {
+                      const req = selectedReqForLogs;
+                      closeLogsModal();
+                      setActiveTab('layer_stacking');
+                      setStackState(req.state || '');
+                      setStackDistrict(req.district || '');
+                      setStackSeason(req.season || 'Kharif');
+                      const sDate = req.start_date ? req.start_date.split('T')[0] : '2026-06-01';
+                      const eDate = req.end_date ? req.end_date.split('T')[0] : '2026-10-31';
+                      setStackStartDate(sDate);
+                      setStackEndDate(eDate);
+                      hasAutoLoadedStackRef.current = true;
+                      loadBandsAndScenesForRegion(req.state, req.district, req.season, sDate, eDate, req.id);
+                      fetchStackHistory(req.district);
+                    }}
+                    style={{
+                      display: 'inline-flex',
+                      alignItems: 'center',
+                      gap: '0.35rem',
+                      padding: '0.4rem 0.75rem',
+                      borderRadius: '0.375rem',
+                      border: '1px solid #bfdbfe',
+                      backgroundColor: '#eff6ff',
+                      fontSize: '0.8rem',
+                      fontWeight: 700,
+                      color: '#1d4ed8',
+                      cursor: 'pointer',
+                      transition: 'all 0.15s ease'
+                    }}
+                    title="Open Multi-Band Layer Stacking Studio for this request"
+                  >
+                    <Layers size={14} /> Stacking Studio
+                  </button>
+                )}
+
+                <button
+                  onClick={closeLogsModal}
+                  style={{
+                    border: 'none',
+                    background: 'none',
+                    color: '#64748b',
+                    cursor: 'pointer',
+                    padding: '0.25rem',
+                    borderRadius: '0.375rem',
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    transition: 'color 0.15s ease'
+                  }}
+                  onMouseEnter={(e) => e.currentTarget.style.color = '#0f172a'}
+                  onMouseLeave={(e) => e.currentTarget.style.color = '#64748b'}
+                >
+                  <X size={22} />
+                </button>
+              </div>
             </div>
 
             {/* View Toolbar: Mode Switcher, Filters & Search */}
@@ -9960,6 +10418,190 @@ export default function App() {
               </button>
             </div>
           </div>
+        </div>
+      )}
+
+      {/* Floating Persistent Background Download Status Widget */}
+      {downloadProgress && (
+        <div style={{
+          position: 'fixed',
+          bottom: '1.25rem',
+          right: '1.25rem',
+          zIndex: 999999,
+          maxWidth: downloadWidgetMinimized ? 'auto' : '410px',
+          width: downloadWidgetMinimized ? 'auto' : 'calc(100vw - 2.5rem)',
+          backgroundColor: '#ffffff',
+          borderRadius: '0.75rem',
+          boxShadow: '0 20px 25px -5px rgba(0, 0, 0, 0.25), 0 10px 10px -5px rgba(0, 0, 0, 0.1)',
+          border: `1px solid ${
+            downloadProgress.status === 'completed' ? '#86efac' : downloadProgress.status === 'error' ? '#fca5a5' : '#93c5fd'
+          }`,
+          overflow: 'hidden'
+        }}>
+          {downloadWidgetMinimized ? (
+            <div
+              onClick={() => setDownloadWidgetMinimized(false)}
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: '0.65rem',
+                padding: '0.65rem 1rem',
+                backgroundColor: downloadProgress.status === 'completed' ? '#f0fdf4' : downloadProgress.status === 'error' ? '#fef2f2' : '#1e293b',
+                color: downloadProgress.status === 'completed' ? '#166534' : downloadProgress.status === 'error' ? '#991b1b' : '#ffffff',
+                cursor: 'pointer',
+                borderRadius: '0.75rem',
+                userSelect: 'none'
+              }}
+            >
+              {downloadProgress.status === 'downloading' ? (
+                <RefreshCw size={17} className="animate-spin" color="#60a5fa" />
+              ) : downloadProgress.status === 'completed' ? (
+                <CheckCircle size={17} color="#16a34a" />
+              ) : (
+                <AlertTriangle size={17} color="#dc2626" />
+              )}
+              <span style={{ fontSize: '0.825rem', fontWeight: 600 }}>
+                {downloadProgress.status === 'downloading'
+                  ? `Downloading: ${downloadProgress.percent !== null && downloadProgress.percent !== undefined ? `${downloadProgress.percent}%` : `${downloadProgress.loadedMB} MB`}`
+                  : downloadProgress.status === 'completed'
+                    ? 'Download Completed'
+                    : 'Download Failed'}
+              </span>
+              <Maximize2 size={14} style={{ marginLeft: '0.25rem', opacity: 0.8 }} />
+            </div>
+          ) : (
+            <div>
+              {/* Header */}
+              <div style={{
+                padding: '0.75rem 1rem',
+                backgroundColor: downloadProgress.status === 'completed' ? '#f0fdf4' : downloadProgress.status === 'error' ? '#fef2f2' : '#eff6ff',
+                borderBottom: `1px solid ${
+                  downloadProgress.status === 'completed' ? '#dcfce7' : downloadProgress.status === 'error' ? '#fee2e2' : '#dbeafe'
+                }`,
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'space-between'
+              }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '0.55rem' }}>
+                  {downloadProgress.status === 'downloading' ? (
+                    <div style={{ backgroundColor: '#dbeafe', borderRadius: '50%', padding: '0.35rem', display: 'flex' }}>
+                      <RefreshCw size={16} className="animate-spin" color="#2563eb" />
+                    </div>
+                  ) : downloadProgress.status === 'completed' ? (
+                    <div style={{ backgroundColor: '#dcfce7', borderRadius: '50%', padding: '0.35rem', display: 'flex' }}>
+                      <CheckCircle size={16} color="#16a34a" />
+                    </div>
+                  ) : (
+                    <div style={{ backgroundColor: '#fee2e2', borderRadius: '50%', padding: '0.35rem', display: 'flex' }}>
+                      <AlertTriangle size={16} color="#dc2626" />
+                    </div>
+                  )}
+                  <div>
+                    <div style={{
+                      fontSize: '0.85rem',
+                      fontWeight: 700,
+                      color: downloadProgress.status === 'completed' ? '#14532d' : downloadProgress.status === 'error' ? '#991b1b' : '#1e3a8a'
+                    }}>
+                      {downloadProgress.status === 'downloading'
+                        ? 'Background Download in Progress'
+                        : downloadProgress.status === 'completed'
+                          ? 'ZIP Download Completed!'
+                          : 'Download Failed'}
+                    </div>
+                    {downloadProgress.status === 'downloading' && (
+                      <div style={{ fontSize: '0.7rem', color: '#2563eb', fontWeight: 600 }}>
+                        ✓ You can freely navigate and continue your work
+                      </div>
+                    )}
+                  </div>
+                </div>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '0.25rem' }}>
+                  <button
+                    type="button"
+                    onClick={() => setDownloadWidgetMinimized(true)}
+                    title="Minimize"
+                    style={{ background: 'none', border: 'none', cursor: 'pointer', color: '#64748b', padding: '0.25rem' }}
+                  >
+                    <Minimize2 size={15} />
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setDownloadProgress(null)}
+                    title="Dismiss"
+                    style={{ background: 'none', border: 'none', cursor: 'pointer', color: '#64748b', padding: '0.25rem' }}
+                  >
+                    <X size={16} />
+                  </button>
+                </div>
+              </div>
+
+              {/* Body */}
+              <div style={{ padding: '0.9rem 1rem' }}>
+                <div style={{
+                  fontSize: '0.78rem',
+                  fontWeight: 600,
+                  color: '#334155',
+                  backgroundColor: '#f8fafc',
+                  padding: '0.45rem 0.65rem',
+                  borderRadius: '0.375rem',
+                  border: '1px solid #e2e8f0',
+                  marginBottom: '0.75rem',
+                  wordBreak: 'break-all',
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: '0.45rem'
+                }}>
+                  <Package size={15} color="#64748b" style={{ flexShrink: 0 }} />
+                  {downloadProgress.fileName}
+                </div>
+
+                {downloadProgress.status === 'downloading' && (
+                  <div>
+                    {/* Animated Progress Bar */}
+                    <div style={{
+                      width: '100%',
+                      height: '7px',
+                      backgroundColor: '#e2e8f0',
+                      borderRadius: '999px',
+                      overflow: 'hidden',
+                      marginBottom: '0.5rem'
+                    }}>
+                      <div style={{
+                        width: `${downloadProgress.percent || 15}%`,
+                        height: '100%',
+                        backgroundColor: '#2563eb',
+                        borderRadius: '999px',
+                        transition: 'width 0.3s ease'
+                      }}></div>
+                    </div>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.73rem', color: '#64748b', fontWeight: 600 }}>
+                      <span style={{ color: '#2563eb' }}>
+                        {downloadProgress.percent !== null && downloadProgress.percent !== undefined
+                          ? `${downloadProgress.percent}% Completed`
+                          : 'Retrieving rasters from NAS...'}
+                      </span>
+                      <span>
+                        {downloadProgress.loadedMB ? `${downloadProgress.loadedMB} MB` : ''}
+                        {downloadProgress.totalMB ? ` / ${downloadProgress.totalMB} MB` : ''}
+                      </span>
+                    </div>
+                  </div>
+                )}
+
+                {downloadProgress.status === 'completed' && (
+                  <div style={{ fontSize: '0.8rem', color: '#166534', fontWeight: 500, lineHeight: 1.4 }}>
+                    ✓ File has been archived from NAS and saved to your browser downloads folder.
+                  </div>
+                )}
+
+                {downloadProgress.status === 'error' && (
+                  <div style={{ fontSize: '0.8rem', color: '#b91c1c', fontWeight: 500, lineHeight: 1.4 }}>
+                    {downloadProgress.errorMsg || 'Failed to download ZIP file from NAS.'}
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
         </div>
       )}
 

@@ -1700,31 +1700,39 @@ def get_downloaded_tifs_for_request(db: Session, request_id: int) -> dict:
 
     matched_scene_ids = set(scene_ids_from_jobs) if scene_ids_from_jobs else scene_ids_from_logs
 
-    # 2. Resolve mapped tiles for district/state
+    has_s1_request = bool((req.satellite and "Sentinel-1" in req.satellite) or (req.bands and any(b in ("VV", "VH", "VV_VH", "VV.tiff", "VH.tiff") for b in req.bands)))
+    has_s2_request = bool((not req.satellite) or ("Sentinel-2" in req.satellite) or (req.bands and any(b.startswith("B") or b in ("SCL", "TCI") for b in req.bands)))
+    if req.satellite and "Sentinel-1" in req.satellite and "Sentinel-2" not in req.satellite:
+        has_s2_request = False
+    elif req.satellite and "Sentinel-2" in req.satellite and "Sentinel-1" not in req.satellite:
+        has_s1_request = False
+
+    # 2. Resolve mapped tiles for district/state (only if Sentinel-2 requested)
     tiles = []
-    if req.district:
-        rows = db.execute(
-            text("SELECT DISTINCT tile_id FROM district_tiles_mapping WHERE LOWER(district_name) = LOWER(:d)"),
-            {"d": req.district}
-        ).fetchall()
-        tiles = [r[0] for r in rows if r[0] != "S1_SAR"]
-    elif req.state:
-        rows = db.execute(
-            text("""
-                SELECT DISTINCT dtm.tile_id
-                FROM district_tiles_mapping dtm
-                JOIN district_boundaries db ON dtm.district_id = db.id
-                WHERE LOWER(db.state_name) = LOWER(:s)
-            """),
-            {"s": req.state}
-        ).fetchall()
-        tiles = [r[0] for r in rows if r[0] != "S1_SAR"]
+    if has_s2_request:
+        if req.district:
+            rows = db.execute(
+                text("SELECT DISTINCT tile_id FROM district_tiles_mapping WHERE LOWER(district_name) = LOWER(:d)"),
+                {"d": req.district}
+            ).fetchall()
+            tiles = [r[0] for r in rows if r[0] != "S1_SAR"]
+        elif req.state:
+            rows = db.execute(
+                text("""
+                    SELECT DISTINCT dtm.tile_id
+                    FROM district_tiles_mapping dtm
+                    JOIN district_boundaries db ON dtm.district_id = db.id
+                    WHERE LOWER(db.state_name) = LOWER(:s)
+                """),
+                {"s": req.state}
+            ).fetchall()
+            tiles = [r[0] for r in rows if r[0] != "S1_SAR"]
 
     start_str = req.start_date.strftime("%Y-%m-%d")
     end_str = req.end_date.strftime("%Y-%m-%d")
 
     # If request has not run yet (matched_scene_ids is empty), populate from spatial tiles within cloud threshold
-    if not matched_scene_ids and tiles:
+    if not matched_scene_ids and tiles and has_s2_request:
         max_cld = float(req.max_cloud_cover) if req.max_cloud_cover is not None else 100.0
         spatial_scenes = db.query(SceneModel.scene_id).filter(
             SceneModel.tile.in_(tiles),
@@ -1739,7 +1747,6 @@ def get_downloaded_tifs_for_request(db: Session, request_id: int) -> dict:
     # For Sentinel-1: ONLY include scenes if they are linked to this request in jobs/logs,
     # OR if this is an unrun request, discover genuinely intersecting S1 scenes via spatial bounding box.
     # NEVER do a blanket query on tile == 'S1_SAR' across all of India!
-    has_s1_request = bool((req.satellite and "Sentinel-1" in req.satellite) or (req.bands and any(b in ("VV", "VH", "VV_VH", "VV.tiff", "VH.tiff") for b in req.bands)))
     s1_matched = [s for s in matched_scene_ids if s.startswith("S1")]
     if has_s1_request and not s1_matched and not req.execution_logs:
         try:
@@ -1755,6 +1762,12 @@ def get_downloaded_tifs_for_request(db: Session, request_id: int) -> dict:
                 matched_scene_ids.add(sc["scene_id"])
         except Exception as e:
             logger.warning(f"Could not discover S1 candidate scenes for request #{request_id}: {e}")
+
+    # Enforce strict satellite partitioning on matched_scene_ids
+    if has_s1_request and not has_s2_request:
+        matched_scene_ids = {s for s in matched_scene_ids if s.startswith("S1")}
+    elif has_s2_request and not has_s1_request:
+        matched_scene_ids = {s for s in matched_scene_ids if not s.startswith("S1")}
 
     if not matched_scene_ids:
         return {
@@ -1775,10 +1788,15 @@ def get_downloaded_tifs_for_request(db: Session, request_id: int) -> dict:
         }
 
     # 3. Query all verified .tif / .tiff band files for these scenes
-    band_records = db.query(BandFileModel).filter(
+    bf_query = db.query(BandFileModel).filter(
         BandFileModel.scene_id.in_(list(matched_scene_ids)),
         BandFileModel.verified == 1
-    ).order_by(BandFileModel.tile, BandFileModel.sensing_date, BandFileModel.band).all()
+    )
+    if has_s1_request and not has_s2_request:
+        bf_query = bf_query.filter(BandFileModel.satellite == "Sentinel-1")
+    elif has_s2_request and not has_s1_request:
+        bf_query = bf_query.filter(BandFileModel.satellite == "Sentinel-2")
+    band_records = bf_query.order_by(BandFileModel.tile, BandFileModel.sensing_date, BandFileModel.band).all()
 
     # Pre-fetch district bounding box to safeguard against out-of-bounds Sentinel-1 scenes
     d_bbox = None
@@ -1932,6 +1950,102 @@ def get_downloaded_tifs_for_request(db: Session, request_id: int) -> dict:
     }
 
 
+def ensure_scene_indices_available(
+    db: Session,
+    scenes: List[Any],
+    requested_bands: List[str]
+) -> None:
+    """
+    If user requested individual scene indices (NDVI, LSWI) that do not yet exist
+    in band_files for the matched scenes, checks disk or generates them on-the-fly
+    from raw optical bands and registers them in PostgreSQL and storage.
+    """
+    needed_indices = []
+    for b in requested_bands:
+        b_up = b.upper()
+        if b_up in ("NDVI", "LSWI") and b_up not in needed_indices:
+            needed_indices.append(b_up)
+
+    if not needed_indices or not scenes:
+        return
+
+    from app.services.processor_service import compute_full_tile_index
+
+    for sc in scenes:
+        sc_sat = getattr(sc, "satellite", "") or ""
+        sc_id = getattr(sc, "scene_id", "") or ""
+        if sc_sat != "Sentinel-2" and not sc_id.startswith("S2"):
+            continue
+
+        existing_bfs = db.query(BandFileModel).filter(BandFileModel.scene_id == sc_id).all()
+        existing_bands = {bf.band.replace(".tif", "").replace(".tiff", "").upper(): bf for bf in existing_bfs}
+
+        band_paths = {}
+        for b_name, bf in existing_bands.items():
+            rp, exists = resolve_tif_path(bf.path)
+            if exists:
+                band_paths[b_name] = rp
+
+        ref_path = None
+        for bp in band_paths.values():
+            if bp:
+                ref_path = bp
+                break
+        if not ref_path:
+            continue
+        sc_dir = os.path.dirname(ref_path)
+
+        for idx_type in needed_indices:
+            if idx_type in existing_bands:
+                continue
+
+            out_file = os.path.join(sc_dir, f"{idx_type}.tif")
+            if os.path.exists(out_file):
+                try:
+                    new_bf = BandFileModel(
+                        scene_id=sc_id,
+                        tile=sc.tile,
+                        sensing_date=sc.sensing_date,
+                        satellite=sc.satellite,
+                        band=f"{idx_type}.tif",
+                        path=out_file,
+                        size_bytes=os.path.getsize(out_file),
+                        verified=1
+                    )
+                    db.add(new_bf)
+                    db.commit()
+                except Exception:
+                    db.rollback()
+                continue
+
+            can_compute = False
+            if idx_type == "NDVI" and "B04" in band_paths and "B08" in band_paths:
+                can_compute = True
+            elif idx_type == "LSWI" and ("B08A" in band_paths or "B8A" in band_paths) and "B11" in band_paths:
+                can_compute = True
+
+            if can_compute:
+                try:
+                    compute_full_tile_index(band_paths, idx_type, out_file)
+                    if os.path.exists(out_file):
+                        new_bf = BandFileModel(
+                            scene_id=sc_id,
+                            tile=sc.tile,
+                            sensing_date=sc.sensing_date,
+                            satellite=sc.satellite,
+                            band=f"{idx_type}.tif",
+                            path=out_file,
+                            size_bytes=os.path.getsize(out_file),
+                            verified=1
+                        )
+                        db.add(new_bf)
+                        db.commit()
+                        logger.info(f"Registered on-demand index {idx_type} for scene {sc_id}")
+                except Exception as ex:
+                    logger.warning(f"Could not compute on-demand {idx_type} for {sc_id}: {ex}")
+                    db.rollback()
+
+
 def search_downloaded_tifs_by_region(
     db: Session,
     state: Optional[str] = None,
@@ -1962,9 +2076,13 @@ def search_downloaded_tifs_by_region(
     start_date = _clean_date(start_date)
     end_date = _clean_date(end_date)
     
-    clean_interval = _clean_str(composite_interval)
-    if clean_interval:
-        clean_interval = clean_interval.lower()
+    raw_interval = (composite_interval or "").strip().lower()
+    if raw_interval in ("none", "individual", "scene", "scenes"):
+        clean_interval = "none"
+    elif raw_interval in ("weekly", "fortnightly", "monthly"):
+        clean_interval = raw_interval
+    else:
+        clean_interval = "all"
 
     # 1. Resolve matching tile IDs from district_tiles_mapping & district_boundaries in DB
     tiles = []
@@ -2145,6 +2263,15 @@ def search_downloaded_tifs_by_region(
         scene_ids = [s.scene_id for s in matched_scenes]
 
         if scene_ids:
+            if band and band.strip() and band.upper() != "ALL":
+                band_tokens = [
+                    b.replace(".tif", "").replace(".tiff", "").strip()
+                    for b in band.split(",")
+                    if b.strip() and b.strip().upper() != "ALL"
+                ]
+                if band_tokens:
+                    ensure_scene_indices_available(db, matched_scenes, band_tokens)
+
             # 3. Query Band Files from DB using path column
             bf_query = db.query(BandFileModel).filter(
                 BandFileModel.scene_id.in_(scene_ids),
@@ -2152,21 +2279,68 @@ def search_downloaded_tifs_by_region(
             )
 
             if band and band.strip() and band.upper() != "ALL":
-                clean_b = band.replace(".tif", "").replace(".tiff", "").strip()
-                if clean_b.upper() in ("VV_VH", "VV/VH", "SAR_RATIO"):
-                    from sqlalchemy import or_
-                    bf_query = bf_query.filter(or_(
-                        BandFileModel.band.ilike("%VV_VH%"),
-                        BandFileModel.band.ilike("%VV/VH%")
-                    ))
-                elif clean_b.upper() in ("COMPOSITE", "COMPOSITES"):
-                    from sqlalchemy import or_
-                    bf_query = bf_query.filter(or_(
-                        BandFileModel.band.ilike("%Composite%"),
-                        BandFileModel.band.ilike("%clipped%")
-                    ))
-                else:
-                    bf_query = bf_query.filter(BandFileModel.band.ilike(f"%{clean_b}%"))
+                band_tokens = [
+                    b.replace(".tif", "").replace(".tiff", "").strip()
+                    for b in band.split(",")
+                    if b.strip() and b.strip().upper() != "ALL"
+                ]
+                if band_tokens:
+                    from sqlalchemy import or_, and_
+                    user_wants_vv_vh = any(bt.upper() in ("VV_VH", "VV/VH", "SAR_RATIO", "VV-VH") for bt in band_tokens)
+                    conditions = []
+                    for b_token in band_tokens:
+                        b_up = b_token.upper()
+                        if b_up in ("VV_VH", "VV/VH", "SAR_RATIO"):
+                            conditions.append(or_(
+                                BandFileModel.band.ilike("%VV_VH%"),
+                                BandFileModel.band.ilike("%VV/VH%"),
+                                BandFileModel.band.ilike("%VV-VH%")
+                            ))
+                        elif b_up in ("COMPOSITE", "COMPOSITES"):
+                            conditions.append(or_(
+                                BandFileModel.band.ilike("%Composite%"),
+                                BandFileModel.band.ilike("%clipped%")
+                            ))
+                        elif b_up in ("VV", "VH"):
+                            # Match ONLY individual co-pol (VV) or cross-pol (VH) band files
+                            # and strictly EXCLUDE VV_VH or VV/VH ratio products
+                            sub_conds = [
+                                BandFileModel.band.ilike(b_token),
+                                BandFileModel.band.ilike(f"{b_token}.tif%"),
+                                BandFileModel.band.ilike(f"%-{b_token}.tif%"),
+                                BandFileModel.band.ilike(f"%_{b_token}.tif%"),
+                                BandFileModel.band.ilike(f"%-{b_token}"),
+                                BandFileModel.band.ilike(f"%_{b_token}"),
+                                BandFileModel.band.ilike(f"%/{b_token}.tif%"),
+                                BandFileModel.band.ilike(f"%\\{b_token}.tif%")
+                            ]
+                            conditions.append(and_(
+                                or_(*sub_conds),
+                                ~BandFileModel.band.ilike("%VV_VH%"),
+                                ~BandFileModel.band.ilike("%VV/VH%"),
+                                ~BandFileModel.band.ilike("%VV-VH%")
+                            ))
+                        elif b_up == "B08":
+                            # Distinguish B08 from B08A / B8A
+                            conditions.append(and_(
+                                or_(
+                                    BandFileModel.band.ilike("B08%"),
+                                    BandFileModel.band.ilike("%_B08.%"),
+                                    BandFileModel.band.ilike("%-B08.%")
+                                ),
+                                ~BandFileModel.band.ilike("%B08A%"),
+                                ~BandFileModel.band.ilike("%B8A%")
+                            ))
+                        else:
+                            conditions.append(BandFileModel.band.ilike(f"%{b_token}%"))
+                    if conditions:
+                        bf_query = bf_query.filter(or_(*conditions))
+                    if not user_wants_vv_vh:
+                        bf_query = bf_query.filter(
+                            ~BandFileModel.band.ilike("%VV_VH%"),
+                            ~BandFileModel.band.ilike("%VV/VH%"),
+                            ~BandFileModel.band.ilike("%VV-VH%")
+                        )
 
             band_records = bf_query.order_by(BandFileModel.tile, BandFileModel.sensing_date, BandFileModel.band).all()
 
@@ -2191,7 +2365,10 @@ def search_downloaded_tifs_by_region(
                 # Enforce spatial validation for S1 rasters
                 is_s1_band = (bf.tile == "S1_SAR" or bf.satellite == "Sentinel-1" or (bf.scene_id and bf.scene_id.startswith("S1")))
                 if d_bbox and is_s1_band:
-                    if not is_raster_overlapping_district(path, d_bbox):
+                    # If this scene was already verified and held for this district in user acquisition requests,
+                    # trust the district association
+                    is_held_for_district = (allowed_scene_ids is not None and bf.scene_id in allowed_scene_ids)
+                    if not is_held_for_district and not is_raster_overlapping_district(path, d_bbox):
                         continue
 
                 actual_size = os.path.getsize(path) if exists else bf.size_bytes
@@ -2213,16 +2390,20 @@ def search_downloaded_tifs_by_region(
     # Skip if user explicitly requested scene-level only ("none" or "individual")
     skip_composites = clean_interval in ("none", "individual", "scene")
     if not skip_composites:
-        clean_b = (band or "").upper().strip()
+        band_tokens_comp = [
+            b.replace(".tif", "").replace(".tiff", "").strip().upper()
+            for b in (band or "").split(",")
+            if b.strip() and b.strip().upper() != "ALL"
+        ] if band and band.upper() != "ALL" else []
         import re
         search_dirs = []
         if district and district.strip():
             search_dirs.append(os.path.join(settings.RAW_ARCHIVE_DIR, "Composites", district.strip()))
         search_dirs.append(os.path.join(settings.RAW_ARCHIVE_DIR, "Composites"))
-        search_dirs.append(settings.DELIVERY_DIR)
 
         dist_clean = (district or "").strip().lower()
         seen_paths = set(tif_paths)
+        seen_filenames = set(os.path.basename(p).lower() for p in tif_paths)
 
         for s_dir in search_dirs:
             if not s_dir or not os.path.exists(s_dir):
@@ -2230,6 +2411,8 @@ def search_downloaded_tifs_by_region(
             for root, _, files in os.walk(s_dir):
                 for f in files:
                     if not (f.lower().endswith(".tif") or f.lower().endswith(".tiff")):
+                        continue
+                    if f.lower() in seen_filenames:
                         continue
                     full_p = os.path.normpath(os.path.join(root, f))
                     if full_p in seen_paths:
@@ -2245,14 +2428,33 @@ def search_downloaded_tifs_by_region(
                             continue
 
                     f_upper = f.upper()
-                    if clean_b in ("COMPOSITE", "COMPOSITES"):
-                        if "COMPOSITE" not in f_upper and "CLIPPED" not in f_upper:
-                            continue
-                    elif clean_b in ("VV_VH", "VV/VH", "SAR_RATIO"):
-                        if "VV_VH" not in f_upper and "VV/VH" not in f_upper:
-                            continue
-                    elif clean_b and clean_b != "ALL":
-                        if clean_b not in f_upper:
+                    if band_tokens_comp:
+                        matched_token = False
+                        user_wants_vv_vh_comp = any(b in ("VV_VH", "VV/VH", "SAR_RATIO", "VV-VH") for b in band_tokens_comp)
+                        for b_tok in band_tokens_comp:
+                            if b_tok in ("COMPOSITE", "COMPOSITES"):
+                                if "COMPOSITE" in f_upper or "CLIPPED" in f_upper:
+                                    matched_token = True
+                                    break
+                            elif b_tok in ("VV_VH", "VV/VH", "SAR_RATIO"):
+                                if "VV_VH" in f_upper or "VV/VH" in f_upper or "VV-VH" in f_upper:
+                                    matched_token = True
+                                    break
+                            elif b_tok in ("VV", "VH"):
+                                # Ensure this composite file is strictly VV or VH, NOT VV_VH
+                                is_ratio = ("VV_VH" in f_upper or "VV/VH" in f_upper or "VV-VH" in f_upper)
+                                if not is_ratio:
+                                    if f"_{b_tok}." in f_upper or f"_{b_tok}_" in f_upper or f"-{b_tok}." in f_upper:
+                                        matched_token = True
+                                        break
+                            elif b_tok in f_upper:
+                                # If file is a VV_VH ratio but user did not ask for VV_VH, don't match
+                                is_ratio = ("VV_VH" in f_upper or "VV/VH" in f_upper or "VV-VH" in f_upper)
+                                if is_ratio and not user_wants_vv_vh_comp:
+                                    continue
+                                matched_token = True
+                                break
+                        if not matched_token:
                             continue
 
                     date_match = re.search(r'(\d{8})_(\d{8})', f)
@@ -2267,6 +2469,7 @@ def search_downloaded_tifs_by_region(
                             continue
 
                     seen_paths.add(full_p)
+                    seen_filenames.add(f.lower())
                     actual_size = os.path.getsize(full_p) if os.path.exists(full_p) else 0
                     total_size += actual_size
 

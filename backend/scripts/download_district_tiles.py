@@ -474,10 +474,14 @@ def run_district_acquisition_pipeline(
             if req_rec_st and req_rec_st[0]:
                 state_name = req_rec_st[0]
 
+        is_pure_s1 = ("Sentinel-1" in satellite) and ("Sentinel-2" not in satellite)
+        has_composite = bool(composite_interval and composite_interval.lower() not in ("none", "null", "false", "0"))
+        total_stages = (3 if has_composite else 2) if is_pure_s1 else (4 if has_composite else 3)
+
         step1_msg = f"STEP 1: Gap Check & Scene Search for '{district_name}' ({state_name or 'Auto'})..."
         logger.info(step1_msg)
         append_request_log(db, request_id, step1_msg)
-        append_request_log(db, request_id, "\n[STAGE 1/4] SCENE DISCOVERY & GAP CHECK")
+        append_request_log(db, request_id, f"\n[STAGE 1/{total_stages}] SCENE DISCOVERY & GAP CHECK")
         append_request_log(db, request_id, f"  • Querying database for tiles overlapping '{district_name}' (State: {state_name or 'Auto'})...")
 
         gap_res = perform_gap_check(
@@ -509,7 +513,7 @@ def run_district_acquisition_pipeline(
         append_request_log(db, request_id, f"  • Missing from archive:    {len(missing_scenes)} scenes (queued for download)")
 
         # Detailed individual tile breakdown
-        append_request_log(db, request_id, f"\n[STAGE 1/4] INDIVIDUAL TILE AUDIT & STORAGE STATUS ({len(tiles)} Tiles):")
+        append_request_log(db, request_id, f"\n[STAGE 1/{total_stages}] INDIVIDUAL TILE AUDIT & STORAGE STATUS ({len(tiles)} Tiles):")
         tile_statuses = gap_res.get("tile_statuses", {})
         for t in tiles:
             t_info = tile_statuses.get(t, {})
@@ -575,7 +579,7 @@ def run_district_acquisition_pipeline(
         step2_msg = f"STEP 2: Verifying/Downloading {len(missing_scenes)} candidate scenes from AWS Open Data S3..."
         logger.info(step2_msg)
         append_request_log(db, request_id, step2_msg)
-        append_request_log(db, request_id, f"\n[STAGE 2/4] NAS FAST-CHECK & FETCHING {len(missing_scenes)} CANDIDATE SCENES FROM AWS S3 (GeoTIFF)")
+        append_request_log(db, request_id, f"\n[STAGE 2/{total_stages}] NAS FAST-CHECK & FETCHING {len(missing_scenes)} CANDIDATE SCENES FROM AWS S3 (GeoTIFF)")
         append_request_log(db, request_id, f"  • S2 COGs: '{settings.AWS_SENTINEL_COGS_BUCKET}' ({settings.AWS_COGS_REGION}) | S1 GRD: '{settings.AWS_SENTINEL_1_BUCKET}' ({settings.AWS_SENTINEL_1_REGION})")
 
         req_record = db.query(RequestModel).filter(RequestModel.id == request_id).first()
@@ -727,82 +731,75 @@ def run_district_acquisition_pipeline(
         append_request_log(db, request_id, "=" * 78)
 
         # ────────────────────────────────────────────────
-        # STAGE 3 - Spectral Index Calculation (SRS 8.4.1 & 8.4.3)  [DB + NAS fast check]
+        # STAGE 3 - Spectral Index Calculation (SRS 8.4.1 & 8.4.3)  [Optical Sentinel-2 Only]
         # ────────────────────────────────────────────────
-        if _is_request_stopped(db, request_id):
-            append_request_log(db, request_id, "[STOPPED] Pipeline halted before processing stage because request was cancelled.", level="WARNING")
-            return False
-
-        proc_job = _get_or_create_job(db, request_id, "TILE_INDEX")
-        _update_job(db, proc_job, "RUNNING")
-
-        has_s1 = "Sentinel-1" in satellite
-        has_s2 = "Sentinel-2" in satellite or not has_s1
-        if has_s1 and has_s2:
-            step3_label = "Optical NDVI/LSWI & SAR VV/VH"
-        elif has_s1:
-            step3_label = "SAR VV/VH Ratio"
-        else:
-            step3_label = "NDVI & LSWI (Cloud-Masked)"
-        step3_msg = f"STEP 3: Processing & Calculating Spectral Indices ({step3_label}) for '{district_name}'..."
-        logger.info(step3_msg)
-        append_request_log(db, request_id, "\n" + "=" * 78)
-        append_request_log(db, request_id, f"  [STAGE 3/4] SPECTRAL INDEX PROCESSING & CLOUD REMOVAL ({step3_label})")
-        append_request_log(db, request_id, "-" * 78)
-
         indices_computed = 0
         indices_skipped = 0
         index_errors = 0
 
-        if not indices or len(indices) == 0:
-            skip_msg = "  ✓ [STAGE 3/4 SKIPPED] No spectral or SAR indices selected in request (2-Step Raw Band Acquisition Mode)."
-            logger.info(skip_msg)
-            append_request_log(db, request_id, "\n" + "=" * 78)
-            append_request_log(db, request_id, skip_msg)
-            _update_job(db, proc_job, "COMPLETED")
-            unique_scenes = []
-            total_sc = 0
-        else:
-            # Build the unique scene list: scenes completed in Stage 2 + scenes already held per Gap Check.
-            # Re-load from the DB so every scene has folder/prefix/satellite populated
-            # (gap-check "held" entries are dicts that may not carry all fields).
-            candidate_ids = []
-            for sc_item in list(held_scenes) + list(gap_res.get("held_scenes", [])):
-                sc_id = _scene_attr(sc_item, "scene_id", "")
-                if sc_id and sc_id not in candidate_ids:
-                    candidate_ids.append(sc_id)
-
-            unique_scenes = []
-            for sc_id in candidate_ids:
-                scene_row = db.query(SceneModel).filter(SceneModel.scene_id == sc_id).first()
-                if scene_row:
-                    unique_scenes.append(scene_row)
-                else:
-                    logger.warning(f"Scene '{sc_id}' not found in DB; skipping index processing.")
-
-            total_sc = len(unique_scenes)
-        for n, sc_item in enumerate(unique_scenes, start=1):
+        if not is_pure_s1:
             if _is_request_stopped(db, request_id):
-                append_request_log(db, request_id, f"[STOPPED] Processing halted at scene [{n}/{total_sc}] because request was cancelled.", level="WARNING")
-                _update_job(db, proc_job, "STOPPED", error_log="Stopped by user")
+                append_request_log(db, request_id, "[STOPPED] Pipeline halted before processing stage because request was cancelled.", level="WARNING")
                 return False
 
-            s_id = str(_scene_attr(sc_item, "scene_id", ""))
-            s_tile = str(_scene_attr(sc_item, "tile", ""))
-            s_folder = str(_scene_attr(sc_item, "folder", ""))
-            s_date = str(_scene_attr(sc_item, "sensing_date", ""))
-            s_sat = str(_scene_attr(sc_item, "satellite", satellite))
-            is_s1_scene = _is_s1(sc_item, satellite)
+            proc_job = _get_or_create_job(db, request_id, "TILE_INDEX")
+            _update_job(db, proc_job, "RUNNING")
 
-            scene_dir = _resolve_scene_dir(sc_item, satellite)
-            band_paths = _list_band_paths(scene_dir)
+            step3_label = "NDVI & LSWI (Cloud-Masked)"
+            step3_msg = f"STEP 3: Processing & Calculating Spectral Indices ({step3_label}) for '{district_name}'..."
+            logger.info(step3_msg)
+            append_request_log(db, request_id, "\n" + "=" * 78)
+            append_request_log(db, request_id, f"  [STAGE 3/{total_stages}] SPECTRAL INDEX PROCESSING & CLOUD REMOVAL ({step3_label})")
+            append_request_log(db, request_id, "-" * 78)
 
-            if not is_s1_scene:
+            if not indices or len(indices) == 0:
+                skip_msg = f"  ✓ [STAGE 3/{total_stages} SKIPPED] No spectral indices selected in request (2-Step Raw Band Acquisition Mode)."
+                logger.info(skip_msg)
+                append_request_log(db, request_id, "\n" + "=" * 78)
+                append_request_log(db, request_id, skip_msg)
+                _update_job(db, proc_job, "COMPLETED")
+                unique_scenes = []
+                total_sc = 0
+            else:
+                candidate_ids = []
+                for sc_item in list(held_scenes) + list(gap_res.get("held_scenes", [])):
+                    sc_id = _scene_attr(sc_item, "scene_id", "")
+                    if sc_id and sc_id not in candidate_ids:
+                        candidate_ids.append(sc_id)
+
+                unique_scenes = []
+                for sc_id in candidate_ids:
+                    scene_row = db.query(SceneModel).filter(SceneModel.scene_id == sc_id).first()
+                    if scene_row:
+                        unique_scenes.append(scene_row)
+                    else:
+                        logger.warning(f"Scene '{sc_id}' not found in DB; skipping index processing.")
+
+                total_sc = len(unique_scenes)
+
+            for n, sc_item in enumerate(unique_scenes, start=1):
+                if _is_request_stopped(db, request_id):
+                    append_request_log(db, request_id, f"[STOPPED] Processing halted at scene [{n}/{total_sc}] because request was cancelled.", level="WARNING")
+                    _update_job(db, proc_job, "STOPPED", error_log="Stopped by user")
+                    return False
+
+                s_id = str(_scene_attr(sc_item, "scene_id", ""))
+                s_tile = str(_scene_attr(sc_item, "tile", ""))
+                s_folder = str(_scene_attr(sc_item, "folder", ""))
+                s_date = str(_scene_attr(sc_item, "sensing_date", ""))
+                s_sat = str(_scene_attr(sc_item, "satellite", satellite))
+                is_s1_scene = _is_s1(sc_item, satellite)
+
+                if is_s1_scene:
+                    continue
+
+                scene_dir = _resolve_scene_dir(sc_item, satellite)
+                band_paths = _list_band_paths(scene_dir)
+
                 # ---------- Optical: NDVI + LSWI ----------
                 ndvi_path = os.path.join(scene_dir, "NDVI.tif")
                 lswi_path = os.path.join(scene_dir, "LSWI.tif")
 
-                # FAST CHECK: NAS existence + raster integrity first, then sync DB.
                 if os.path.exists(ndvi_path) and os.path.exists(lswi_path):
                     ndvi_ok, _, _ = verify_raster(ndvi_path)
                     lswi_ok, _, _ = verify_raster(lswi_path)
@@ -818,7 +815,6 @@ def run_district_acquisition_pipeline(
                         append_request_log(db, request_id, proc_log)
                         continue
 
-                # Not cached (or corrupt): compute via cloud_removal_and_indices.py
                 b04_p = band_paths.get("B04")
                 b08_p = band_paths.get("B08")
                 b11_p = band_paths.get("B11")
@@ -856,57 +852,18 @@ def run_district_acquisition_pipeline(
                     logger.warning(warn_log)
                     append_request_log(db, request_id, warn_log, level="WARNING")
 
+            processed_indices_count = indices_computed + indices_skipped
+            stage3_summary = (
+                f"  ✓ Stage 3 Complete: {indices_computed} index rasters computed, "
+                f"{indices_skipped} already on NAS/DB (skipped), {index_errors} errors."
+            )
+            logger.info(stage3_summary)
+            append_request_log(db, request_id, stage3_summary)
+
+            if total_sc > 0 and processed_indices_count == 0 and index_errors > 0:
+                _update_job(db, proc_job, "FAILED", error_log=f"{index_errors} scene(s) failed index processing.")
             else:
-                # ---------- SAR: VV/VH ratio ----------
-                ratio_path = os.path.join(scene_dir, "VV_VH.tif")
-
-                if os.path.exists(ratio_path):
-                    ratio_ok, _, _ = verify_raster(ratio_path)
-                    if ratio_ok:
-                        _record_index_band_file_in_db(db, s_id or s_folder, s_tile, s_date, s_sat, "VV_VH", ratio_path)
-                        indices_skipped += 1
-                        proc_log = (
-                            f"  ✓ [SAR RATIO VERIFIED ON NAS & DB - SKIPPED] [{n}/{total_sc}] Scene '{s_folder}' -> "
-                            f"'VV_VH.tif' cached at '{scene_dir}'. Skipping calculation."
-                        )
-                        logger.info(proc_log)
-                        append_request_log(db, request_id, proc_log)
-                        continue
-
-                vv_p = band_paths.get("VV")
-                vh_p = band_paths.get("VH")
-                if vv_p and vh_p:
-                    try:
-                        compute_full_tile_index(band_paths, "VV/VH", ratio_path)
-                        _record_index_band_file_in_db(db, s_id or s_folder, s_tile, s_date, s_sat, "VV_VH", ratio_path)
-                        indices_computed += 1
-                        proc_log = f"  ✓ [SAR VV/VH RATIO COMPUTED] [{n}/{total_sc}] Scene '{s_folder}' -> Saved 'VV_VH.tif' in '{scene_dir}'."
-                        logger.info(proc_log)
-                        append_request_log(db, request_id, proc_log)
-                    except Exception as s1_err:
-                        index_errors += 1
-                        warn_log = f"  ⚠ WARN: SAR ratio calculation error for '{s_folder}': {s1_err}"
-                        logger.warning(warn_log)
-                        append_request_log(db, request_id, warn_log, level="WARNING")
-                else:
-                    index_errors += 1
-                    missing_b = [b for b in REQUIRED_S1_BANDS if b not in band_paths]
-                    warn_log = f"  ⚠ WARN: Missing polarizations for SAR ratio in '{s_folder}': {missing_b}"
-                    logger.warning(warn_log)
-                    append_request_log(db, request_id, warn_log, level="WARNING")
-
-        processed_indices_count = indices_computed + indices_skipped
-        stage3_summary = (
-            f"  ✓ Stage 3 Complete: {indices_computed} index rasters computed, "
-            f"{indices_skipped} already on NAS/DB (skipped), {index_errors} errors."
-        )
-        logger.info(stage3_summary)
-        append_request_log(db, request_id, stage3_summary)
-
-        if total_sc > 0 and processed_indices_count == 0 and index_errors > 0:
-            _update_job(db, proc_job, "FAILED", error_log=f"{index_errors} scene(s) failed index processing.")
-        else:
-            _update_job(db, proc_job, "COMPLETED")
+                _update_job(db, proc_job, "COMPLETED")
 
         # ────────────────────────────────────────────────
         # STAGE 4 - Temporal Compositing & District Delivery (SRS 8.4 & 8.5)
@@ -916,7 +873,7 @@ def run_district_acquisition_pipeline(
                 append_request_log(db, request_id, "[STOPPED] Pipeline halted before compositing because request was cancelled.", level="WARNING")
                 return False
 
-            append_request_log(db, request_id, f"\n[STAGE 4/4] TEMPORAL COMPOSITING ({composite_interval.upper()} - LEVEL: {level.upper()})")
+            append_request_log(db, request_id, f"\n[STAGE {total_stages}/{total_stages}] TEMPORAL COMPOSITING ({composite_interval.upper()} - LEVEL: {level.upper()})")
             comp_job = _get_or_create_job(db, request_id, "DELIVERY_CLIP")
             _update_job(db, comp_job, "RUNNING")
             try:
@@ -929,7 +886,7 @@ def run_district_acquisition_pipeline(
                 )
                 _update_job(db, comp_job, "COMPLETED")
             except Exception as comp_err:
-                logger.error(f"Error executing Stage 4 temporal compositing: {comp_err}", exc_info=True)
+                logger.error(f"Error executing Stage {total_stages} temporal compositing: {comp_err}", exc_info=True)
                 append_request_log(db, request_id, f"  ⚠ WARN: Temporal compositing encountered an error: {comp_err}", level="WARNING")
                 _update_job(db, comp_job, "FAILED", error_log=str(comp_err))
 
@@ -940,24 +897,42 @@ def run_district_acquisition_pipeline(
         total_mb = tif_summary.get("total_size_mb", 0.0)
 
         total_held = downloaded_count + nas_cached_count + held_count
-        success_msg = (
-            f"DATA DOWNLOAD & SPECTRAL INDEX PROCESSING COMPLETED FOR '{district_name}' ({satellite}). "
-            f"Total Scenes Held/Downloaded: {total_held} "
-            f"(New: {downloaded_count}, NAS-cached: {nas_cached_count}, DB-cached: {held_count}). "
-            f"Indices: {indices_computed} computed, {indices_skipped} reused. "
-            f"Total GeoTIFF (.tif) files ready: {total_tifs} ({total_mb:.1f} MB)."
-        )
-        logger.info("=" * 78)
-        logger.info(success_msg)
-        logger.info("=" * 78)
-        append_request_log(db, request_id, success_msg)
-        append_request_log(db, request_id, "\n" + "=" * 78)
-        append_request_log(db, request_id, f"  DATA ACQUISITION & PROCESSING FINISHED SUCCESSFULLY FOR '{district_name}'")
-        append_request_log(db, request_id, f"  Archive Location: '{settings.RAW_ARCHIVE_DIR}' (Rasters & Spectral Indices)")
-        append_request_log(db, request_id, f"  Scenes Verified:  {total_held} total ({downloaded_count} newly downloaded, {nas_cached_count} NAS-cached, {held_count} DB-cached).")
-        append_request_log(db, request_id, f"  Indices Created:  {indices_computed} computed, {indices_skipped} reused from NAS/DB.")
-        append_request_log(db, request_id, f"  GeoTIFFs Ready:   {total_tifs} .tif files ({total_mb:.1f} MB) ready for delivery.")
-        append_request_log(db, request_id, "=" * 78)
+        if is_pure_s1:
+            success_msg = (
+                f"DATA ACQUISITION & RAW BAND DOWNLOAD COMPLETED FOR '{district_name}' ({satellite}). "
+                f"Total Scenes Held/Downloaded: {total_held} "
+                f"(New: {downloaded_count}, NAS-cached: {nas_cached_count}, DB-cached: {held_count}). "
+                f"Total GeoTIFF (.tif) files ready: {total_tifs} ({total_mb:.1f} MB)."
+            )
+            logger.info("=" * 78)
+            logger.info(success_msg)
+            logger.info("=" * 78)
+            append_request_log(db, request_id, success_msg)
+            append_request_log(db, request_id, "\n" + "=" * 78)
+            append_request_log(db, request_id, f"  DATA ACQUISITION & PROCESSING FINISHED SUCCESSFULLY FOR '{district_name}'")
+            append_request_log(db, request_id, f"  Archive Location: '{settings.RAW_ARCHIVE_DIR}' (SAR Rasters)")
+            append_request_log(db, request_id, f"  Scenes Verified:  {total_held} total ({downloaded_count} newly downloaded, {nas_cached_count} NAS-cached, {held_count} DB-cached).")
+            append_request_log(db, request_id, f"  GeoTIFFs Ready:   {total_tifs} .tif files ({total_mb:.1f} MB) ready for delivery.")
+            append_request_log(db, request_id, "=" * 78)
+        else:
+            success_msg = (
+                f"DATA DOWNLOAD & SPECTRAL INDEX PROCESSING COMPLETED FOR '{district_name}' ({satellite}). "
+                f"Total Scenes Held/Downloaded: {total_held} "
+                f"(New: {downloaded_count}, NAS-cached: {nas_cached_count}, DB-cached: {held_count}). "
+                f"Indices: {indices_computed} computed, {indices_skipped} reused. "
+                f"Total GeoTIFF (.tif) files ready: {total_tifs} ({total_mb:.1f} MB)."
+            )
+            logger.info("=" * 78)
+            logger.info(success_msg)
+            logger.info("=" * 78)
+            append_request_log(db, request_id, success_msg)
+            append_request_log(db, request_id, "\n" + "=" * 78)
+            append_request_log(db, request_id, f"  DATA ACQUISITION & PROCESSING FINISHED SUCCESSFULLY FOR '{district_name}'")
+            append_request_log(db, request_id, f"  Archive Location: '{settings.RAW_ARCHIVE_DIR}' (Rasters & Spectral Indices)")
+            append_request_log(db, request_id, f"  Scenes Verified:  {total_held} total ({downloaded_count} newly downloaded, {nas_cached_count} NAS-cached, {held_count} DB-cached).")
+            append_request_log(db, request_id, f"  Indices Created:  {indices_computed} computed, {indices_skipped} reused from NAS/DB.")
+            append_request_log(db, request_id, f"  GeoTIFFs Ready:   {total_tifs} .tif files ({total_mb:.1f} MB) ready for delivery.")
+            append_request_log(db, request_id, "=" * 78)
         return True
 
     except Exception as e:

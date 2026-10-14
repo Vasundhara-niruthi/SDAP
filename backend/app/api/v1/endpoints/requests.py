@@ -384,6 +384,23 @@ def list_requests(
     return [build_request_response(r, include_logs=False) for r in requests_list]
 
 
+@router.get("/by-district/{district_name}", summary="Get requests for a specific district")
+def get_requests_by_district(
+    district_name: str,
+    db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_user)
+):
+    """
+    Returns requests matching a district name so both Admin and standard Users
+    can discover acquisition jobs for layer stacking and data retrieval.
+    """
+    from sqlalchemy import func
+    reqs = db.query(RequestModel).filter(
+        func.lower(RequestModel.district) == district_name.strip().lower()
+    ).order_by(RequestModel.id.desc()).all()
+    return [build_request_response(r, include_logs=False) for r in reqs]
+
+
 @router.get("/{request_id}", response_model=RequestResponse, summary="Get Request by ID")
 def get_request(
     request_id: int,
@@ -392,8 +409,6 @@ def get_request(
 ):
     """Retrieve details and execution logs for a specific request."""
     query = db.query(RequestModel).options(joinedload(RequestModel.user)).filter(RequestModel.id == request_id)
-    if current_user.role != "ADMIN":
-        query = query.filter(RequestModel.user_id == current_user.id)
     req = query.first()
     if not req:
         raise HTTPException(status_code=404, detail="Request not found.")
@@ -587,23 +602,66 @@ def download_tifs_zip(
     zip_filename = f"SDAP_GeoTIFFs_{district or state or 'Batch'}.zip"
     zip_path = os.path.join(tmp_dir, zip_filename)
 
+    seen_paths = set()
+    seen_arcnames = set()
     with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_STORED) as zf:
         for item in tifs:
             p, exists = resolve_tif_path(item["path"])
-            if exists and os.path.exists(p):
-                norm_p = os.path.normpath(p)
-                parts = norm_p.split(os.sep)
-                if "archive" in parts:
-                    arch_idx = parts.index("archive")
-                    rel_parts = parts[arch_idx + 1:]
-                    arcname = "/".join(rel_parts)
-                elif "data" in parts:
-                    data_idx = parts.index("data")
-                    rel_parts = parts[data_idx + 1:]
-                    arcname = "/".join(rel_parts)
+            if not exists or not os.path.exists(p):
+                continue
+
+            abs_p = os.path.normcase(os.path.abspath(p))
+            if abs_p in seen_paths:
+                continue
+            seen_paths.add(abs_p)
+
+            norm_p = os.path.normpath(p)
+            parts = norm_p.split(os.sep)
+            fname = os.path.basename(norm_p)
+            dist_folder = district or item.get("tile") or "Rasters"
+            sc_id = item.get("scene_id")
+
+            # Check if this is a composite raster
+            is_composite = (
+                fname.lower().startswith("composite_") or 
+                "composites" in [pt.lower() for pt in parts] or
+                (item.get("satellite") == "Composite Deliverable")
+            )
+
+            if is_composite:
+                arcname = f"{dist_folder}/Composites/{fname}"
+            elif sc_id and not sc_id.lower().startswith("composite"):
+                # Put each scene's band files in its own scene_id folder so all scenes across date range are preserved
+                arcname = f"{dist_folder}/{sc_id}/{fname}"
+            elif "SDAP_DATA_STORAGE" in parts:
+                storage_idx = parts.index("SDAP_DATA_STORAGE")
+                rel_parts = [rp for rp in parts[storage_idx + 1:] if rp.lower() != "delivery" and not rp.lower().startswith("request_")]
+                arcname = "/".join(rel_parts)
+            elif "archive" in parts:
+                arch_idx = parts.index("archive")
+                rel_parts = [rp for rp in parts[arch_idx + 1:] if rp.lower() != "delivery" and not rp.lower().startswith("request_")]
+                arcname = "/".join(rel_parts)
+            else:
+                arcname = f"{dist_folder}/{fname}"
+
+            # Ensure 'delivery' or 'request_X' is NEVER in arcname
+            clean_parts = [ap for ap in arcname.split("/") if ap and ap.lower() != "delivery" and not ap.lower().startswith("request_")]
+            clean_arcname = "/".join(clean_parts)
+            if not clean_arcname or clean_arcname == fname:
+                if sc_id and not sc_id.lower().startswith("composite"):
+                    clean_arcname = f"{dist_folder}/{sc_id}/{fname}"
                 else:
-                    arcname = f"{item['tile']}/{item['scene_id']}/{item['band']}.tif"
-                zf.write(p, arcname=arcname)
+                    clean_arcname = f"{dist_folder}/{fname}"
+
+            base_arcname = clean_arcname
+            counter = 1
+            while clean_arcname.lower() in seen_arcnames:
+                root, ext = os.path.splitext(base_arcname)
+                clean_arcname = f"{root}_{counter}{ext}"
+                counter += 1
+
+            seen_arcnames.add(clean_arcname.lower())
+            zf.write(p, arcname=clean_arcname)
 
     import shutil
     from starlette.background import BackgroundTask
@@ -668,9 +726,6 @@ def get_request_tifs(
     if not req:
         raise HTTPException(status_code=404, detail="Request not found.")
 
-    if current_user.role != "ADMIN" and req.user_id != current_user.id:
-        raise HTTPException(status_code=403, detail="Not authorized to access files for this request.")
-
     from app.services.downloader_service import get_downloaded_tifs_for_request
     return get_downloaded_tifs_for_request(db, request_id)
 
@@ -688,9 +743,6 @@ def get_request_composites(
     req = db.query(RequestModel).filter(RequestModel.id == request_id).first()
     if not req:
         raise HTTPException(status_code=404, detail="Request not found.")
-
-    if current_user.role != "ADMIN" and req.user_id != current_user.id:
-        raise HTTPException(status_code=403, detail="Not authorized to access composites for this request.")
 
     district_name = req.district or req.state or "Region"
     interval = req.composite_interval or "none"
@@ -750,9 +802,6 @@ def download_request_composite(
     req = db.query(RequestModel).filter(RequestModel.id == request_id).first()
     if not req:
         raise HTTPException(status_code=404, detail="Request not found.")
-
-    if current_user.role != "ADMIN" and req.user_id != current_user.id:
-        raise HTTPException(status_code=403, detail="Not authorized to download files for this request.")
 
     district_name = req.district or req.state or "Region"
     interval = req.composite_interval or "none"

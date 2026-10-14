@@ -5,19 +5,50 @@
 **/.env
 **/.env.example
 
-# Python & Virtual Environments
-__pycache__/
-*.py[cod]
-*$py.class
+# Python & Virtual Environments (Dependencies)
 venv/
 .venv/
 env/
 ENV/
+**/venv/
+**/.venv/
+**/env/
+**/ENV/
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*$py.class
+site-packages/
+**/site-packages/
+pip-wheel-metadata/
+wheels/
+*.egg
+*.egg-info/
+eggs/
+.eggs/
 
-# Node modules & build outputs
+# Node modules & frontend dependencies
 node_modules/
+**/node_modules/
+.vite/
+**/.vite/
+frontend/.vite/
+.yarn/
+.pnpm-store/
 dist/
+**/dist/
 dist-ssr/
+**/dist-ssr/
+build/
+**/build/
+
+# Testing & Cache
+.pytest_cache/
+**/.pytest_cache/
+.mypy_cache/
+**/.mypy_cache/
+.ruff_cache/
+**/.ruff_cache/
 
 # Large GIS and Satellite Data (>100MB or multi-GB rasters)
 *.shp
@@ -43,7 +74,7 @@ backend_git_backup/
 # System & Editor files
 .DS_Store
 .vscode/
+**/.vscode/
 .idea/
+**/.idea/
 *.log
-
-

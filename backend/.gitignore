@@ -2,12 +2,29 @@
 __pycache__/
 *.py[cod]
 *$py.class
+*.so
 
-# Virtual environments
+# Python virtual environments & dependencies
 venv/
 .venv/
 env/
 ENV/
+site-packages/
+pip-wheel-metadata/
+wheels/
+*.egg
+*.egg-info/
+dist/
+build/
+eggs/
+.eggs/
+
+# Testing & Linting cache
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
 
 # Environment files
 .env
@@ -23,4 +40,3 @@ ENV/
 *.log
 *.sqlite
 *.db
-

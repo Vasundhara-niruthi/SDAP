@@ -155,13 +155,13 @@ def _is_scene_matching_band(p: str, b_name: str) -> bool:
     """
     Robust matching of a raster file path to a requested band or index name.
     Handles:
-      - Direct band names: B02.tif, B04.tif, B08.tif, VH.tiff, VV.tiff
+      - Direct band names: B02.tif, B04.tif, B08.tif, VH.tiff, VV.tiff, iw-vv.tiff, iw-vh.tiff
       - Pre-computed indices: NDVI.tif, LSWI.tif
       - Composite files: Composite_NDVI_weekly_..., Composite_LSWI_fortnightly_...
       - Prefixed files: Sentinel2_B02_..., 44QQF_B04_...
     """
     fname = os.path.basename(p).upper()
-    b_clean = b_name.upper().strip()
+    b_clean = re.sub(r"\.(tif|tiff)$", "", b_name.strip(), flags=re.IGNORECASE).upper()
     name_no_ext, _ = os.path.splitext(fname)
 
     # 1. Exact match (e.g. "B02.TIF" -> "B02", "NDVI.TIF" -> "NDVI")
@@ -173,19 +173,32 @@ def _is_scene_matching_band(p: str, b_name: str) -> bool:
     tokens = re.split(r"[_\-\.\s/\\]+", name_no_ext)
     if b_clean in tokens:
         # Exclude matching pure VV or VH if the file is actually VV_VH
-        if b_clean in ("VV", "VH") and ("VV_VH" in name_no_ext or "VV/VH" in name_no_ext):
+        if b_clean in ("VV", "VH") and ("VV_VH" in name_no_ext or "VV/VH" in name_no_ext or "VV-VH" in name_no_ext):
             return False
         return True
 
-    # 3. Handle SAR_RATIO / VV_VH aliases
-    if b_clean in ("SAR_RATIO", "VV_VH") and ("VV_VH" in name_no_ext or "VV/VH" in name_no_ext):
+    # 3. Sentinel-1 SAR polarizations (VV, VH, IW-VV, IW-VH):
+    if b_clean in ("VV", "IW-VV", "IW_VV"):
+        if "VV_VH" in name_no_ext or "VV/VH" in name_no_ext or "VV-VH" in name_no_ext:
+            return False
+        if "VV" in tokens or name_no_ext.endswith("VV") or "-VV" in name_no_ext or "_VV" in name_no_ext or "IW-VV" in name_no_ext:
+            return True
+
+    if b_clean in ("VH", "IW-VH", "IW_VH"):
+        if "VV_VH" in name_no_ext or "VV/VH" in name_no_ext or "VV-VH" in name_no_ext:
+            return False
+        if "VH" in tokens or name_no_ext.endswith("VH") or "-VH" in name_no_ext or "_VH" in name_no_ext or "IW-VH" in name_no_ext:
+            return True
+
+    # 4. Handle SAR_RATIO / VV_VH aliases
+    if b_clean in ("SAR_RATIO", "VV_VH") and ("VV_VH" in name_no_ext or "VV/VH" in name_no_ext or "VV-VH" in name_no_ext):
         return True
 
-    # 4. Standard starts/ends with delimiter
+    # 5. Standard starts/ends with delimiter
     if name_no_ext.startswith(b_clean + "_") or name_no_ext.endswith("_" + b_clean):
         return True
 
-    # 5. Directory component check
+    # 6. Directory component check
     norm_fwd = p.replace("\\", "/").upper()
     if f"/{b_clean}." in norm_fwd or f"/{b_clean}/" in norm_fwd:
         return True
@@ -204,9 +217,13 @@ def find_band_rasters_for_district(
 ) -> List[str]:
     """
     Finds verified GeoTIFF raster paths for a specific band associated with the district.
+    Supports Sentinel-2 optical bands, Sentinel-1 SAR polarizations (VV, VH, iw-vv, iw-vh),
+    and pre-computed spectral indices.
     """
     clean_d = district.split(",")[0].strip().lower()
     clean_b = re.sub(r"\.(tif|tiff)$", "", band_name.strip(), flags=re.IGNORECASE)
+    is_s1_vv = clean_b.upper() in ("VV", "IW-VV", "IW_VV")
+    is_s1_vh = clean_b.upper() in ("VH", "IW-VH", "IW_VH")
 
     # Query scenes linked through completed download process jobs for this district
     pj_query = db.query(ProcessJobModel.scene_id).join(
@@ -223,23 +240,38 @@ def find_band_rasters_for_district(
         pj_query = pj_query.filter(func.lower(RequestModel.state) == state.strip().lower())
 
     scene_ids = [r[0] for r in pj_query.distinct().all() if r[0]]
+
+    # Fallback discovery if ProcessJobModel has no scene IDs:
     if not scene_ids:
-        # Fallback: check district_tiles_mapping
-        tiles_rows = db.execute(
-            text("SELECT DISTINCT tile_id FROM district_tiles_mapping WHERE LOWER(district_name) = :d"),
-            {"d": clean_d}
-        ).fetchall()
-        tiles = [r[0] for r in tiles_rows if r[0] and r[0] != "S1_SAR"]
-        if tiles:
-            scene_query = db.query(SceneModel.scene_id).filter(
+        # Fallback 1: Sentinel-1 SAR scenes
+        if is_s1_vv or is_s1_vh or clean_b.upper() in ("VV_VH", "SAR_RATIO"):
+            s1_scene_query = db.query(SceneModel.scene_id).filter(
                 SceneModel.status == "HELD",
-                SceneModel.tile.in_(tiles)
+                SceneModel.tile == "S1_SAR"
             )
             if start_date:
-                scene_query = scene_query.filter(SceneModel.sensing_date >= start_date)
+                s1_scene_query = s1_scene_query.filter(SceneModel.sensing_date >= start_date)
             if end_date:
-                scene_query = scene_query.filter(SceneModel.sensing_date <= end_date)
-            scene_ids = [r[0] for r in scene_query.all()]
+                s1_scene_query = s1_scene_query.filter(SceneModel.sensing_date <= end_date)
+            scene_ids = [r[0] for r in s1_scene_query.all() if r[0]]
+
+        # Fallback 2: Sentinel-2 MGRS tiles
+        if not scene_ids:
+            tiles_rows = db.execute(
+                text("SELECT DISTINCT tile_id FROM district_tiles_mapping WHERE LOWER(district_name) = :d"),
+                {"d": clean_d}
+            ).fetchall()
+            tiles = [r[0] for r in tiles_rows if r[0] and r[0] != "S1_SAR"]
+            if tiles:
+                scene_query = db.query(SceneModel.scene_id).filter(
+                    SceneModel.status == "HELD",
+                    SceneModel.tile.in_(tiles)
+                )
+                if start_date:
+                    scene_query = scene_query.filter(SceneModel.sensing_date >= start_date)
+                if end_date:
+                    scene_query = scene_query.filter(SceneModel.sensing_date <= end_date)
+                scene_ids = [r[0] for r in scene_query.all() if r[0]]
 
     if not scene_ids:
         return []
@@ -254,18 +286,39 @@ def find_band_rasters_for_district(
     if end_date:
         bf_query = bf_query.filter(BandFileModel.sensing_date <= end_date)
 
-    bf_query = bf_query.filter(
-        (func.lower(BandFileModel.band) == clean_b.lower()) |
-        (func.lower(BandFileModel.band) == f"{clean_b.lower()}.tif") |
-        (func.lower(BandFileModel.band) == f"{clean_b.lower()}.tiff")
-    )
+    if is_s1_vv:
+        vv_aliases = ["vv", "vv.tif", "vv.tiff", "iw-vv", "iw-vv.tif", "iw-vv.tiff"]
+        bf_query = bf_query.filter(
+            func.lower(BandFileModel.band).in_(vv_aliases) |
+            func.lower(BandFileModel.path).like("%iw-vv.tif%") |
+            func.lower(BandFileModel.path).like("%/vv.tif%") |
+            func.lower(BandFileModel.path).like("%\\vv.tif%")
+        )
+    elif is_s1_vh:
+        vh_aliases = ["vh", "vh.tif", "vh.tiff", "iw-vh", "iw-vh.tif", "iw-vh.tiff"]
+        bf_query = bf_query.filter(
+            func.lower(BandFileModel.band).in_(vh_aliases) |
+            func.lower(BandFileModel.path).like("%iw-vh.tif%") |
+            func.lower(BandFileModel.path).like("%/vh.tif%") |
+            func.lower(BandFileModel.path).like("%\\vh.tif%")
+        )
+    else:
+        bf_query = bf_query.filter(
+            (func.lower(BandFileModel.band) == clean_b.lower()) |
+            (func.lower(BandFileModel.band) == f"{clean_b.lower()}.tif") |
+            (func.lower(BandFileModel.band) == f"{clean_b.lower()}.tiff")
+        )
 
     records = bf_query.all()
     found_paths = []
+    seen_paths = set()
     for r in records:
         resolved, exists = resolve_tif_path(r.path)
         if exists and os.path.exists(resolved):
-            found_paths.append(_normalize_unc_path(resolved))
+            norm = _normalize_unc_path(resolved)
+            if norm.lower() not in seen_paths:
+                seen_paths.add(norm.lower())
+                found_paths.append(norm)
 
     return found_paths
 
@@ -651,9 +704,9 @@ def execute_layer_stacking(
                 f"Please verify data exists on NAS for this district."
             )
 
-        raw_band_paths[b_name] = paths
-        sample_candidate_paths.extend(paths[:2])
-        emit_log(f"Band '{b_name}' ready: {len(paths)} scene tile(s) queued.", "INFO", 30, "LOCATING")
+        raw_band_paths[b_name] = list(dict.fromkeys(paths))
+        sample_candidate_paths.extend(raw_band_paths[b_name][:2])
+        emit_log(f"Band '{b_name}' ready: {len(raw_band_paths[b_name])} scene tile(s) queued.", "INFO", 30, "LOCATING")
 
     # 4. Compute unified target grid covering district
     emit_log("Establishing unified raster grid (~10m resolution, EPSG:4326)...", "INFO", 35, "GRID")
@@ -893,10 +946,14 @@ def execute_layer_stacking(
         "bigtiff": "IF_SAFER"
     }
 
-    with tempfile.TemporaryDirectory() as tmp_dir:
-        temp_out = os.path.join(tmp_dir, filename)
+    temp_target = output_file_path + ".tmp"
+    saved_to_target = False
+
+    try:
+        dest_dir = os.path.dirname(output_file_path)
+        os.makedirs(dest_dir, exist_ok=True)
         with rasterio.Env(GDAL_NUM_THREADS="ALL_CPUS", GDAL_CACHEMAX=512):
-            with rasterio.open(temp_out, "w", **profile) as dst:
+            with rasterio.open(temp_target, "w", **profile) as dst:
                 for band_idx, arr_2d in enumerate(stacked_arrays, start=1):
                     dst.write(arr_2d, band_idx)
                     b_name = layer_names_ordered[band_idx - 1]
@@ -905,40 +962,38 @@ def execute_layer_stacking(
                         dst.update_tags(band_idx, DESCRIPTION=b_name, NAME=b_name, FILENAME=b_name)
                     except Exception:
                         pass
-
-        # Copy to primary target directory (single path: Composites/stack/{district}/)
-        emit_log("Copying final GeoTIFF to persistent archive...", "INFO", 95, "ARCHIVING")
-        dest_dir = os.path.dirname(output_file_path)
-        try:
-            os.makedirs(dest_dir, exist_ok=True)
-        except Exception:
-            pass
-
-        saved_to_target = False
-        try:
-            temp_target = output_file_path + ".tmp"
-            shutil.copy2(temp_out, temp_target)
-            if os.path.exists(output_file_path):
-                try:
-                    os.remove(output_file_path)
-                except Exception:
-                    pass
-            os.replace(temp_target, output_file_path)
-            saved_to_target = True
-        except Exception as e:
-            logger.warning(f"Could not write to '{output_file_path}': {e}. Falling back to local archive...")
-            os.makedirs(local_fallback_dir, exist_ok=True)
-            loc_target = os.path.join(local_fallback_dir, filename)
-            loc_tmp = loc_target + ".tmp"
-            shutil.copy2(temp_out, loc_tmp)
-            if os.path.exists(loc_target):
-                try:
-                    os.remove(loc_target)
-                except Exception:
-                    pass
-            os.replace(loc_tmp, loc_target)
-            output_file_path = loc_target
-            saved_to_target = True
+        time.sleep(0.3)
+        if os.path.exists(output_file_path):
+            try:
+                os.remove(output_file_path)
+            except Exception:
+                pass
+        os.replace(temp_target, output_file_path)
+        saved_to_target = True
+    except Exception as e:
+        logger.warning(f"Could not write directly to '{temp_target}': {e}. Using local fallback...")
+        os.makedirs(local_fallback_dir, exist_ok=True)
+        loc_target = os.path.join(local_fallback_dir, filename)
+        loc_tmp = loc_target + ".tmp"
+        with rasterio.Env(GDAL_NUM_THREADS="ALL_CPUS", GDAL_CACHEMAX=512):
+            with rasterio.open(loc_tmp, "w", **profile) as dst:
+                for band_idx, arr_2d in enumerate(stacked_arrays, start=1):
+                    dst.write(arr_2d, band_idx)
+                    b_name = layer_names_ordered[band_idx - 1]
+                    dst.set_band_description(band_idx, b_name)
+                    try:
+                        dst.update_tags(band_idx, DESCRIPTION=b_name, NAME=b_name, FILENAME=b_name)
+                    except Exception:
+                        pass
+        time.sleep(0.3)
+        if os.path.exists(loc_target):
+            try:
+                os.remove(loc_target)
+            except Exception:
+                pass
+        os.replace(loc_tmp, loc_target)
+        output_file_path = loc_target
+        saved_to_target = True
 
     file_size_bytes = os.path.getsize(output_file_path)
     file_size_mb = round(file_size_bytes / (1024 * 1024), 2)
@@ -1269,7 +1324,7 @@ def launch_layer_stack_task(
                         db_row.status = "SUCCESS"
                         db_row.progress = 100
                         db_row.step = "COMPLETED"
-                        db_row.output_path = res.get("file_path")
+                        db_row.output_path = res.get("output_path") or res.get("file_path")
                         db_row.filename = res.get("filename")
                         db_row.file_size_mb = res.get("size_mb") or res.get("file_size_mb")
                         db_row.total_bands = res.get("bands") or res.get("total_bands")
