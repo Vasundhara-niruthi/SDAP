@@ -14,7 +14,7 @@ from concurrent.futures import ThreadPoolExecutor
 import boto3
 import rasterio
 from botocore import UNSIGNED
-from botocore.config import Config
+from botocore.config import Config  # type: ignore
 from sqlalchemy.orm import Session
 from sqlalchemy import text
 
@@ -63,16 +63,6 @@ s3_s1_client = boto3.client(
 s3_client = s3_s2_client
 
 
-import os
-import boto3
-from botocore import UNSIGNED
-from botocore.config import Config
- 
-# Keep your existing imports and other functions here.
- 
- 
-#import os
- 
 def resolve_s3_band_path(
     prefix: str,
     band_name: str

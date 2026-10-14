@@ -1,5 +1,8 @@
 from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks, Query
-from fastapi.responses import FileResponse
+try:
+    from fastapi.responses import FileResponse  # type: ignore
+except (ImportError, ModuleNotFoundError):
+    from starlette.responses import FileResponse  # type: ignore
 import os
 import logging
 from sqlalchemy.orm import Session, joinedload, defer
