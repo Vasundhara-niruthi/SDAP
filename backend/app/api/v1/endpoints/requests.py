@@ -7,7 +7,7 @@ import os
 import logging
 from sqlalchemy.orm import Session, joinedload, defer
 from sqlalchemy import text
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 from datetime import datetime
 
 from app.core.database import get_db, SessionLocal
@@ -209,8 +209,25 @@ def run_pipeline_background(request_id: int):
         db.close()
 
 
-def build_request_response(req: RequestModel, include_logs: bool = True) -> RequestResponse:
-    """Helper to attach user metadata to request response."""
+def build_request_response(
+    req: RequestModel,
+    include_logs: bool = True,
+    stack_info: Optional[Dict[str, Any]] = None,
+    db: Optional[Session] = None
+) -> RequestResponse:
+    """Helper to attach user metadata and multi-band layer stacking details to request response."""
+    from app.services.stacker_service import get_layer_stacks_for_request
+
+    if stack_info is None:
+        try:
+            stack_info = get_layer_stacks_for_request(req, db=db)
+        except Exception:
+            stack_info = {"count": 0, "status": "NOT_STARTED", "files": []}
+
+    stk_cnt = stack_info.get("count", 0)
+    stk_status = stack_info.get("status", "NOT_STARTED")
+    stk_files = stack_info.get("files", [])
+
     return RequestResponse(
         id=req.id,
         user_id=req.user_id,
@@ -232,7 +249,10 @@ def build_request_response(req: RequestModel, include_logs: bool = True) -> Requ
         status=req.status,
         storage_estimated_gb=req.storage_estimated_gb,
         execution_logs=(req.execution_logs[-200000:] if req.execution_logs else None) if include_logs else None,
-        created_at=req.created_at
+        created_at=req.created_at,
+        stacking_count=stk_cnt,
+        stacking_status=stk_status,
+        stacked_files=stk_files
     )
 
 
@@ -384,7 +404,9 @@ def list_requests(
         query = query.filter(RequestModel.user_id == user_id)
 
     requests_list = query.order_by(RequestModel.id.desc()).offset(skip).limit(limit).all()
-    return [build_request_response(r, include_logs=False) for r in requests_list]
+    from app.services.stacker_service import get_layer_stacks_for_requests_bulk
+    bulk_stack_info = get_layer_stacks_for_requests_bulk(requests_list, db=db)
+    return [build_request_response(r, include_logs=False, stack_info=bulk_stack_info.get(r.id), db=db) for r in requests_list]
 
 
 @router.get("/by-district/{district_name}", summary="Get requests for a specific district")
@@ -398,10 +420,12 @@ def get_requests_by_district(
     can discover acquisition jobs for layer stacking and data retrieval.
     """
     from sqlalchemy import func
+    from app.services.stacker_service import get_layer_stacks_for_requests_bulk
     reqs = db.query(RequestModel).filter(
         func.lower(RequestModel.district) == district_name.strip().lower()
     ).order_by(RequestModel.id.desc()).all()
-    return [build_request_response(r, include_logs=False) for r in reqs]
+    bulk_stack_info = get_layer_stacks_for_requests_bulk(reqs, db=db)
+    return [build_request_response(r, include_logs=False, stack_info=bulk_stack_info.get(r.id), db=db) for r in reqs]
 
 
 @router.get("/{request_id}", response_model=RequestResponse, summary="Get Request by ID")
@@ -415,7 +439,7 @@ def get_request(
     req = query.first()
     if not req:
         raise HTTPException(status_code=404, detail="Request not found.")
-    return build_request_response(req)
+    return build_request_response(req, db=db)
 
 
 @router.patch("/{request_id}/status", response_model=RequestResponse, summary="Approve / Update Request Status (Admin Only)")
@@ -854,8 +878,67 @@ def create_layer_stack(
     Saves to: {RAW_ARCHIVE_DIR}/Composites/stack/{district}/
     Filename: {district}_{season}_{start_date}_{end_date}_{bands}.tif
     """
-    from app.services.stacker_service import launch_layer_stack_task
+    from app.services.stacker_service import launch_layer_stack_task, find_matching_layer_stacks_on_nas
     try:
+        force_recreate = bool(getattr(payload, "force_recreate", False))
+        if not force_recreate:
+            matches = find_matching_layer_stacks_on_nas(
+                district=payload.district,
+                state=payload.state,
+                season=payload.season or "Kharif",
+                start_date=payload.start_date,
+                end_date=payload.end_date,
+                layers=payload.layers
+            )
+            if matches:
+                top_m = matches[0]
+                if payload.request_id:
+                    try:
+                        from app.models import LayerStackJobModel
+                        from app.services.stacker_service import invalidate_request_stacks_cache
+                        existing_rec = db.query(LayerStackJobModel).filter(
+                            LayerStackJobModel.request_id == payload.request_id,
+                            LayerStackJobModel.filename == top_m["filename"]
+                        ).first()
+                        if not existing_rec:
+                            rec = LayerStackJobModel(
+                                task_id=f"stack_ex_{uuid.uuid4().hex[:10]}",
+                                request_id=payload.request_id,
+                                user_id=current_user.id if current_user else None,
+                                district=payload.district,
+                                state=payload.state,
+                                season=payload.season or "Kharif",
+                                start_date=payload.start_date,
+                                end_date=payload.end_date,
+                                layers=payload.layers,
+                                status="SUCCESS",
+                                progress=100,
+                                step="COMPLETED",
+                                output_path=top_m.get("path"),
+                                filename=top_m.get("filename"),
+                                file_size_mb=top_m.get("file_size_mb")
+                            )
+                            db.add(rec)
+                            db.commit()
+                            invalidate_request_stacks_cache()
+                    except Exception as e_link:
+                        logger.warning(f"Could not link existing NAS match to request #{payload.request_id}: {e_link}")
+
+                return {
+                    "status": "EXISTS_ON_NAS",
+                    "already_completed": True,
+                    "already_in_nas": True,
+                    "filename": top_m["filename"],
+                    "path": top_m["path"],
+                    "file_size_mb": top_m["file_size_mb"],
+                    "matches": matches,
+                    "district": payload.district,
+                    "state": payload.state,
+                    "season": payload.season or "Kharif",
+                    "layers_order": payload.layers,
+                    "message": f"Exact matching layer stack '{top_m['filename']}' is already downloaded and present on NAS storage."
+                }
+
         task_id = launch_layer_stack_task(
             district=payload.district,
             state=payload.state,
@@ -867,6 +950,7 @@ def create_layer_stack(
             output_filename=getattr(payload, "output_filename", None),
             selected_files=getattr(payload, "selected_files", None),
             selected_files_by_band=getattr(payload, "selected_files_by_band", None),
+            force_recreate=force_recreate,
             request_id=payload.request_id,
             user_id=current_user.id if current_user else None
         )
@@ -892,6 +976,23 @@ def get_layer_stack_task_status(
     if not job:
         raise HTTPException(status_code=404, detail=f"Layer stacking task '{task_id}' not found.")
     return job
+
+
+@router.post("/layer-stack/stop/{task_id}", summary="Stop / Cancel a running layer stacking task immediately")
+@router.post("/layer-stack/cancel/{task_id}", summary="Stop / Cancel a running layer stacking task immediately")
+def stop_layer_stack_task(
+    task_id: str,
+    db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_user)
+):
+    """Cancels/stops an active layer stacking task immediately, terminates background workers, and marks status as CANCELLED."""
+    from app.services.stacker_service import cancel_layer_stack_task
+    cancel_layer_stack_task(task_id)
+    return {
+        "status": "CANCELLED",
+        "task_id": task_id,
+        "message": f"Layer stacking task '{task_id}' has been stopped successfully."
+    }
 
 
 @router.get("/layer-stack/latest-active", summary="Get most recent or active layer stacking task for persistence across page refresh")

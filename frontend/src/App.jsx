@@ -443,6 +443,78 @@ export default function App() {
   // ---------------------------------------------------------------------------
   // 9. Layer Stacking Studio State & Handlers
   // ---------------------------------------------------------------------------
+  const extractBandsFromStackFilename = (filename) => {
+    if (!filename) return [];
+    const stem = filename.replace(/\.(tif|tiff)$/i, '');
+    const m = stem.match(/(\d{4}-?\d{2}-?\d{2})[_\-](\d{4}-?\d{2}-?\d{2})_(.+)$/i);
+    if (m && m[3]) {
+      return m[3].split('_').map(b => b.trim().toUpperCase()).filter(Boolean);
+    }
+    const m2 = stem.match(/_(?:Kharif|Rabi|Zaid|Annual|Monsoon|Winter|Pre-Monsoon|Post-Monsoon|Custom)_([A-Za-z0-9_]+)$/i);
+    if (m2 && m2[1]) {
+      return m2[1].split('_').map(b => b.trim().toUpperCase()).filter(Boolean);
+    }
+    return [];
+  };
+
+  const isExactMatchingStack = (stackItem, selectedLayers, targetDistrict, targetSeason, targetStartDate, targetEndDate) => {
+    if (!stackItem || !selectedLayers || selectedLayers.length === 0) return false;
+
+    // Check district match
+    if (targetDistrict && stackItem.district) {
+      if (stackItem.district.trim().toLowerCase() !== targetDistrict.trim().toLowerCase()) {
+        return false;
+      }
+    }
+
+    // Check season match if present
+    if (targetSeason && stackItem.season) {
+      const s1 = targetSeason.split('(')[0].trim().toLowerCase();
+      const s2 = stackItem.season.split('(')[0].trim().toLowerCase();
+      if (s1 && s2 && s1 !== s2) {
+        return false;
+      }
+    }
+
+    // Extract exact bands from layers array or filename
+    let itemBands = [];
+    if (Array.isArray(stackItem.layers) && stackItem.layers.length > 0) {
+      itemBands = stackItem.layers.map(b => b.trim().toUpperCase()).filter(Boolean);
+    } else if (stackItem.filename) {
+      itemBands = extractBandsFromStackFilename(stackItem.filename);
+    }
+
+    if (itemBands.length === 0) return false;
+
+    const selBands = selectedLayers.map(b => b.trim().toUpperCase()).filter(Boolean);
+    if (itemBands.length !== selBands.length) return false;
+
+    const bandsMatch = selBands.every(b => itemBands.includes(b)) && itemBands.every(b => selBands.includes(b));
+    if (!bandsMatch) return false;
+
+    // Check date range if target dates and item dates are available
+    if (targetStartDate && targetEndDate) {
+      const tStart = targetStartDate.replace(/-/g, '');
+      const tEnd = targetEndDate.replace(/-/g, '');
+      const dRangeStr = `${tStart}_${tEnd}`;
+      if (stackItem.filename) {
+        const dm = stackItem.filename.match(/_(\d{8}_\d{8})_/);
+        if (dm && dm[1] && dm[1] !== dRangeStr) {
+          return false;
+        }
+      }
+      if (stackItem.start_date && stackItem.end_date) {
+        const iStart = stackItem.start_date.replace(/-/g, '');
+        const iEnd = stackItem.end_date.replace(/-/g, '');
+        if (tStart !== iStart || tEnd !== iEnd) {
+          return false;
+        }
+      }
+    }
+
+    return true;
+  };
+
   const [stackState, setStackState] = useState('');
   const [stackDistrict, setStackDistrict] = useState('');
   const [stackSeason, setStackSeason] = useState('Kharif');
@@ -456,13 +528,17 @@ export default function App() {
   const [stackHistory, setStackHistory] = useState([]);
   const [loadingStackHistory, setLoadingStackHistory] = useState(false);
   const [stackHistorySearch, setStackHistorySearch] = useState('');
+  const [exactStackMatchModal, setExactStackMatchModal] = useState(null);
+  const [stackMatchSelectedFiles, setStackMatchSelectedFiles] = useState(new Set());
+  const [stackRequestId, setStackRequestId] = useState(null);
+  const [stackFilesModalReq, setStackFilesModalReq] = useState(null);
 
   // Dedicated NAS Layer Stack Archive Verification state (Tab 4: Retrieve Data)
   const [stackArchiveState, setStackArchiveState] = useState('');
   const [stackArchiveDistrict, setStackArchiveDistrict] = useState('');
-  const [stackArchiveSeason, setStackArchiveSeason] = useState('Kharif');
-  const [stackArchiveStartDate, setStackArchiveStartDate] = useState('2024-06-01');
-  const [stackArchiveEndDate, setStackArchiveEndDate] = useState('2024-12-31');
+  const [stackArchiveSeason, setStackArchiveSeason] = useState('ALL');
+  const [stackArchiveStartDate, setStackArchiveStartDate] = useState('');
+  const [stackArchiveEndDate, setStackArchiveEndDate] = useState('');
   const [stackArchiveResults, setStackArchiveResults] = useState([]);
   const [hasVerifiedStackArchive, setHasVerifiedStackArchive] = useState(false);
   const [verifyingStackArchive, setVerifyingStackArchive] = useState(false);
@@ -801,9 +877,27 @@ export default function App() {
         });
       }
 
-      // Default selected stage: all downloaded scenes for EVERY band are selected by default
+      // Default selected stage: select scenes within requested date window, or all if no date window
       Object.keys(grouped).forEach(bKey => {
-        initSelectedScenes[bKey] = new Set(grouped[bKey].map(s => s.path || s.scene_id));
+        const scenesInWindow = grouped[bKey].filter(s => {
+          if (!startVal && !endVal) return true;
+          if (s.is_composite) return true;
+          const rawDate = s.sensing_date || '';
+          let dVal = '';
+          const m1 = rawDate.match(/(\d{4})-(\d{2})-(\d{2})/);
+          if (m1) {
+            dVal = `${m1[1]}-${m1[2]}-${m1[3]}`;
+          } else {
+            const m2 = (rawDate || s.filename || '').match(/(\d{4})(\d{2})(\d{2})/);
+            if (m2) dVal = `${m2[1]}-${m2[2]}-${m2[3]}`;
+          }
+          if (!dVal) return true;
+          if (startVal && dVal < startVal) return false;
+          if (endVal && dVal > endVal) return false;
+          return true;
+        });
+        const scenesToSelect = scenesInWindow.length > 0 ? scenesInWindow : grouped[bKey];
+        initSelectedScenes[bKey] = new Set(scenesToSelect.map(s => s.path || s.scene_id));
       });
 
       setStackSelectedScenes(initSelectedScenes);
@@ -975,7 +1069,7 @@ export default function App() {
         params.state = stackArchiveState.trim();
       }
       if (stackArchiveSeason && stackArchiveSeason.trim() && stackArchiveSeason !== 'ALL') {
-        params.season = stackArchiveSeason.trim();
+        params.season = stackArchiveSeason.split('(')[0].trim();
       }
       if (stackArchiveStartDate && stackArchiveStartDate.trim()) {
         params.start_date = stackArchiveStartDate.trim();
@@ -1015,9 +1109,9 @@ export default function App() {
   const handleResetStackArchive = () => {
     setStackArchiveState('');
     setStackArchiveDistrict('');
-    setStackArchiveSeason('Kharif');
-    setStackArchiveStartDate('2024-06-01');
-    setStackArchiveEndDate('2024-12-31');
+    setStackArchiveSeason('ALL');
+    setStackArchiveStartDate('');
+    setStackArchiveEndDate('');
     setStackArchiveResults([]);
     setHasVerifiedStackArchive(false);
     setStackArchiveNotice(null);
@@ -1057,13 +1151,14 @@ export default function App() {
           setStackNotice({
             type: 'success',
             text: data.result?.already_completed
-              ? `✓ Verified: Task was already completed on NAS — loaded existing stack "${data.result?.filename}" (${data.result?.file_size_mb} MB, ${data.result?.total_bands} bands).`
-              : `✓ Layer stack created successfully: "${data.result?.filename}" (${data.result?.file_size_mb} MB, ${data.result?.total_bands} bands)`
+              ? `✓ Already in NAS: Layer stack for these exact bands is already generated on NAS — retrieved existing file "${data.result?.filename}" (${data.result?.file_size_mb} MB) directly without downloading or re-processing.`
+              : `✓ Data retrieved from NAS: Layer stack assembled successfully from existing downloaded rasters: "${data.result?.filename}" (${data.result?.file_size_mb} MB, ${data.result?.total_bands} bands). No downloading required.`
           });
           localStorage.removeItem('sdap_active_stack_task');
           if (targetDistrict || stackDistrict) {
             fetchStackHistory(targetDistrict || stackDistrict);
           }
+          fetchRequests();
         } else if (data.status === 'FAILED') {
           if (stackPollIntervalRef.current) {
             clearInterval(stackPollIntervalRef.current);
@@ -1085,22 +1180,7 @@ export default function App() {
     stackPollIntervalRef.current = setInterval(poll, 1200);
   }, [stackDistrict, fetchStackHistory]);
 
-  const handleExecuteLayerStacking = async () => {
-    if (!stackDistrict) {
-      setStackNotice({
-        type: 'error',
-        text: '⚠️ Please select a District to execute layer stacking.'
-      });
-      return;
-    }
-    if (!stackSelectedLayers || stackSelectedLayers.length === 0) {
-      setStackNotice({
-        type: 'error',
-        text: '⚠️ Please select at least one band or index to build the layer stack.'
-      });
-      return;
-    }
-
+  const executeStackTask = async (forceOverwrite = false) => {
     if (stackPollIntervalRef.current) {
       clearInterval(stackPollIntervalRef.current);
       stackPollIntervalRef.current = null;
@@ -1115,7 +1195,14 @@ export default function App() {
       {
         timestamp: new Date().toLocaleTimeString(),
         level: 'INFO',
-        message: `Verifying whether layer stacking task for ${stackDistrict} (${stackSeason || 'Kharif'}) is already completed on NAS or a new task...`
+        message: forceOverwrite
+          ? `Initiating fresh layer stack assembly for ${stackDistrict} (${stackSeason || 'Kharif'}) [Overwrite Mode]...`
+          : `Checking whether layer stack for ${stackDistrict} (${stackSeason || 'Kharif'}) is already generated on NAS...`
+      },
+      {
+        timestamp: new Date().toLocaleTimeString(),
+        level: 'SUCCESS',
+        message: `✓ Selected bands (${stackSelectedLayers.join(', ')}) are verified from downloaded data on NAS storage. Layer stacking will retrieve existing GeoTIFF rasters directly from NAS — no downloading required.`
       }
     ]);
 
@@ -1143,6 +1230,7 @@ export default function App() {
     });
 
     try {
+      const isForce = forceOverwrite === true;
       const payload = {
         state: stackState || null,
         district: stackDistrict,
@@ -1153,12 +1241,39 @@ export default function App() {
         clip_to_district: stackClipToDistrict,
         selected_files: selectedPaths.length > 0 ? selectedPaths : null,
         selected_files_by_band: Object.keys(selectedFilesByBand).length > 0 ? selectedFilesByBand : null,
-        request_id: null
+        force_recreate: isForce,
+        request_id: stackRequestId || null
       };
 
       const res = await axios.post(`${API_BASE}/requests/layer-stack`, payload, {
         headers: getAuthHeader()
       });
+
+      // BACKEND SAFEGUARD: If exact matching layer stack is already on NAS storage, pop up modal!
+      if (res.data.status === 'EXISTS_ON_NAS' || res.data.already_in_nas) {
+        setStackLoading(false);
+        fetchRequests();
+        const matches = res.data.matches && res.data.matches.length > 0
+          ? res.data.matches
+          : [{
+              filename: res.data.filename,
+              path: res.data.path || res.data.output_path,
+              file_size_mb: res.data.file_size_mb || res.data.size_mb,
+              size_mb: res.data.file_size_mb || res.data.size_mb,
+              district: res.data.district || stackDistrict,
+              season: res.data.season || stackSeason,
+              layers: stackSelectedLayers
+            }];
+        setStackMatchSelectedFiles(new Set(matches.map(m => m.filename)));
+        setExactStackMatchModal({
+          files: matches,
+          district: stackDistrict,
+          state: stackState,
+          season: stackSeason,
+          bands: stackSelectedLayers
+        });
+        return;
+      }
 
       const taskId = res.data.task_id;
       setStackTaskId(taskId);
@@ -1186,6 +1301,151 @@ export default function App() {
         text: `⚠️ Layer stacking failed: ${formatApiError(err, 'Failed to launch layer stacking task.')}`
       });
     }
+  };
+
+  const handleExecuteLayerStacking = async (forceOverwrite = false) => {
+    // CRITICAL: Strictly compare with boolean true so React SyntheticEvent is never treated as forceOverwrite=true
+    const isForce = forceOverwrite === true;
+
+    if (!stackDistrict) {
+      setStackNotice({
+        type: 'error',
+        text: '⚠️ Please select a District to execute layer stacking.'
+      });
+      return;
+    }
+    if (!stackSelectedLayers || stackSelectedLayers.length === 0) {
+      setStackNotice({
+        type: 'error',
+        text: '⚠️ Please select at least one band or index to build the layer stack.'
+      });
+      return;
+    }
+
+    if (!isForce) {
+      // 1. Fetch latest NAS history for this district to ensure 100% up-to-date data
+      let historyList = stackHistory || [];
+      try {
+        const cleanDistParam = (stackDistrict || '').split(',')[0].trim();
+        const checkRes = await axios.get(`${API_BASE}/requests/layer-stack/history`, {
+          params: { district: cleanDistParam },
+          headers: getAuthHeader()
+        });
+        if (Array.isArray(checkRes.data)) {
+          historyList = checkRes.data;
+          setStackHistory(historyList);
+        }
+      } catch (checkErr) {
+        console.warn('Live history check before stacking skipped:', checkErr);
+      }
+
+      // 2. Find ALL files where bands match stackSelectedLayers EXACTLY
+      const isMatchingBands = (item) => {
+        if (!item || !stackSelectedLayers || stackSelectedLayers.length === 0) return false;
+
+        // Match district name robustly (handles 'North Goa' vs 'North_Goa', 'Anantapur, Andhra Pradesh' vs 'Anantapur')
+        if (stackDistrict) {
+          const dClean = stackDistrict.split(',')[0].replace(/[^a-zA-Z0-9]/g, '').toLowerCase();
+          const itemD = (item.district || '').split(',')[0].replace(/[^a-zA-Z0-9]/g, '').toLowerCase();
+          const fn = (item.filename || '').replace(/[^a-zA-Z0-9]/g, '').toLowerCase();
+          if (itemD && dClean && itemD !== dClean && !fn.startsWith(dClean) && !fn.includes(dClean) && !dClean.includes(itemD)) {
+            return false;
+          }
+        }
+
+        let itemBands = [];
+        if (Array.isArray(item.layers) && item.layers.length > 0) {
+          itemBands = item.layers.map(b => b.trim().toUpperCase()).filter(Boolean);
+        } else if (item.filename) {
+          itemBands = extractBandsFromStackFilename(item.filename);
+        }
+        if (itemBands.length === 0) return false;
+        const selBands = stackSelectedLayers.map(b => b.trim().toUpperCase()).filter(Boolean);
+        if (itemBands.length !== selBands.length) return false;
+        return selBands.every(b => itemBands.includes(b)) && itemBands.every(b => selBands.includes(b));
+      };
+
+      const matchingFiles = historyList.filter(isMatchingBands);
+
+      // 3. If exact matching layer stack data exists on NAS, pop up modal with the single best matching file!
+      if (matchingFiles.length > 0) {
+        let bestMatch = matchingFiles[0];
+
+        if (matchingFiles.length > 1) {
+          const dRangeTarget = (stackStartDate && stackEndDate)
+            ? `${stackStartDate.replace(/-/g, '')}_${stackEndDate.replace(/-/g, '')}`
+            : '';
+          const exactDateMatches = matchingFiles.filter(f => 
+            (f.start_date === stackStartDate && f.end_date === stackEndDate) ||
+            (dRangeTarget && f.filename && f.filename.includes(dRangeTarget))
+          );
+          if (exactDateMatches.length > 0) {
+            bestMatch = exactDateMatches[0];
+          } else if (stackStartDate && stackEndDate) {
+            try {
+              const reqSpan = Math.abs((new Date(stackEndDate) - new Date(stackStartDate)) / (1000 * 60 * 60 * 24)) + 1;
+              let bestDiff = Infinity;
+              matchingFiles.forEach(c => {
+                if (c.start_date && c.end_date) {
+                  const cSpan = Math.abs((new Date(c.end_date) - new Date(c.start_date)) / (1000 * 60 * 60 * 24)) + 1;
+                  const diff = Math.abs(cSpan - reqSpan);
+                  if (diff < bestDiff) {
+                    bestDiff = diff;
+                    bestMatch = c;
+                  }
+                }
+              });
+            } catch (spanErr) {
+              bestMatch = matchingFiles[0];
+            }
+          }
+        }
+
+        const selectedTarget = [bestMatch];
+        setStackMatchSelectedFiles(new Set([bestMatch.filename]));
+        setExactStackMatchModal({
+          files: selectedTarget,
+          district: stackDistrict,
+          state: stackState,
+          season: stackSeason,
+          bands: stackSelectedLayers
+        });
+        return;
+      }
+    }
+
+    // No exact match found or user explicitly requested overwrite: proceed with background task
+    executeStackTask(isForce);
+  };
+
+  const handleStopLayerStacking = async () => {
+    const currentTaskId = stackTaskId || (JSON.parse(localStorage.getItem('sdap_active_stack_task') || '{}')).taskId;
+    try {
+      const stopTarget = currentTaskId || 'all';
+      await axios.post(`${API_BASE}/requests/layer-stack/stop/${stopTarget}`, {}, { headers: getAuthHeader() });
+    } catch (e) {
+      console.warn('Failed to stop layer stack task on backend:', e);
+    }
+    if (stackPollIntervalRef.current) {
+      clearInterval(stackPollIntervalRef.current);
+      stackPollIntervalRef.current = null;
+    }
+    setStackLoading(false);
+    setStackStep('CANCELLED');
+    localStorage.removeItem('sdap_active_stack_task');
+    setStackNotice({
+      type: 'warning',
+      text: '⚠️ Layer stacking task was stopped upon user request.'
+    });
+    setStackLogs(prev => [
+      ...prev,
+      {
+        timestamp: new Date().toLocaleTimeString(),
+        level: 'WARNING',
+        phase: 'STOPPED',
+        message: '⏹️ Execution stopped by user. All background workers and mosaicing tasks halted.'
+      }
+    ]);
   };
 
   const handleDownloadStackedTif = (filePath, fileName) => {
@@ -3943,6 +4203,13 @@ export default function App() {
       const compStepLabel = isPureS1Req ? `Step-3: ${intervalLabel} Composites (${step4Rows.length} windows)` : `Step-4: ${intervalLabel} Composites (${step4Rows.length} windows)`;
       stepTabs.push({ id: 'step4', label: compStepLabel });
     }
+    if (['COMPLETED', 'HELD', 'SUCCESS'].includes(selectedReq?.status) || (selectedReq?.stacking_count && selectedReq.stacking_count > 0)) {
+      const stackCount = selectedReq?.stacking_count || (selectedReq?.stacked_files || []).length || 0;
+      const stackStepLabel = stackCount > 0
+        ? `Step-5: Layer Stacking (${stackCount} done)`
+        : `Step-5: Layer Stacking (Not Done)`;
+      stepTabs.push({ id: 'step5', label: stackStepLabel });
+    }
     stepTabs.push({ id: 'warnings', label: `Warnings (${allIssueItems.length})`, isWarning: true });
 
     const activeStepFilter = stepTabs.some(t => t.id === logStepFilter) ? logStepFilter : 'all';
@@ -4224,6 +4491,129 @@ export default function App() {
                         `✓ STEP-4 · ${step4Rows.length} WEEKS ARCHIVED`
                       )}
                       {step4Rows.map((row, idx) => renderStep4Row(row, idx))}
+                    </>
+                  )}
+
+                  {/* STEP 5: Multi-Band Layer Stacking Studio Deliverables */}
+                  {((['COMPLETED', 'HELD', 'SUCCESS'].includes(selectedReq?.status) || (selectedReq?.stacking_count && selectedReq.stacking_count > 0)) && (activeStepFilter === 'all' || activeStepFilter === 'step5')) && (
+                    <>
+                      {renderStepHeader(
+                        5,
+                        'Multi-Band Layer Stacking Deliverables (Studio)',
+                        (selectedReq?.stacking_count || (selectedReq?.stacked_files || []).length || 0) > 0
+                          ? `Total ${selectedReq.stacking_count || selectedReq.stacked_files.length} layer stack(s) completed (${selectedReq.stacking_count || selectedReq.stacked_files.length} times done) · Archived on NAS`
+                          : 'Pipeline steps 1 to 4 completed successfully · Layer stacking has not been performed yet',
+                        (selectedReq?.stacking_count || (selectedReq?.stacked_files || []).length || 0) > 0
+                          ? `✓ STEP-5 · ${selectedReq.stacking_count || selectedReq.stacked_files.length} STACK${(selectedReq.stacking_count || selectedReq.stacked_files.length) > 1 ? 'S' : ''} DONE`
+                          : `⚠️ STEP-5 · NOT STACKED YET (0)`
+                      )}
+
+                      {(selectedReq?.stacked_files && selectedReq.stacked_files.length > 0) ? (
+                        selectedReq.stacked_files.map((sf, sidx) => (
+                          <tr key={`stk-${sidx}`} style={{ borderBottom: '1px solid #f1f5f9', backgroundColor: sidx % 2 === 0 ? '#ffffff' : '#f8fafc' }}>
+                            <td style={{ padding: '0.65rem 0.85rem' }} colSpan={2}>
+                              <div style={{ display: 'flex', alignItems: 'center', gap: '0.45rem' }}>
+                                <Layers size={14} color="#2563eb" style={{ flexShrink: 0 }} />
+                                <div>
+                                  <div style={{ fontFamily: 'monospace', fontSize: '0.8rem', fontWeight: 700, color: '#0f172a', wordBreak: 'break-all' }}>
+                                    {sf.filename}
+                                  </div>
+                                  <div style={{ fontSize: '0.7rem', color: '#64748b', marginTop: '0.15rem' }}>
+                                    {sf.layers && sf.layers.length > 0 ? `Bands: [${sf.layers.join(', ')}]` : 'Multi-band stacked GeoTIFF'}
+                                  </div>
+                                </div>
+                              </div>
+                            </td>
+                            <td style={{ padding: '0.65rem 0.85rem', fontSize: '0.78rem', color: '#334155', fontWeight: 600 }}>
+                              {sf.file_size_mb ? `${sf.file_size_mb} MB` : '—'}
+                            </td>
+                            <td style={{ padding: '0.65rem 0.85rem' }}>
+                              <span style={{
+                                display: 'inline-flex',
+                                alignItems: 'center',
+                                gap: '0.25rem',
+                                padding: '0.2rem 0.5rem',
+                                borderRadius: '9999px',
+                                fontSize: '0.7rem',
+                                fontWeight: 700,
+                                backgroundColor: '#ecfdf5',
+                                color: '#047857',
+                                border: '1px solid #a7f3d0'
+                              }}>
+                                <CheckCircle size={10} color="#047857" /> ARCHIVED ON NAS
+                              </span>
+                            </td>
+                            <td style={{ padding: '0.65rem 0.85rem', textAlign: 'right' }} colSpan={2}>
+                              <button
+                                onClick={() => handleDownloadStackedTif(sf.path || sf.filename, sf.filename)}
+                                style={{
+                                  display: 'inline-flex',
+                                  alignItems: 'center',
+                                  gap: '0.35rem',
+                                  padding: '0.35rem 0.65rem',
+                                  borderRadius: '0.375rem',
+                                  border: '1px solid #2563eb',
+                                  backgroundColor: '#eff6ff',
+                                  color: '#1d4ed8',
+                                  fontSize: '0.75rem',
+                                  fontWeight: 600,
+                                  cursor: 'pointer'
+                                }}
+                                title="Download stacked GeoTIFF file from NAS"
+                              >
+                                <Download size={12} /> Download Stack (.tif)
+                              </button>
+                            </td>
+                          </tr>
+                        ))
+                      ) : (
+                        <tr>
+                          <td colSpan={6} style={{ padding: '1.25rem 1rem', textAlign: 'center', backgroundColor: '#fffbeb', border: '1px dashed #fde68a' }}>
+                            <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '0.4rem' }}>
+                              <div style={{ fontWeight: 700, fontSize: '0.85rem', color: '#b45309', display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
+                                <Layers size={16} color="#d97706" /> Stacking: Not Done (0 Stacks Completed)
+                              </div>
+                              <div style={{ fontSize: '0.76rem', color: '#78350f' }}>
+                                Pipeline steps 1 to 4 are completed and all input rasters are on NAS. Layer stacking has not been executed yet for this request.
+                              </div>
+                              <button
+                                onClick={() => {
+                                  const req = selectedReq;
+                                  closeLogsModal();
+                                  setActiveTab('layer_stacking');
+                                  setStackRequestId(req.id);
+                                  setStackState(req.state || '');
+                                  setStackDistrict(req.district || '');
+                                  setStackSeason(req.season || 'Kharif');
+                                  const sDate = req.start_date ? req.start_date.split('T')[0] : '2026-06-01';
+                                  const eDate = req.end_date ? req.end_date.split('T')[0] : '2026-10-31';
+                                  setStackStartDate(sDate);
+                                  setStackEndDate(eDate);
+                                  hasAutoLoadedStackRef.current = true;
+                                  loadBandsAndScenesForRegion(req.state, req.district, req.season, sDate, eDate, req.id);
+                                  fetchStackHistory(req.district);
+                                }}
+                                style={{
+                                  marginTop: '0.4rem',
+                                  display: 'inline-flex',
+                                  alignItems: 'center',
+                                  gap: '0.35rem',
+                                  padding: '0.4rem 0.85rem',
+                                  borderRadius: '0.375rem',
+                                  border: '1px solid #d97706',
+                                  backgroundColor: '#fef3c7',
+                                  color: '#92400e',
+                                  fontSize: '0.78rem',
+                                  fontWeight: 700,
+                                  cursor: 'pointer'
+                                }}
+                              >
+                                <Layers size={13} /> Launch Layer Stacking Studio Now
+                              </button>
+                            </div>
+                          </td>
+                        </tr>
+                      )}
                     </>
                   )}
 
@@ -5184,38 +5574,86 @@ export default function App() {
                               </button>
 
                               {['COMPLETED', 'HELD', 'SUCCESS'].includes(req.status) && (
-                                <button
-                                  onClick={() => {
-                                    closeLogsModal();
-                                    setActiveTab('layer_stacking');
-                                    setStackState(req.state || '');
-                                    setStackDistrict(req.district || '');
-                                    setStackSeason(req.season || 'Kharif');
-                                    const sDate = req.start_date ? req.start_date.split('T')[0] : '2026-06-01';
-                                    const eDate = req.end_date ? req.end_date.split('T')[0] : '2026-10-31';
-                                    setStackStartDate(sDate);
-                                    setStackEndDate(eDate);
-                                    hasAutoLoadedStackRef.current = true;
-                                    loadBandsAndScenesForRegion(req.state, req.district, req.season, sDate, eDate, req.id);
-                                    fetchStackHistory(req.district);
-                                  }}
-                                  style={{
-                                    display: 'inline-flex',
-                                    alignItems: 'center',
-                                    gap: '0.25rem',
-                                    padding: '0.35rem 0.6rem',
-                                    borderRadius: '0.375rem',
-                                    border: '1px solid #bfdbfe',
-                                    backgroundColor: '#eff6ff',
-                                    fontSize: '0.75rem',
-                                    fontWeight: 600,
-                                    color: '#1d4ed8',
-                                    cursor: 'pointer'
-                                  }}
-                                  title="Open Multi-Band Layer Stacking Studio for this request"
-                                >
-                                  <Layers size={12} /> Stacking
-                                </button>
+                                <>
+                                  {(req.stacking_count > 0 || (req.stacked_files && req.stacked_files.length > 0)) ? (
+                                    <button
+                                      onClick={(e) => {
+                                        e.stopPropagation();
+                                        setStackFilesModalReq(req);
+                                      }}
+                                      style={{
+                                        display: 'inline-flex',
+                                        alignItems: 'center',
+                                        gap: '0.25rem',
+                                        padding: '0.3rem 0.55rem',
+                                        borderRadius: '9999px',
+                                        border: '1px solid #86efac',
+                                        backgroundColor: '#f0fdf4',
+                                        fontSize: '0.72rem',
+                                        fontWeight: 700,
+                                        color: '#166534',
+                                        cursor: 'pointer',
+                                        transition: 'all 0.15s ease'
+                                      }}
+                                      title={`Click to view ${req.stacking_count || req.stacked_files.length} stacked GeoTIFF file(s)`}
+                                    >
+                                      <CheckCircle size={11} color="#16a34a" />
+                                      {req.stacking_count || req.stacked_files.length} {(req.stacking_count || req.stacked_files.length) === 1 ? 'time done' : 'times done'}
+                                    </button>
+                                  ) : (
+                                    <span
+                                      style={{
+                                        display: 'inline-flex',
+                                        alignItems: 'center',
+                                        gap: '0.25rem',
+                                        padding: '0.3rem 0.55rem',
+                                        borderRadius: '9999px',
+                                        border: '1px solid #fed7aa',
+                                        backgroundColor: '#fff7ed',
+                                        fontSize: '0.72rem',
+                                        fontWeight: 700,
+                                        color: '#c2410c'
+                                      }}
+                                      title="Pipeline steps 1 to 4 completed, but layer stacking has not been performed yet"
+                                    >
+                                      Stacking: Not Done
+                                    </span>
+                                  )}
+
+                                  <button
+                                    onClick={() => {
+                                      closeLogsModal();
+                                      setActiveTab('layer_stacking');
+                                      setStackRequestId(req.id);
+                                      setStackState(req.state || '');
+                                      setStackDistrict(req.district || '');
+                                      setStackSeason(req.season || 'Kharif');
+                                      const sDate = req.start_date ? req.start_date.split('T')[0] : '2026-06-01';
+                                      const eDate = req.end_date ? req.end_date.split('T')[0] : '2026-10-31';
+                                      setStackStartDate(sDate);
+                                      setStackEndDate(eDate);
+                                      hasAutoLoadedStackRef.current = true;
+                                      loadBandsAndScenesForRegion(req.state, req.district, req.season, sDate, eDate, req.id);
+                                      fetchStackHistory(req.district);
+                                    }}
+                                    style={{
+                                      display: 'inline-flex',
+                                      alignItems: 'center',
+                                      gap: '0.25rem',
+                                      padding: '0.35rem 0.6rem',
+                                      borderRadius: '0.375rem',
+                                      border: '1px solid #bfdbfe',
+                                      backgroundColor: '#eff6ff',
+                                      fontSize: '0.75rem',
+                                      fontWeight: 600,
+                                      color: '#1d4ed8',
+                                      cursor: 'pointer'
+                                    }}
+                                    title="Open Multi-Band Layer Stacking Studio for this request"
+                                  >
+                                    <Layers size={12} /> Stacking
+                                  </button>
+                                </>
                               )}
 
                               {req.status === 'PROCESSING' ? (
@@ -6708,37 +7146,84 @@ export default function App() {
                                                     </button>
 
                                                     {['COMPLETED', 'HELD', 'SUCCESS'].includes(req.status) && (
-                                                      <button
-                                                        onClick={() => {
-                                                          setActiveTab('layer_stacking');
-                                                          setStackState(req.state || '');
-                                                          setStackDistrict(req.district || '');
-                                                          setStackSeason(req.season || 'Kharif');
-                                                          const sDate = req.start_date ? req.start_date.split('T')[0] : '2026-06-01';
-                                                          const eDate = req.end_date ? req.end_date.split('T')[0] : '2026-10-31';
-                                                          setStackStartDate(sDate);
-                                                          setStackEndDate(eDate);
-                                                          hasAutoLoadedStackRef.current = true;
-                                                          loadBandsAndScenesForRegion(req.state, req.district, req.season, sDate, eDate, req.id);
-                                                          fetchStackHistory(req.district);
-                                                        }}
-                                                        title="Open Multi-Band Layer Stacking Studio for this request"
-                                                        style={{
-                                                          display: 'inline-flex',
-                                                          alignItems: 'center',
-                                                          gap: '0.25rem',
-                                                          padding: '0.3rem 0.55rem',
-                                                          borderRadius: '0.375rem',
-                                                          border: '1px solid #bfdbfe',
-                                                          backgroundColor: '#eff6ff',
-                                                          fontSize: '0.75rem',
-                                                          fontWeight: 600,
-                                                          color: '#1d4ed8',
-                                                          cursor: 'pointer'
-                                                        }}
-                                                      >
-                                                        <Layers size={12} color="#1d4ed8" /> Stacking
-                                                      </button>
+                                                      <>
+                                                        {(req.stacking_count > 0 || (req.stacked_files && req.stacked_files.length > 0)) ? (
+                                                          <button
+                                                            onClick={(e) => {
+                                                              e.stopPropagation();
+                                                              setStackFilesModalReq(req);
+                                                            }}
+                                                            style={{
+                                                              display: 'inline-flex',
+                                                              alignItems: 'center',
+                                                              gap: '0.25rem',
+                                                              padding: '0.25rem 0.5rem',
+                                                              borderRadius: '9999px',
+                                                              border: '1px solid #86efac',
+                                                              backgroundColor: '#f0fdf4',
+                                                              fontSize: '0.72rem',
+                                                              fontWeight: 700,
+                                                              color: '#166534',
+                                                              cursor: 'pointer'
+                                                            }}
+                                                            title={`View ${req.stacking_count || req.stacked_files.length} stacked GeoTIFF file(s)`}
+                                                          >
+                                                            <CheckCircle size={10} color="#16a34a" />
+                                                            {req.stacking_count || req.stacked_files.length} {(req.stacking_count || req.stacked_files.length) === 1 ? 'time done' : 'times done'}
+                                                          </button>
+                                                        ) : (
+                                                          <span
+                                                            style={{
+                                                              display: 'inline-flex',
+                                                              alignItems: 'center',
+                                                              gap: '0.25rem',
+                                                              padding: '0.25rem 0.5rem',
+                                                              borderRadius: '9999px',
+                                                              border: '1px solid #fed7aa',
+                                                              backgroundColor: '#fff7ed',
+                                                              fontSize: '0.72rem',
+                                                              fontWeight: 700,
+                                                              color: '#c2410c'
+                                                            }}
+                                                            title="Pipeline steps 1 to 4 completed, but layer stacking has not been performed yet"
+                                                          >
+                                                            Stacking: Not Done
+                                                          </span>
+                                                        )}
+
+                                                        <button
+                                                          onClick={() => {
+                                                            setActiveTab('layer_stacking');
+                                                            setStackRequestId(req.id);
+                                                            setStackState(req.state || '');
+                                                            setStackDistrict(req.district || '');
+                                                            setStackSeason(req.season || 'Kharif');
+                                                            const sDate = req.start_date ? req.start_date.split('T')[0] : '2026-06-01';
+                                                            const eDate = req.end_date ? req.end_date.split('T')[0] : '2026-10-31';
+                                                            setStackStartDate(sDate);
+                                                            setStackEndDate(eDate);
+                                                            hasAutoLoadedStackRef.current = true;
+                                                            loadBandsAndScenesForRegion(req.state, req.district, req.season, sDate, eDate, req.id);
+                                                            fetchStackHistory(req.district);
+                                                          }}
+                                                          title="Open Multi-Band Layer Stacking Studio for this request"
+                                                          style={{
+                                                            display: 'inline-flex',
+                                                            alignItems: 'center',
+                                                            gap: '0.25rem',
+                                                            padding: '0.3rem 0.55rem',
+                                                            borderRadius: '0.375rem',
+                                                            border: '1px solid #bfdbfe',
+                                                            backgroundColor: '#eff6ff',
+                                                            fontSize: '0.75rem',
+                                                            fontWeight: 600,
+                                                            color: '#1d4ed8',
+                                                            cursor: 'pointer'
+                                                          }}
+                                                        >
+                                                          <Layers size={12} color="#1d4ed8" /> Stacking
+                                                        </button>
+                                                      </>
                                                     )}
 
                                                     {/* Approve if Hold for Approval */}
@@ -7899,6 +8384,7 @@ export default function App() {
                             <th style={{ padding: '0.75rem 1rem' }}>Sensor</th>
                             <th style={{ padding: '0.75rem 1rem' }}>District</th>
                             <th style={{ padding: '0.75rem 1rem' }}>Season</th>
+                            <th style={{ padding: '0.75rem 1rem' }}>Stacked Bands</th>
                             <th style={{ padding: '0.75rem 1rem' }}>File Size</th>
                             <th style={{ padding: '0.75rem 1rem' }}>Modified Date</th>
                             <th style={{ padding: '0.75rem 1rem', textAlign: 'right' }}>Actions</th>
@@ -7934,8 +8420,25 @@ export default function App() {
                                 <td style={{ padding: '0.75rem 1rem', color: '#334155' }}>
                                   {item.season || '—'}
                                 </td>
+                                <td style={{ padding: '0.75rem 1rem' }}>
+                                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.25rem' }}>
+                                    {(item.layers && item.layers.length > 0 ? item.layers : extractBandsFromStackFilename(item.filename)).map((lyr, lIdx) => (
+                                      <span key={lIdx} style={{
+                                        fontSize: '0.72rem',
+                                        fontWeight: 700,
+                                        backgroundColor: ['NDVI', 'LSWI'].includes(lyr) ? '#eff6ff' : (['VV', 'VH'].includes(lyr) ? '#fffbeb' : '#f0fdf4'),
+                                        color: ['NDVI', 'LSWI'].includes(lyr) ? '#1d4ed8' : (['VV', 'VH'].includes(lyr) ? '#92400e' : '#166534'),
+                                        border: `1px solid ${['NDVI', 'LSWI'].includes(lyr) ? '#bfdbfe' : (['VV', 'VH'].includes(lyr) ? '#fde68a' : '#bbf7d0')}`,
+                                        padding: '0.1rem 0.4rem',
+                                        borderRadius: '0.25rem'
+                                      }}>
+                                        {lyr}
+                                      </span>
+                                    ))}
+                                  </div>
+                                </td>
                                 <td style={{ padding: '0.75rem 1rem', fontFamily: 'monospace', color: '#475569' }}>
-                                  {item.size_mb} MB
+                                  {item.file_size_mb || item.size_mb} MB
                                 </td>
                                 <td style={{ padding: '0.75rem 1rem', color: '#64748b', fontSize: '0.8rem' }}>
                                   {item.modified_at || '—'}
@@ -8656,6 +9159,40 @@ export default function App() {
                 );
               })()}
 
+              {/* NAS Verification Banner (Informational: Input bands available on NAS) */}
+              {(() => {
+                if (!stackDistrict || stackSelectedLayers.length === 0) return null;
+
+                const allSelectedBandsInNas = stackSelectedLayers.every(lyr => {
+                  const scenes = stackDownloadedBandsData[lyr] || [];
+                  return scenes.length > 0;
+                });
+
+                if (allSelectedBandsInNas) {
+                  return (
+                    <div style={{
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: '0.5rem',
+                      fontSize: '0.82rem',
+                      color: '#047857',
+                      backgroundColor: '#ecfdf5',
+                      border: '1px solid #a7f3d0',
+                      padding: '0.55rem 0.85rem',
+                      borderRadius: '0.375rem',
+                      marginBottom: '1rem'
+                    }}>
+                      <CheckCircle size={16} color="#059669" style={{ flexShrink: 0 }} />
+                      <span>
+                        <strong>NAS Data Verified:</strong> All {stackSelectedLayers.length} selected bands are already downloaded and stored on NAS. Layer stacking will retrieve existing GeoTIFF files directly from NAS — <strong>no re-downloading required</strong>.
+                      </span>
+                    </div>
+                  );
+                }
+
+                return null;
+              })()}
+
               {/* Execution Actions & Output Preview */}
               <div style={{
                 display: 'flex',
@@ -8675,34 +9212,59 @@ export default function App() {
                   <span>Mask and clip output layers to district administrative boundary (EPSG:4326)</span>
                 </label>
 
-                <button
-                  onClick={handleExecuteLayerStacking}
-                  disabled={stackLoading || !stackDistrict || stackSelectedLayers.length === 0}
-                  style={{
-                    display: 'flex',
-                    alignItems: 'center',
-                    gap: '0.5rem',
-                    backgroundColor: (stackLoading || !stackDistrict || stackSelectedLayers.length === 0) ? '#94a3b8' : '#2563eb',
-                    color: '#ffffff',
-                    fontWeight: 600,
-                    fontSize: '0.9rem',
-                    padding: '0.65rem 1.5rem',
-                    border: 'none',
-                    borderRadius: '0.375rem',
-                    cursor: (stackLoading || !stackDistrict || stackSelectedLayers.length === 0) ? 'not-allowed' : 'pointer',
-                    boxShadow: '0 1px 3px rgba(0,0,0,0.1)'
-                  }}
-                >
-                  {stackLoading ? (
-                    <>
-                      <RefreshCw size={16} className="spin" /> Generating Layer Stack on NAS...
-                    </>
-                  ) : (
-                    <>
-                      <Layers size={16} /> Execute Layer Stacking
-                    </>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
+                  {stackLoading && (
+                    <button
+                      type="button"
+                      onClick={handleStopLayerStacking}
+                      style={{
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: '0.5rem',
+                        backgroundColor: '#dc2626',
+                        color: '#ffffff',
+                        fontWeight: 600,
+                        fontSize: '0.9rem',
+                        padding: '0.65rem 1.25rem',
+                        border: 'none',
+                        borderRadius: '0.375rem',
+                        cursor: 'pointer',
+                        boxShadow: '0 1px 3px rgba(0,0,0,0.1)'
+                      }}
+                      title="Stop / Cancel Layer Stacking"
+                    >
+                      <Square size={16} fill="#ffffff" /> Stop Stacking
+                    </button>
                   )}
-                </button>
+                  <button
+                    onClick={() => handleExecuteLayerStacking(false)}
+                    disabled={stackLoading || !stackDistrict || stackSelectedLayers.length === 0}
+                    style={{
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: '0.5rem',
+                      backgroundColor: (stackLoading || !stackDistrict || stackSelectedLayers.length === 0) ? '#94a3b8' : '#2563eb',
+                      color: '#ffffff',
+                      fontWeight: 600,
+                      fontSize: '0.9rem',
+                      padding: '0.65rem 1.5rem',
+                      border: 'none',
+                      borderRadius: '0.375rem',
+                      cursor: (stackLoading || !stackDistrict || stackSelectedLayers.length === 0) ? 'not-allowed' : 'pointer',
+                      boxShadow: '0 1px 3px rgba(0,0,0,0.1)'
+                    }}
+                  >
+                    {stackLoading ? (
+                      <>
+                        <RefreshCw size={16} className="spin" /> Generating Layer Stack on NAS...
+                      </>
+                    ) : (
+                      <>
+                        <Layers size={16} /> Execute Layer Stacking
+                      </>
+                    )}
+                  </button>
+                </div>
               </div>
 
             </div>
@@ -8801,6 +9363,29 @@ export default function App() {
                         <Terminal size={13} /> Terminal View
                       </button>
                     </div>
+
+                    {stackLoading && (
+                      <button
+                        type="button"
+                        onClick={handleStopLayerStacking}
+                        title="Stop Stacking Task"
+                        style={{
+                          display: 'inline-flex',
+                          alignItems: 'center',
+                          gap: '0.35rem',
+                          padding: '0.25rem 0.65rem',
+                          borderRadius: '0.25rem',
+                          border: '1px solid #f87171',
+                          backgroundColor: '#fee2e2',
+                          color: '#b91c1c',
+                          fontSize: '0.72rem',
+                          fontWeight: 700,
+                          cursor: 'pointer'
+                        }}
+                      >
+                        <Square size={12} fill="#b91c1c" /> Stop Stacking
+                      </button>
+                    )}
 
                     <button
                       type="button"
@@ -9378,40 +9963,85 @@ export default function App() {
 
               <div style={{ display: 'flex', alignItems: 'center', gap: '0.65rem' }}>
                 {['COMPLETED', 'HELD', 'SUCCESS'].includes(selectedReqForLogs.status) && (
-                  <button
-                    onClick={() => {
-                      const req = selectedReqForLogs;
-                      closeLogsModal();
-                      setActiveTab('layer_stacking');
-                      setStackState(req.state || '');
-                      setStackDistrict(req.district || '');
-                      setStackSeason(req.season || 'Kharif');
-                      const sDate = req.start_date ? req.start_date.split('T')[0] : '2026-06-01';
-                      const eDate = req.end_date ? req.end_date.split('T')[0] : '2026-10-31';
-                      setStackStartDate(sDate);
-                      setStackEndDate(eDate);
-                      hasAutoLoadedStackRef.current = true;
-                      loadBandsAndScenesForRegion(req.state, req.district, req.season, sDate, eDate, req.id);
-                      fetchStackHistory(req.district);
-                    }}
-                    style={{
-                      display: 'inline-flex',
-                      alignItems: 'center',
-                      gap: '0.35rem',
-                      padding: '0.4rem 0.75rem',
-                      borderRadius: '0.375rem',
-                      border: '1px solid #bfdbfe',
-                      backgroundColor: '#eff6ff',
-                      fontSize: '0.8rem',
-                      fontWeight: 700,
-                      color: '#1d4ed8',
-                      cursor: 'pointer',
-                      transition: 'all 0.15s ease'
-                    }}
-                    title="Open Multi-Band Layer Stacking Studio for this request"
-                  >
-                    <Layers size={14} /> Stacking Studio
-                  </button>
+                  <>
+                    {(selectedReqForLogs.stacking_count > 0 || (selectedReqForLogs.stacked_files && selectedReqForLogs.stacked_files.length > 0)) ? (
+                      <button
+                        onClick={() => setStackFilesModalReq(selectedReqForLogs)}
+                        style={{
+                          display: 'inline-flex',
+                          alignItems: 'center',
+                          gap: '0.35rem',
+                          padding: '0.38rem 0.75rem',
+                          borderRadius: '0.375rem',
+                          border: '1px solid #86efac',
+                          backgroundColor: '#f0fdf4',
+                          fontSize: '0.78rem',
+                          fontWeight: 700,
+                          color: '#166534',
+                          cursor: 'pointer'
+                        }}
+                        title="Click to view all stacked GeoTIFF files and downloads for this request"
+                      >
+                        <CheckCircle size={13} color="#16a34a" />
+                        Stacking: {selectedReqForLogs.stacking_count || selectedReqForLogs.stacked_files.length} {(selectedReqForLogs.stacking_count || selectedReqForLogs.stacked_files.length) === 1 ? 'time done' : 'times done'}
+                      </button>
+                    ) : (
+                      <span
+                        style={{
+                          display: 'inline-flex',
+                          alignItems: 'center',
+                          gap: '0.35rem',
+                          padding: '0.38rem 0.75rem',
+                          borderRadius: '0.375rem',
+                          border: '1px solid #fed7aa',
+                          backgroundColor: '#fff7ed',
+                          fontSize: '0.78rem',
+                          fontWeight: 700,
+                          color: '#c2410c'
+                        }}
+                        title="Pipeline steps 1 to 4 completed, but layer stacking has not been performed yet"
+                      >
+                        <Layers size={13} color="#ea580c" />
+                        Stacking: Not Done (0)
+                      </span>
+                    )}
+
+                    <button
+                      onClick={() => {
+                        const req = selectedReqForLogs;
+                        closeLogsModal();
+                        setActiveTab('layer_stacking');
+                        setStackRequestId(req.id);
+                        setStackState(req.state || '');
+                        setStackDistrict(req.district || '');
+                        setStackSeason(req.season || 'Kharif');
+                        const sDate = req.start_date ? req.start_date.split('T')[0] : '2026-06-01';
+                        const eDate = req.end_date ? req.end_date.split('T')[0] : '2026-10-31';
+                        setStackStartDate(sDate);
+                        setStackEndDate(eDate);
+                        hasAutoLoadedStackRef.current = true;
+                        loadBandsAndScenesForRegion(req.state, req.district, req.season, sDate, eDate, req.id);
+                        fetchStackHistory(req.district);
+                      }}
+                      style={{
+                        display: 'inline-flex',
+                        alignItems: 'center',
+                        gap: '0.35rem',
+                        padding: '0.4rem 0.75rem',
+                        borderRadius: '0.375rem',
+                        border: '1px solid #bfdbfe',
+                        backgroundColor: '#eff6ff',
+                        fontSize: '0.8rem',
+                        fontWeight: 700,
+                        color: '#1d4ed8',
+                        cursor: 'pointer',
+                        transition: 'all 0.15s ease'
+                      }}
+                      title="Open Multi-Band Layer Stacking Studio for this request"
+                    >
+                      <Layers size={14} /> Stacking Studio
+                    </button>
+                  </>
                 )}
 
                 <button
@@ -10420,6 +11050,508 @@ export default function App() {
           </div>
         </div>
       )}
+
+      {/* ========================================================================= */}
+      {/* MODAL 4: Existing Layer Stack Found on NAS (Direct Download vs Re-Generate) */}
+      {/* ========================================================================= */}
+      {exactStackMatchModal && (() => {
+        const modalFiles = exactStackMatchModal.files || (exactStackMatchModal.filename ? [exactStackMatchModal] : []);
+        const totalMb = modalFiles
+          .filter(f => stackMatchSelectedFiles.has(f.filename))
+          .reduce((sum, f) => sum + (Number(f.file_size_mb || f.size_mb) || 0), 0);
+        const selectedCount = modalFiles.filter(f => stackMatchSelectedFiles.has(f.filename)).length;
+
+        const layersList = exactStackMatchModal.bands || stackSelectedLayers || [];
+        const hasS1 = layersList.some(l => ['VV', 'VH', 'VV_VH'].includes(l));
+        const hasS2 = layersList.some(l => !['VV', 'VH', 'VV_VH'].includes(l));
+        const sensorName = (hasS1 && hasS2) ? 'Combined' : (hasS1 ? 'Sentinel-1' : 'Sentinel-2');
+
+        return (
+          <div className="modal-overlay" onClick={() => setExactStackMatchModal(null)}>
+            <div
+              className="modal-content"
+              onClick={(e) => e.stopPropagation()}
+              style={{
+                maxWidth: '560px',
+                borderRadius: '0.75rem',
+                overflow: 'hidden',
+                boxShadow: '0 20px 25px -5px rgba(0, 0, 0, 0.2)',
+                border: '1px solid #e2e8f0',
+                backgroundColor: '#ffffff'
+              }}
+            >
+              {/* Modal Header */}
+              <div style={{
+                padding: '1.25rem 1.5rem',
+                backgroundColor: '#eff6ff',
+                borderBottom: '1px solid #dbeafe',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'space-between'
+              }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '0.65rem' }}>
+                  <div style={{
+                    backgroundColor: '#dbeafe',
+                    borderRadius: '0.5rem',
+                    padding: '0.45rem',
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'center'
+                  }}>
+                    <CheckCircle size={22} color="#2563eb" />
+                  </div>
+                  <div>
+                    <h3 style={{ fontSize: '1.1rem', fontWeight: 700, color: '#1e3a8a', margin: 0 }}>
+                      Data Available on NAS Storage
+                    </h3>
+                    <p style={{ fontSize: '0.78rem', color: '#3b82f6', margin: 0, fontWeight: 500 }}>
+                      Verified raster files exist on NAS storage ready for download
+                    </p>
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setExactStackMatchModal(null)}
+                  style={{ background: 'none', border: 'none', cursor: 'pointer', color: '#64748b', padding: '0.25rem' }}
+                >
+                  <X size={20} />
+                </button>
+              </div>
+
+              {/* Body Content */}
+              <div style={{ padding: '1.5rem' }}>
+                <div style={{
+                  backgroundColor: '#f8fafc',
+                  borderRadius: '0.5rem',
+                  border: '1px solid #e2e8f0',
+                  padding: '1rem',
+                  marginBottom: '1.25rem'
+                }}>
+                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, 1fr)', gap: '0.75rem', fontSize: '0.85rem' }}>
+                    <div>
+                      <span style={{ color: '#64748b', fontWeight: 600 }}>Region:</span>{' '}
+                      <span style={{ color: '#0f172a', fontWeight: 700 }}>
+                        {exactStackMatchModal.district || stackDistrict}{exactStackMatchModal.state ? `, ${exactStackMatchModal.state}` : (stackState ? `, ${stackState}` : '')}
+                      </span>
+                    </div>
+                    <div>
+                      <span style={{ color: '#64748b', fontWeight: 600 }}>Sensor:</span>{' '}
+                      <span style={{ color: '#0f172a', fontWeight: 700 }}>{sensorName}</span>
+                    </div>
+                    <div>
+                      <span style={{ color: '#64748b', fontWeight: 600 }}>Band:</span>{' '}
+                      <span style={{ color: '#0f172a', fontWeight: 700 }}>{layersList.join(', ')}</span>
+                    </div>
+                    <div>
+                      <span style={{ color: '#64748b', fontWeight: 600 }}>Season:</span>{' '}
+                      <span style={{ color: '#2563eb', fontWeight: 700 }}>
+                        {exactStackMatchModal.season || stackSeason || 'Kharif'}
+                      </span>
+                    </div>
+                  </div>
+
+                  {/* Summary Bar */}
+                  <div style={{
+                    marginTop: '1rem',
+                    paddingTop: '0.75rem',
+                    borderTop: '1px solid #e2e8f0',
+                    display: 'flex',
+                    justifyContent: 'space-between',
+                    alignItems: 'center'
+                  }}>
+                    <div>
+                      <span style={{ fontSize: '0.8rem', color: '#64748b' }}>Total Files Found:</span>{' '}
+                      <strong style={{ fontSize: '0.95rem', color: '#0f172a' }}>{selectedCount} GeoTIFF{selectedCount !== 1 ? 's' : ''}</strong>
+                    </div>
+                    <div>
+                      <span style={{ fontSize: '0.8rem', color: '#64748b' }}>Total Volume:</span>{' '}
+                      <strong style={{ fontSize: '0.95rem', color: '#166534' }}>{totalMb.toFixed(2)} MB</strong>
+                    </div>
+                  </div>
+
+                  {/* File List with Checkboxes */}
+                  <div style={{
+                    marginTop: '0.85rem',
+                    paddingTop: '0.75rem',
+                    borderTop: '1px solid #e2e8f0',
+                    display: 'flex',
+                    flexDirection: 'column',
+                    gap: '0.5rem'
+                  }}>
+                    <div style={{ fontSize: '0.74rem', fontWeight: 700, color: '#475569', textTransform: 'uppercase' }}>
+                      Matching Layer Stack File{modalFiles.length > 1 ? 's' : ''} on NAS ({modalFiles.length}):
+                    </div>
+                    {modalFiles.map((f, i) => {
+                      const isChecked = stackMatchSelectedFiles.has(f.filename);
+                      const fSize = f.file_size_mb || f.size_mb || 0;
+                      return (
+                        <label
+                          key={i}
+                          style={{
+                            display: 'flex',
+                            alignItems: 'flex-start',
+                            gap: '0.65rem',
+                            padding: '0.6rem 0.75rem',
+                            borderRadius: '0.375rem',
+                            backgroundColor: isChecked ? '#eff6ff' : '#ffffff',
+                            border: `1px solid ${isChecked ? '#93c5fd' : '#cbd5e1'}`,
+                            cursor: 'pointer',
+                            transition: 'all 0.15s ease'
+                          }}
+                        >
+                          <input
+                            type="checkbox"
+                            checked={isChecked}
+                            onChange={(e) => {
+                              const next = new Set(stackMatchSelectedFiles);
+                              if (e.target.checked) next.add(f.filename);
+                              else next.delete(f.filename);
+                              setStackMatchSelectedFiles(next);
+                            }}
+                            style={{ marginTop: '0.2rem', accentColor: '#166534', cursor: 'pointer' }}
+                          />
+                          <div style={{ flex: 1, minWidth: 0 }}>
+                            <div style={{ fontSize: '0.82rem', fontWeight: 700, color: '#0f172a', fontFamily: 'monospace', wordBreak: 'break-all' }}>
+                              {f.filename}
+                            </div>
+                            <div style={{ fontSize: '0.72rem', color: '#64748b', marginTop: '0.2rem', display: 'flex', gap: '0.85rem', flexWrap: 'wrap' }}>
+                              {f.start_date && f.end_date && (
+                                <span>Date Range: <b>{f.start_date} to {f.end_date}</b></span>
+                              )}
+                              <span>File Size: <strong style={{ color: '#166534' }}>{fSize} MB</strong></span>
+                            </div>
+                          </div>
+                        </label>
+                      );
+                    })}
+                  </div>
+                </div>
+
+                {/* Question to User */}
+                <div style={{ textAlign: 'center', marginBottom: '1.25rem' }}>
+                  <p style={{ fontSize: '1.05rem', fontWeight: 700, color: '#0f172a', margin: 0 }}>
+                    Data is available on NAS. Do you want to download this data?
+                  </p>
+                  <p style={{ fontSize: '0.8rem', color: '#64748b', margin: '0.35rem 0 0 0' }}>
+                    The download will run in the background so you can freely continue your work.
+                  </p>
+                </div>
+
+                {/* Modal Action Buttons */}
+                <div style={{ display: 'flex', gap: '0.75rem', justifyContent: 'flex-end' }}>
+                  <button
+                    type="button"
+                    onClick={() => setExactStackMatchModal(null)}
+                    style={{
+                      padding: '0.65rem 1.25rem',
+                      borderRadius: '0.375rem',
+                      border: '1px solid #cbd5e1',
+                      backgroundColor: '#ffffff',
+                      color: '#475569',
+                      fontWeight: 600,
+                      fontSize: '0.875rem',
+                      cursor: 'pointer'
+                    }}
+                  >
+                    Cancel
+                  </button>
+
+                  <button
+                    type="button"
+                    disabled={selectedCount === 0}
+                    onClick={() => {
+                      const toDownload = modalFiles.filter(f => stackMatchSelectedFiles.has(f.filename));
+                      setExactStackMatchModal(null);
+                      toDownload.forEach((f, idx) => {
+                        setTimeout(() => {
+                          handleDownloadStackedTif(f.path, f.filename);
+                        }, idx * 600);
+                      });
+                    }}
+                    style={{
+                      padding: '0.65rem 1.4rem',
+                      borderRadius: '0.375rem',
+                      border: 'none',
+                      backgroundColor: selectedCount === 0 ? '#94a3b8' : '#166534',
+                      color: '#ffffff',
+                      fontWeight: 600,
+                      fontSize: '0.875rem',
+                      cursor: selectedCount === 0 ? 'not-allowed' : 'pointer',
+                      display: 'inline-flex',
+                      alignItems: 'center',
+                      gap: '0.5rem',
+                      boxShadow: '0 2px 4px rgba(22, 101, 52, 0.2)'
+                    }}
+                  >
+                    <Download size={16} /> Yes, Download Data (.tif)
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
+
+      {/* Dedicated Modal: Stacked Files & Download for a Specific Request */}
+      {stackFilesModalReq && (() => {
+        const req = stackFilesModalReq;
+        const files = req.stacked_files || [];
+        const count = req.stacking_count || files.length;
+        return (
+          <div className="modal-overlay" onClick={() => setStackFilesModalReq(null)} style={{
+            position: 'fixed',
+            inset: 0,
+            backgroundColor: 'rgba(15, 23, 42, 0.6)',
+            backdropFilter: 'blur(3px)',
+            zIndex: 9999,
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            padding: '1rem'
+          }}>
+            <div
+              className="modal-content"
+              onClick={(e) => e.stopPropagation()}
+              style={{
+                backgroundColor: '#ffffff',
+                borderRadius: '0.75rem',
+                border: '1px solid #cbd5e1',
+                boxShadow: '0 25px 50px -12px rgba(15, 23, 42, 0.25)',
+                width: '100%',
+                maxWidth: '720px',
+                maxHeight: '85vh',
+                display: 'flex',
+                flexDirection: 'column',
+                overflow: 'hidden'
+              }}
+            >
+              {/* Modal Header */}
+              <div style={{
+                padding: '1.25rem 1.5rem',
+                borderBottom: '1px solid #e2e8f0',
+                display: 'flex',
+                alignItems: 'flex-start',
+                justifyContent: 'space-between',
+                backgroundColor: '#f8fafc'
+              }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
+                  <div style={{
+                    width: '42px',
+                    height: '42px',
+                    borderRadius: '0.5rem',
+                    backgroundColor: '#eff6ff',
+                    border: '1px solid #bfdbfe',
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    color: '#2563eb'
+                  }}>
+                    <Layers size={22} />
+                  </div>
+                  <div>
+                    <h3 style={{ fontSize: '1.1rem', fontWeight: 800, color: '#0f172a', margin: 0 }}>
+                      Layer Stacks — Request #{req.id}
+                    </h3>
+                    <div style={{ fontSize: '0.8rem', color: '#64748b', marginTop: '0.2rem', display: 'flex', alignItems: 'center', gap: '0.5rem', flexWrap: 'wrap' }}>
+                      <span><b>{req.district}</b>{req.state ? `, ${req.state}` : ''}</span>
+                      <span>•</span>
+                      <span>Season: <b>{req.season || 'Kharif'}</b></span>
+                      <span>•</span>
+                      <span style={{
+                        display: 'inline-flex',
+                        alignItems: 'center',
+                        gap: '0.25rem',
+                        padding: '0.15rem 0.5rem',
+                        borderRadius: '9999px',
+                        fontSize: '0.72rem',
+                        fontWeight: 700,
+                        backgroundColor: count > 0 ? '#ecfdf5' : '#fff7ed',
+                        color: count > 0 ? '#047857' : '#c2410c',
+                        border: count > 0 ? '1px solid #a7f3d0' : '1px solid #fed7aa'
+                      }}>
+                        {count > 0 ? <CheckCircle size={11} color="#047857" /> : null}
+                        {count > 0 ? `${count} stack${count > 1 ? 's' : ''} completed (${count} times done)` : 'Stacking: Not Done (0)'}
+                      </span>
+                    </div>
+                  </div>
+                </div>
+
+                <button
+                  onClick={() => setStackFilesModalReq(null)}
+                  style={{
+                    border: 'none',
+                    background: 'none',
+                    color: '#64748b',
+                    cursor: 'pointer',
+                    padding: '0.25rem',
+                    borderRadius: '0.375rem',
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'center'
+                  }}
+                >
+                  <X size={20} />
+                </button>
+              </div>
+
+              {/* Modal Body */}
+              <div style={{ padding: '1.25rem 1.5rem', overflowY: 'auto', flex: '1 1 auto', display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
+                <div style={{ fontSize: '0.82rem', color: '#475569' }}>
+                  The following multi-band GeoTIFF layer stack files are archived on NAS storage for this request:
+                </div>
+
+                {files.length === 0 ? (
+                  <div style={{
+                    padding: '2rem 1.5rem',
+                    textAlign: 'center',
+                    backgroundColor: '#fffbeb',
+                    borderRadius: '0.5rem',
+                    border: '1px dashed #fde68a'
+                  }}>
+                    <Layers size={32} color="#d97706" style={{ margin: '0 auto 0.5rem auto' }} />
+                    <div style={{ fontWeight: 700, fontSize: '0.9rem', color: '#b45309' }}>
+                      No Layer Stacks Generated Yet (0 Done)
+                    </div>
+                    <div style={{ fontSize: '0.78rem', color: '#78350f', marginTop: '0.25rem' }}>
+                      Pipeline steps 1 to 4 are complete. All raw spectral bands and indices are stored on NAS.
+                    </div>
+                  </div>
+                ) : (
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: '0.65rem' }}>
+                    {files.map((f, idx) => (
+                      <div
+                        key={idx}
+                        style={{
+                          display: 'flex',
+                          alignItems: 'center',
+                          justifyContent: 'space-between',
+                          padding: '0.85rem 1rem',
+                          backgroundColor: '#f8fafc',
+                          borderRadius: '0.5rem',
+                          border: '1px solid #e2e8f0',
+                          gap: '1rem',
+                          flexWrap: 'wrap'
+                        }}
+                      >
+                        <div style={{ display: 'flex', alignItems: 'flex-start', gap: '0.65rem', flex: 1, minWidth: '260px' }}>
+                          <Layers size={18} color="#2563eb" style={{ marginTop: '0.15rem', flexShrink: 0 }} />
+                          <div>
+                            <div style={{ fontFamily: 'monospace', fontSize: '0.82rem', fontWeight: 700, color: '#0f172a', wordBreak: 'break-all' }}>
+                              {f.filename}
+                            </div>
+                            <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', marginTop: '0.25rem', flexWrap: 'wrap' }}>
+                              <span style={{ fontSize: '0.75rem', fontWeight: 600, color: '#166534' }}>
+                                💾 {f.file_size_mb ? `${f.file_size_mb} MB` : 'Size available'}
+                              </span>
+                              <span>•</span>
+                              <span style={{ fontSize: '0.72rem', color: '#64748b' }}>
+                                {f.layers && f.layers.length > 0 ? `Bands: [${f.layers.join(', ')}]` : 'Multi-band GeoTIFF'}
+                              </span>
+                              <span>•</span>
+                              <span style={{ fontSize: '0.7rem', color: '#047857', fontWeight: 700, backgroundColor: '#ecfdf5', padding: '0.05rem 0.4rem', borderRadius: '0.25rem', border: '1px solid #a7f3d0' }}>
+                                ✓ On NAS Archive
+                              </span>
+                            </div>
+                          </div>
+                        </div>
+
+                        <button
+                          onClick={() => handleDownloadStackedTif(f.path || f.filename, f.filename)}
+                          style={{
+                            display: 'inline-flex',
+                            alignItems: 'center',
+                            gap: '0.4rem',
+                            padding: '0.45rem 0.85rem',
+                            borderRadius: '0.375rem',
+                            border: '1px solid #2563eb',
+                            backgroundColor: '#eff6ff',
+                            color: '#1d4ed8',
+                            fontSize: '0.8rem',
+                            fontWeight: 700,
+                            cursor: 'pointer',
+                            flexShrink: 0
+                          }}
+                          title="Download GeoTIFF directly to your computer"
+                        >
+                          <Download size={13} /> Download (.tif)
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+
+              {/* Modal Footer */}
+              <div style={{
+                padding: '0.85rem 1.5rem',
+                borderTop: '1px solid #e2e8f0',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'space-between',
+                backgroundColor: '#f8fafc',
+                flexWrap: 'wrap',
+                gap: '0.75rem'
+              }}>
+                <div style={{ fontSize: '0.75rem', color: '#64748b', fontFamily: 'monospace' }}>
+                  NAS Path: Composites/stack/{req.district}/
+                </div>
+
+                <div style={{ display: 'flex', alignItems: 'center', gap: '0.65rem' }}>
+                  <button
+                    onClick={() => {
+                      setStackFilesModalReq(null);
+                      closeLogsModal();
+                      setActiveTab('layer_stacking');
+                      setStackRequestId(req.id);
+                      setStackState(req.state || '');
+                      setStackDistrict(req.district || '');
+                      setStackSeason(req.season || 'Kharif');
+                      const sDate = req.start_date ? req.start_date.split('T')[0] : '2026-06-01';
+                      const eDate = req.end_date ? req.end_date.split('T')[0] : '2026-10-31';
+                      setStackStartDate(sDate);
+                      setStackEndDate(eDate);
+                      hasAutoLoadedStackRef.current = true;
+                      loadBandsAndScenesForRegion(req.state, req.district, req.season, sDate, eDate, req.id);
+                      fetchStackHistory(req.district);
+                    }}
+                    style={{
+                      display: 'inline-flex',
+                      alignItems: 'center',
+                      gap: '0.35rem',
+                      padding: '0.45rem 0.9rem',
+                      borderRadius: '0.375rem',
+                      border: '1px solid #2563eb',
+                      backgroundColor: '#2563eb',
+                      color: '#ffffff',
+                      fontSize: '0.8rem',
+                      fontWeight: 700,
+                      cursor: 'pointer'
+                    }}
+                  >
+                    <Layers size={13} /> Open in Stacking Studio
+                  </button>
+
+                  <button
+                    onClick={() => setStackFilesModalReq(null)}
+                    style={{
+                      padding: '0.45rem 0.9rem',
+                      borderRadius: '0.375rem',
+                      border: '1px solid #cbd5e1',
+                      backgroundColor: '#ffffff',
+                      color: '#475569',
+                      fontSize: '0.8rem',
+                      fontWeight: 600,
+                      cursor: 'pointer'
+                    }}
+                  >
+                    Close
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
 
       {/* Floating Persistent Background Download Status Widget */}
       {downloadProgress && (

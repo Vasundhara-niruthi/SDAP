@@ -389,11 +389,13 @@ def reproject_and_mosaic_band_to_grid(
     district_mask: Optional[np.ndarray],
     target_crs: str = TARGET_CRS,
     band_name: Optional[str] = None,
-    log_cb: Optional[Callable[[str, str], None]] = None
+    log_cb: Optional[Callable[[str, str], None]] = None,
+    cancel_check: Optional[Callable[[], bool]] = None
 ) -> np.ndarray:
     """
     Directly reprojects and mosaics input rasters for a band onto the unified district grid.
     Applies district boundary mask and returns (height, width) float32 array.
+    Supports responsive cooperative interruption via cancel_check.
     """
     accumulated = np.full((height, width), np.nan, dtype="float32")
     g_minx, g_miny, g_maxx, g_maxy = rasterio.transform.array_bounds(height, width, dst_transform)
@@ -406,6 +408,9 @@ def reproject_and_mosaic_band_to_grid(
 
     with rasterio.Env(GDAL_NUM_THREADS="ALL_CPUS", GDAL_CACHEMAX=512, VSI_CACHE=True, VSI_CACHE_SIZE=25000000):
         for idx, p in enumerate(input_paths, start=1):
+            if cancel_check and cancel_check():
+                logger.info(f"Tile {idx}/{len(input_paths)} halted: layer stacking task was stopped by user.")
+                raise InterruptedError("Layer stacking task was stopped by user.")
             norm_p = _normalize_unc_path(p)
             fname = os.path.basename(p)
             try:
@@ -499,6 +504,27 @@ def reproject_and_mosaic_band_to_grid(
     return accumulated
 
 
+def extract_bands_from_stack_filename(filename: str) -> List[str]:
+    """
+    Extracts exact band tokens from standardized layer stack filename across all states and formats:
+    Format: {District}_{Season}_{StartDate}_{EndDate}_{Bands}.tif
+    Handles delimiters '_', '-', and ISO date formats like 2026-06-01.
+    """
+    if not filename:
+        return []
+    stem = os.path.splitext(filename)[0]
+    m = re.search(r"(\d{4}-?\d{2}-?\d{2})[_\-](\d{4}-?\d{2}-?\d{2})_(.+)$", stem, flags=re.IGNORECASE)
+    if m:
+        raw_bands = m.group(3)
+        tokens = [b.strip().upper() for b in raw_bands.split("_") if b.strip()]
+        return tokens
+    m2 = re.search(r"_(?:Kharif|Rabi|Zaid|Annual|Monsoon|Winter|Pre-Monsoon|Post-Monsoon|Custom)_([A-Za-z0-9_]+)$", stem, flags=re.IGNORECASE)
+    if m2:
+        tokens = [b.strip().upper() for b in m2.group(1).split("_") if b.strip()]
+        return tokens
+    return []
+
+
 def execute_layer_stacking(
     db: Session,
     district: str,
@@ -511,6 +537,8 @@ def execute_layer_stacking(
     output_filename: Optional[str] = None,
     selected_files: Optional[List[str]] = None,
     selected_files_by_band: Optional[Dict[str, List[str]]] = None,
+    force_recreate: bool = False,
+    task_id: Optional[str] = None,
     request_id: Optional[int] = None,
     log_cb: Optional[Callable[[str, str, Optional[int], Optional[str]], None]] = None
 ) -> Dict[str, Any]:
@@ -524,11 +552,17 @@ def execute_layer_stacking(
       4. Standardized filename format: {district}_{season}_{startdate}_{enddate}_{bands}.tif
       5. Multi-date / time-series scenes are stacked as individual bands with descriptive metadata.
       6. Clips to administrative district boundary polygon.
+      7. Supports immediate cancellation via task_id.
     """
     def emit_log(msg: str, level: str = "INFO", progress: Optional[int] = None, step: Optional[str] = None):
         logger.info(msg)
         if log_cb:
             log_cb(msg, level, progress, step)
+
+    def check_cancelled():
+        if task_id and (task_id in CANCELLED_STACK_TASKS or STACK_JOBS.get(task_id, {}).get("status") == "CANCELLED"):
+            emit_log("⚠️ Layer stacking execution stopped by user.", "WARNING", None, "STOPPED")
+            raise InterruptedError("Layer stacking was stopped by user.")
 
     if not district or not district.strip():
         raise ValueError("District is required for layer stacking.")
@@ -558,54 +592,77 @@ def execute_layer_stacking(
             fn_clean += ".tif"
         expected_filename = fn_clean
 
+    req_bands_set = set(l.upper().strip() for l in layers)
     candidate_existing_paths = [
         os.path.join(settings.RAW_ARCHIVE_DIR, "Composites", "stack", clean_dist, expected_filename),
         os.path.join(settings.BASE_DATA_DIR, "archive", "Composites", "stack", clean_dist, expected_filename),
     ]
-    for existing_path in candidate_existing_paths:
-        try:
+
+    matched_existing_file: Optional[Tuple[str, str]] = None
+    if not force_recreate:
+        for existing_path in candidate_existing_paths:
             if os.path.exists(existing_path) and os.path.getsize(existing_path) > 1024:
-                with rasterio.open(_normalize_unc_path(existing_path)) as existing_src:
-                    ex_count = existing_src.count
-                    ex_width = existing_src.width
-                    ex_height = existing_src.height
-                    ex_descriptions = [existing_src.descriptions[i] or layers[min(i, len(layers) - 1)] for i in range(ex_count)]
-                if ex_count >= len(layers):
-                    ex_size_bytes = os.path.getsize(existing_path)
-                    ex_size_mb = round(ex_size_bytes / (1024 * 1024), 2)
-                    emit_log(
-                        f"✓ [ALREADY COMPLETED] Verified existing layer stack '{expected_filename}' ({ex_size_mb} MB, {ex_count} bands, {ex_width}x{ex_height}) on NAS at '{existing_path}'.",
-                        "SUCCESS",
-                        95,
-                        "ALREADY_COMPLETED"
-                    )
-                    emit_log(
-                        f"Layer stack task is already completed on NAS. Skipping duplicate processing and returning verified stack '{expected_filename}'.",
-                        "SUCCESS",
-                        100,
-                        "COMPLETED"
-                    )
-                    return {
-                        "status": "SUCCESS",
-                        "already_completed": True,
-                        "message": f"Verified: Layer stack '{expected_filename}' is already completed on NAS ({ex_size_mb} MB, {ex_count} bands).",
-                        "output_path": existing_path,
-                        "filename": expected_filename,
-                        "file_size_mb": ex_size_mb,
-                        "file_size_bytes": ex_size_bytes,
-                        "total_bands": ex_count,
-                        "layers_order": ex_descriptions if ex_descriptions else list(layers),
-                        "district": clean_dist,
-                        "state": clean_state,
-                        "season": clean_season,
-                        "date_range": f"{s_clean} to {e_clean}",
-                        "crs": TARGET_CRS,
-                        "dimensions": f"{ex_width} x {ex_height}"
-                    }
+                matched_existing_file = (existing_path, os.path.basename(existing_path))
+                break
+
+        # If exact expected_filename not found, scan NAS storage using find_matching_layer_stacks_on_nas
+        if not matched_existing_file:
+            nas_matches = find_matching_layer_stacks_on_nas(
+                district=clean_dist,
+                state=clean_state,
+                season=clean_season,
+                start_date=s_clean,
+                end_date=e_clean,
+                layers=layers
+            )
+            if nas_matches:
+                matched_existing_file = (nas_matches[0]["path"], nas_matches[0]["filename"])
+
+    if matched_existing_file and not force_recreate:
+        existing_path, matched_fname = matched_existing_file
+        try:
+            with rasterio.open(_normalize_unc_path(existing_path)) as existing_src:
+                ex_count = existing_src.count
+                ex_width = existing_src.width
+                ex_height = existing_src.height
+                ex_descriptions = [existing_src.descriptions[i] or layers[min(i, len(layers) - 1)] for i in range(ex_count)]
+            if ex_count >= 1:
+                ex_size_bytes = os.path.getsize(existing_path)
+                ex_size_mb = round(ex_size_bytes / (1024 * 1024), 2)
+                emit_log(
+                    f"✓ [ALREADY IN NAS] Found matching layer stack '{matched_fname}' ({ex_size_mb} MB, {ex_count} bands, {ex_width}x{ex_height}) already saved on NAS storage.",
+                    "SUCCESS",
+                    95,
+                    "ALREADY_COMPLETED"
+                )
+                emit_log(
+                    f"✓ All selected bands ({', '.join(layers)}) are already in NAS. Retrieved existing data directly without re-downloading or re-processing.",
+                    "SUCCESS",
+                    100,
+                    "COMPLETED"
+                )
+                return {
+                    "status": "SUCCESS",
+                    "already_completed": True,
+                    "already_in_nas": True,
+                    "message": f"Layer stack with these exact bands is already downloaded and present in NAS storage: '{matched_fname}' ({ex_size_mb} MB). Retrieved directly from NAS.",
+                    "output_path": existing_path,
+                    "filename": matched_fname,
+                    "file_size_mb": ex_size_mb,
+                    "file_size_bytes": ex_size_bytes,
+                    "total_bands": ex_count,
+                    "layers_order": ex_descriptions if ex_descriptions else list(layers),
+                    "district": clean_dist,
+                    "state": clean_state,
+                    "season": clean_season,
+                    "date_range": f"{s_clean} to {e_clean}",
+                    "crs": TARGET_CRS,
+                    "dimensions": f"{ex_width} x {ex_height}"
+                }
         except Exception as ver_err:
             logger.debug(f"Pre-check inspection on {existing_path} skipped: {ver_err}")
 
-    emit_log(f"✓ Verified as NEW TASK ('{expected_filename}' not yet on NAS). Starting Layer Stacking execution...", "INFO", 9, "NEW_TASK_CONFIRMED")
+    emit_log(f"✓ Starting layer stack assembly for '{expected_filename}'. All input bands will be retrieved directly from NAS...", "INFO", 9, "STARTING_ASSEMBLY")
 
     # 1. Fetch District Polygon Boundary Geometry if available
     district_geom = None
@@ -706,7 +763,17 @@ def execute_layer_stacking(
 
         raw_band_paths[b_name] = list(dict.fromkeys(paths))
         sample_candidate_paths.extend(raw_band_paths[b_name][:2])
-        emit_log(f"Band '{b_name}' ready: {len(raw_band_paths[b_name])} scene tile(s) queued.", "INFO", 30, "LOCATING")
+        emit_log(f"✓ [RETRIEVED FROM NAS] Band '{b_name}' ({len(raw_band_paths[b_name])} GeoTIFF tile(s)) retrieved directly from existing NAS archive. No downloading needed.", "INFO", 30, "LOCATING")
+
+    total_nas_scenes = sum(len(p_list) for p_list in raw_band_paths.values())
+    emit_log(
+        f"✓ [ALL BANDS ALREADY IN NAS] All {len(raw_band_paths)} selected bands [{', '.join(sorted(raw_band_paths.keys()))}] "
+        f"({total_nas_scenes} total GeoTIFF raster tiles) are already downloaded on NAS storage. "
+        f"Retrieving existing data directly from NAS archive — no internet download needed.",
+        "SUCCESS",
+        33,
+        "NAS_DATA_RETRIEVED"
+    )
 
     # 4. Compute unified target grid covering district
     emit_log("Establishing unified raster grid (~10m resolution, EPSG:4326)...", "INFO", 35, "GRID")
@@ -774,19 +841,34 @@ def execute_layer_stacking(
     completed_warp_count = [0]
     warp_lock = threading.Lock()
 
-    def _run_warp_task(task_tuple: Tuple[str, str, List[str], int, int]) -> Tuple[str, str, np.ndarray]:
+    def _is_task_halted() -> bool:
+        return bool(task_id and (task_id in CANCELLED_STACK_TASKS or STACK_JOBS.get(task_id, {}).get("status") == "CANCELLED"))
+
+    def _run_warp_task(task_tuple: Tuple[str, str, List[str], int, int]) -> Tuple[str, str, Optional[np.ndarray]]:
+        if _is_task_halted():
+            return task_tuple[0], task_tuple[1], None
         b_name, ts, s_paths, s_idx, tot_s = task_tuple
         emit_log(f"  [{b_name}] Processing time-step {s_idx}/{tot_s} ({ts}) from {len(s_paths)} tile(s)...", "INFO", None, f"STEP_{b_name}_{ts}")
-        arr = reproject_and_mosaic_band_to_grid(
-            input_paths=s_paths,
-            width=width,
-            height=height,
-            dst_transform=dst_transform,
-            district_mask=district_mask,
-            target_crs=TARGET_CRS,
-            band_name=b_name,
-            log_cb=lambda msg, lvl, _b=b_name, _ts=ts: emit_log(f"    [{_b}_{_ts}] {msg}", lvl, None, f"STEP_{_b}_{_ts}")
-        )
+        try:
+            arr = reproject_and_mosaic_band_to_grid(
+                input_paths=s_paths,
+                width=width,
+                height=height,
+                dst_transform=dst_transform,
+                district_mask=district_mask,
+                target_crs=TARGET_CRS,
+                band_name=b_name,
+                log_cb=lambda msg, lvl, _b=b_name, _ts=ts: emit_log(f"    [{_b}_{_ts}] {msg}", lvl, None, f"STEP_{_b}_{_ts}"),
+                cancel_check=_is_task_halted
+            )
+        except (InterruptedError, Exception) as w_err:
+            if _is_task_halted() or isinstance(w_err, InterruptedError):
+                logger.info(f"Warp task for [{b_name}_{ts}] stopped: cancellation detected.")
+                return b_name, ts, None
+            raise w_err
+
+        if _is_task_halted():
+            return b_name, ts, None
         with warp_lock:
             completed_warp_count[0] += 1
             prog = 48 + int((completed_warp_count[0] / max(1, total_warp_tasks)) * 28)
@@ -796,15 +878,40 @@ def execute_layer_stacking(
     max_workers = min(6, max(1, total_warp_tasks))
     if max_workers == 1:
         for t in warp_tasks:
+            check_cancelled()
             b_name, ts, arr = _run_warp_task(t)
-            raw_band_step_arrays[b_name][ts] = arr
-    else:
-        with ThreadPoolExecutor(max_workers=max_workers) as pool:
-            futures = [pool.submit(_run_warp_task, t) for t in warp_tasks]
-            for fut in as_completed(futures):
-                b_name, ts, arr = fut.result()
+            check_cancelled()
+            if arr is not None:
                 raw_band_step_arrays[b_name][ts] = arr
+    else:
+        executor = ThreadPoolExecutor(max_workers=max_workers)
+        futures = []
+        try:
+            futures = [executor.submit(_run_warp_task, t) for t in warp_tasks]
+            for fut in as_completed(futures):
+                check_cancelled()
+                b_name, ts, arr = fut.result()
+                check_cancelled()
+                if arr is not None:
+                    raw_band_step_arrays[b_name][ts] = arr
+        except (InterruptedError, Exception) as exc:
+            for fut in futures:
+                try:
+                    fut.cancel()
+                except Exception:
+                    pass
+            try:
+                executor.shutdown(wait=False, cancel_futures=True)
+            except TypeError:
+                executor.shutdown(wait=False)
+            raise
+        finally:
+            try:
+                executor.shutdown(wait=False, cancel_futures=True)
+            except Exception:
+                pass
 
+    check_cancelled()
     # Assemble layers in requested user order
     emit_log("Assembling multi-band layer sequence in exact requested order...", "INFO", 78, "ASSEMBLING")
 
@@ -997,11 +1104,12 @@ def execute_layer_stacking(
 
     file_size_bytes = os.path.getsize(output_file_path)
     file_size_mb = round(file_size_bytes / (1024 * 1024), 2)
-    emit_log(f"Layer stack saved: {filename} ({file_size_mb} MB, {len(layer_names_ordered)} bands)", "SUCCESS", 100, "COMPLETED")
+    emit_log(f"✓ All selected bands retrieved directly from NAS and assembled into layer stack: {filename} ({file_size_mb} MB, {len(layer_names_ordered)} bands)", "SUCCESS", 100, "COMPLETED")
 
     return {
         "status": "SUCCESS",
-        "message": f"Successfully created {len(layer_names_ordered)}-layer stacked GeoTIFF for {clean_dist}.",
+        "already_in_nas": True,
+        "message": f"All selected bands were already downloaded on NAS. Successfully assembled layer stack '{filename}' ({file_size_mb} MB, {len(layer_names_ordered)} bands) directly from existing NAS rasters.",
         "output_path": output_file_path,
         "filename": filename,
         "file_size_mb": file_size_mb,
@@ -1020,6 +1128,231 @@ def execute_layer_stacking(
 # In-memory tracking of background stacking jobs and their real-time log feeds
 STACK_JOBS: Dict[str, Dict[str, Any]] = {}
 STACK_JOBS_LOCK = threading.Lock()
+CANCELLED_STACK_TASKS: set = set()
+
+
+def cancel_layer_stack_task(task_id: str) -> bool:
+    """Cancels an ongoing layer stacking task immediately and halts all worker threads."""
+    if not task_id or task_id.strip().lower() == "all":
+        with STACK_JOBS_LOCK:
+            active_ids = list(STACK_JOBS.keys())
+        for tid in active_ids:
+            cancel_layer_stack_task(tid)
+        try:
+            from app.core.database import SessionLocal
+            from app.models import LayerStackJobModel
+            db = SessionLocal()
+            try:
+                db.query(LayerStackJobModel).filter(LayerStackJobModel.status == "RUNNING").update({
+                    "status": "CANCELLED",
+                    "step": "STOPPED",
+                    "error": "Layer stacking task stopped by user."
+                })
+                db.commit()
+            finally:
+                db.close()
+        except Exception:
+            pass
+        return True
+
+    clean_tid = task_id.strip()
+    CANCELLED_STACK_TASKS.add(clean_tid)
+    with STACK_JOBS_LOCK:
+        job = STACK_JOBS.get(clean_tid)
+        if job:
+            job["status"] = "CANCELLED"
+            job["step"] = "STOPPED"
+            job["error"] = "Layer stacking task stopped by user."
+            job["logs"].append({
+                "timestamp": datetime.now().strftime("%H:%M:%S"),
+                "level": "WARNING",
+                "message": "⚠️ Stacking stopped upon user request."
+            })
+    try:
+        from app.core.database import SessionLocal
+        from app.models import LayerStackJobModel
+        db = SessionLocal()
+        try:
+            db_row = db.query(LayerStackJobModel).filter(LayerStackJobModel.task_id == clean_tid).first()
+            if db_row:
+                db_row.status = "CANCELLED"
+                db_row.step = "STOPPED"
+                db_row.error = "Layer stacking task stopped by user."
+                db_row.updated_at = datetime.utcnow()
+                db.commit()
+            # Also ensure any dangling RUNNING row is halted
+            db.query(LayerStackJobModel).filter(LayerStackJobModel.status == "RUNNING").update({
+                "status": "CANCELLED",
+                "step": "STOPPED",
+                "error": "Layer stacking task stopped by user."
+            })
+            db.commit()
+        finally:
+            db.close()
+    except Exception as e:
+        logger.error(f"Error marking LayerStackJobModel as cancelled: {e}")
+    return True
+
+
+def find_matching_layer_stacks_on_nas(
+    district: str,
+    state: Optional[str] = None,
+    season: Optional[str] = None,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    layers: Optional[List[str]] = None
+) -> List[Dict[str, Any]]:
+    """
+    Scans NAS Composites/stack directories and returns matching existing layer stack(s)
+    for any state and district where:
+      1. District matches (e.g. 'Anantapur', 'North Goa' / 'North_Goa', 'Balangir', etc.)
+      2. Spectral bands match EXACTLY (exact set and length of bands)
+      3. Season matches (if specified, e.g. 'Kharif')
+      4. Picks the single best matching file corresponding to the user's requested date range / span.
+    """
+    if not district or not layers:
+        return []
+
+    d_raw = district.split(",")[0].strip()
+    d_clean_alphanumeric = re.sub(r"[^a-zA-Z0-9]", "", d_raw).lower()
+    clean_d = d_raw
+
+    req_bands_set = set(l.strip().upper() for l in layers if l.strip())
+    if not req_bands_set:
+        return []
+
+    clean_season = (season or "").split("(")[0].strip().upper()
+
+    search_dirs = [
+        os.path.join(settings.RAW_ARCHIVE_DIR, "Composites", "stack", clean_d),
+        os.path.join(settings.BASE_DATA_DIR, "archive", "Composites", "stack", clean_d),
+        os.path.join(settings.RAW_ARCHIVE_DIR, "Composites", "stack", clean_d.replace(" ", "_")),
+        os.path.join(settings.RAW_ARCHIVE_DIR, "Composites", "stack"),
+    ]
+
+    candidates = []
+    seen = set()
+
+    for s_dir in search_dirs:
+        if not os.path.exists(s_dir):
+            continue
+        try:
+            is_parent_stack_dir = os.path.basename(s_dir.rstrip("/\\")).lower() == "stack"
+            entries = os.listdir(s_dir)
+            for fname in entries:
+                if not (fname.lower().endswith(".tif") or fname.lower().endswith(".tiff")):
+                    continue
+                if fname in seen:
+                    continue
+
+                full_p = os.path.join(s_dir, fname)
+                try:
+                    sz = os.path.getsize(full_p)
+                    if sz <= 1024:
+                        continue
+
+                    # If scanning parent stack dir, verify district in filename
+                    if is_parent_stack_dir:
+                        fn_alphanumeric = re.sub(r"[^a-zA-Z0-9]", "", fname).lower()
+                        if not fn_alphanumeric.startswith(d_clean_alphanumeric):
+                            continue
+
+                    file_bands = extract_bands_from_stack_filename(fname)
+                    # STRICT EXACT MATCH ON BANDS:
+                    if set(file_bands) != req_bands_set or len(file_bands) != len(req_bands_set):
+                        continue
+
+                    stem = os.path.splitext(fname)[0]
+                    seen.add(fname)
+                    sz_mb = round(sz / (1024 * 1024), 2)
+
+                    # Extract season
+                    inferred_season = ""
+                    m_s = re.search(r"_(Kharif|Rabi|Zaid|Annual|Monsoon|Winter|Pre-Monsoon|Post-Monsoon|Custom)_", fname, re.IGNORECASE)
+                    if m_s:
+                        inferred_season = m_s.group(1).upper()
+
+                    # Extract dates
+                    inferred_start = ""
+                    inferred_end = ""
+                    m_dates = re.search(r"(\d{4}-?\d{2}-?\d{2})[_\-](\d{4}-?\d{2}-?\d{2})", stem)
+                    if m_dates:
+                        r1 = m_dates.group(1).replace("-", "")
+                        r2 = m_dates.group(2).replace("-", "")
+                        inferred_start = f"{r1[:4]}-{r1[4:6]}-{r1[6:8]}"
+                        inferred_end = f"{r2[:4]}-{r2[4:6]}-{r2[6:8]}"
+
+                    # Season filter if specified
+                    if clean_season and clean_season not in ("ALL", "CUSTOM") and inferred_season:
+                        if clean_season != inferred_season:
+                            continue
+
+                    candidates.append({
+                        "filename": fname,
+                        "path": full_p,
+                        "district": clean_d,
+                        "state": state or "",
+                        "season": inferred_season or season or "Kharif",
+                        "start_date": inferred_start,
+                        "end_date": inferred_end,
+                        "file_size_mb": sz_mb,
+                        "size_mb": sz_mb,
+                        "layers": file_bands,
+                        "total_bands": len(file_bands)
+                    })
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    if not candidates:
+        return []
+
+    # If only 1 candidate found, return it directly
+    if len(candidates) == 1:
+        candidates[0]["exact_date_match"] = True
+        return [candidates[0]]
+
+    # Compute requested span and target date tokens
+    req_d_tokens = []
+    req_span = 0
+    if start_date and end_date:
+        try:
+            s_clean_val = start_date.split("T")[0].replace("/", "-")
+            e_clean_val = end_date.split("T")[0].replace("/", "-")
+            d1 = datetime.strptime(s_clean_val, "%Y-%m-%d")
+            d2 = datetime.strptime(e_clean_val, "%Y-%m-%d")
+            req_span = abs((d2 - d1).days) + 1
+            r1 = d1.strftime("%Y%m%d")
+            r2 = d2.strftime("%Y%m%d")
+            req_d_tokens = [f"{r1}_{r2}", f"{r1}-{r2}", f"{s_clean_val}_{e_clean_val}"]
+        except Exception:
+            pass
+
+    # Priority 1: Exact date string token match in filename
+    for c in candidates:
+        fn = c.get("filename", "")
+        if any(tok in fn for tok in req_d_tokens):
+            c["exact_date_match"] = True
+            return [c]
+
+    # Priority 2: Closest date duration/span matching what the user requested
+    def _score_candidate(c):
+        c_start = c.get("start_date")
+        c_end = c.get("end_date")
+        if not c_start or not c_end or not req_span:
+            return 999999
+        try:
+            cd1 = datetime.strptime(c_start, "%Y-%m-%d")
+            cd2 = datetime.strptime(c_end, "%Y-%m-%d")
+            c_span = abs((cd2 - cd1).days) + 1
+            return abs(c_span - req_span)
+        except Exception:
+            return 999999
+
+    best = min(candidates, key=_score_candidate)
+    best["exact_date_match"] = True
+    return [best]
 
 
 def get_stack_job(task_id: str, db: Optional[Any] = None) -> Optional[Dict[str, Any]]:
@@ -1172,6 +1505,7 @@ def launch_layer_stack_task(
     output_filename: Optional[str] = None,
     selected_files: Optional[List[str]] = None,
     selected_files_by_band: Optional[Dict[str, List[str]]] = None,
+    force_recreate: bool = False,
     request_id: Optional[int] = None,
     user_id: Optional[int] = None
 ) -> str:
@@ -1300,6 +1634,8 @@ def launch_layer_stack_task(
                 output_filename=output_filename,
                 selected_files=selected_files,
                 selected_files_by_band=selected_files_by_band,
+                force_recreate=force_recreate,
+                task_id=task_id,
                 request_id=request_id,
                 log_cb=_job_log_cb
             )
@@ -1334,10 +1670,43 @@ def launch_layer_stack_task(
                             db_row.execution_logs = "\n".join([f"[{l['timestamp']}] [{l['level']}] {l['message']}" for l in final_logs])
                         db_row.updated_at = datetime.utcnow()
                         db_final.commit()
+                        invalidate_request_stacks_cache()
                 finally:
                     db_final.close()
             except Exception as dbe:
                 logger.error(f"Failed to record final success state in DB: {dbe}")
+
+        except (InterruptedError, KeyboardInterrupt):
+            logger.info(f"Layer stack task {task_id} stopped upon user request.")
+            _job_log_cb("⚠️ Stacking operation stopped upon user request.", "WARNING", None, "STOPPED")
+            invalidate_request_stacks_cache()
+            with STACK_JOBS_LOCK:
+                job = STACK_JOBS.get(task_id)
+                if job:
+                    job["status"] = "CANCELLED"
+                    job["step"] = "STOPPED"
+                    job["error"] = "Layer stacking task stopped by user."
+                    job["updated_at"] = datetime.utcnow().isoformat()
+                    final_logs = list(job["logs"])
+                else:
+                    final_logs = []
+            try:
+                db_cancel = SessionLocal()
+                try:
+                    db_row = db_cancel.query(LayerStackJobModel).filter(LayerStackJobModel.task_id == task_id).first()
+                    if db_row:
+                        db_row.status = "CANCELLED"
+                        db_row.step = "STOPPED"
+                        db_row.error = "Layer stacking task stopped by user."
+                        if final_logs:
+                            db_row.logs_json = final_logs
+                            db_row.execution_logs = "\n".join([f"[{l['timestamp']}] [{l['level']}] {l['message']}" for l in final_logs])
+                        db_row.updated_at = datetime.utcnow()
+                        db_cancel.commit()
+                finally:
+                    db_cancel.close()
+            except Exception as dbe:
+                logger.error(f"Failed to record cancelled state in DB: {dbe}")
 
         except Exception as e:
             logger.exception(f"Layer stack task {task_id} failed: {e}")
@@ -1437,10 +1806,12 @@ def list_existing_layer_stacks(
         if not os.path.exists(base_d):
             continue
         if district and district.strip() and district.strip().upper() != "ALL":
-            d_clean = district.strip()
+            d_clean = district.split(",")[0].strip()
             d_sub = os.path.join(base_d, d_clean)
             if os.path.exists(d_sub) and d_sub not in search_dirs:
                 search_dirs.append(d_sub)
+            elif base_d not in search_dirs:
+                search_dirs.append(base_d)
         else:
             if base_d not in search_dirs:
                 search_dirs.append(base_d)
@@ -1491,11 +1862,38 @@ def list_existing_layer_stacks(
 
                         job_meta = jobs_by_filename.get(f.strip().lower(), {})
                         final_season = job_meta.get("season") or inferred_season or (season if season and season != "ALL" else "Kharif")
+
+                        # Filter by season if requested
+                        if season and season.strip() and season.strip().upper() != "ALL":
+                            s_req = season.split("(")[0].strip().lower()
+                            if s_req not in final_season.lower() and s_req not in f.lower():
+                                continue
+
+                        # Filter by district if requested
+                        if district and district.strip() and district.strip().upper() != "ALL":
+                            d_clean = district.split(",")[0].strip().lower()
+                            if d_clean != dist_val.lower() and d_clean not in f.lower() and dist_val.lower() not in d_clean:
+                                continue
+
+                        # Filter by start_date / end_date if requested and dates are known
+                        if start_date and start_date.strip() and inferred_end:
+                            req_start = start_date.strip()
+                            if inferred_end < req_start:
+                                continue
+                        if end_date and end_date.strip() and inferred_start:
+                            req_end = end_date.strip()
+                            if inferred_start > req_end:
+                                continue
+
+                        extracted_layers = job_meta.get("layers") or extract_bands_from_stack_filename(f)
+                        if not extracted_layers and inferred_bands_str:
+                            extracted_layers = [b.strip().upper() for b in inferred_bands_str.split("_") if b.strip()]
+
                         logs_list = job_meta.get("logs") or []
                         exec_logs_str = job_meta.get("execution_logs") or ""
 
                         if not logs_list:
-                            bands_desc = ", ".join(job_meta.get("layers") or (inferred_bands_str.split("_") if inferred_bands_str else [sensor]))
+                            bands_desc = ", ".join(extracted_layers or [sensor])
                             range_desc = f"{inferred_start} to {inferred_end}" if inferred_start and inferred_end else "Selected Range"
                             logs_list = [
                                 {"timestamp": mod_time_only, "level": "INFO", "message": f"Initiating Layer Stacking for '{dist_val}', Season='{final_season}', Range={range_desc}, Layers=[{bands_desc}]"},
@@ -1511,12 +1909,18 @@ def list_existing_layer_stacks(
                             "filename": f,
                             "path": full_p,
                             "district": dist_val,
+                            "state": job_meta.get("state") or (state if state and state != "ALL" else ""),
                             "season": final_season,
                             "sensor": sensor,
                             "size_mb": size_mb,
+                            "file_size_mb": size_mb,
                             "modified_at": mod_str,
                             "task_id": job_meta.get("task_id"),
                             "status": job_meta.get("status", "COMPLETED"),
+                            "layers": extracted_layers,
+                            "total_bands": len(extracted_layers) if extracted_layers else (job_meta.get("total_bands") or 1),
+                            "start_date": inferred_start or job_meta.get("start_date", ""),
+                            "end_date": inferred_end or job_meta.get("end_date", ""),
                             "logs": logs_list,
                             "execution_logs": exec_logs_str
                         })
@@ -1525,3 +1929,146 @@ def list_existing_layer_stacks(
 
     results.sort(key=lambda x: x.get("modified_at", ""), reverse=True)
     return results
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Request-Linked Layer Stacks Query & Caching
+# ─────────────────────────────────────────────────────────────────────────────
+_REQUEST_STACKS_CACHE: Dict[str, Any] = {}
+_REQUEST_STACKS_CACHE_TIME: float = 0.0
+
+
+def invalidate_request_stacks_cache() -> None:
+    """Invalidates the in-memory cache for request layer stack lookups."""
+    global _REQUEST_STACKS_CACHE_TIME
+    _REQUEST_STACKS_CACHE_TIME = 0.0
+
+
+def get_layer_stacks_for_requests_bulk(requests_list: List[Any], db: Optional[Any] = None) -> Dict[int, Dict[str, Any]]:
+    """
+    Computes layer stacking metadata for multiple requests efficiently:
+    - How many times layer stacking was completed for each request (count: 0, 1, 2, ...).
+    - Status: 'COMPLETED' (if count > 0), 'NOT_DONE' (if pipeline steps 1-4 completed but 0 stacks), 'NOT_STARTED'.
+    - List of generated stacked filenames with file size, path, layers, and download URL.
+    Uses an in-memory cache with 15-second TTL for maximum throughput.
+    """
+    global _REQUEST_STACKS_CACHE, _REQUEST_STACKS_CACHE_TIME
+    if not requests_list:
+        return {}
+
+    now = time.time()
+    req_ids = [r.id for r in requests_list if hasattr(r, 'id')]
+    cache_key = ",".join(str(i) for i in sorted(req_ids))
+    if _REQUEST_STACKS_CACHE_TIME and (now - _REQUEST_STACKS_CACHE_TIME < 15.0) and cache_key in _REQUEST_STACKS_CACHE:
+        return _REQUEST_STACKS_CACHE[cache_key]
+
+    close_session = False
+    session = db
+    if session is None:
+        from app.core.database import SessionLocal
+        session = SessionLocal()
+        close_session = True
+
+    try:
+        from app.models import LayerStackJobModel
+        districts = list(set(r.district.strip() for r in requests_list if getattr(r, 'district', None)))
+
+        # 1. Fetch DB jobs where status == 'SUCCESS'
+        all_jobs = session.query(LayerStackJobModel).filter(LayerStackJobModel.status == 'SUCCESS').all()
+        jobs_by_req_id: Dict[int, List[Any]] = {}
+        for j in all_jobs:
+            if j.request_id:
+                jobs_by_req_id.setdefault(j.request_id, []).append(j)
+
+        # 2. Fast scan NAS Composites/stack directories for target districts
+        base_stack = os.path.join(settings.RAW_ARCHIVE_DIR, 'Composites', 'stack')
+        nas_files_by_dist: Dict[str, List[tuple]] = {}
+        for dist in districts:
+            d_clean = dist.split(',')[0].strip()
+            p = os.path.join(base_stack, d_clean)
+            if os.path.exists(p):
+                try:
+                    nas_files_by_dist[dist.lower()] = [
+                        (entry.name, entry.path, round(entry.stat().st_size / (1024 * 1024), 2))
+                        for entry in os.scandir(p)
+                        if entry.is_file() and (entry.name.lower().endswith('.tif') or entry.name.lower().endswith('.tiff'))
+                        and not entry.name.endswith('.tmp') and not entry.name.endswith('.xml')
+                    ]
+                except Exception:
+                    pass
+
+        results: Dict[int, Dict[str, Any]] = {}
+        for r in requests_list:
+            seen_files = set()
+            stacked_files = []
+
+            # A. Jobs explicitly tagged with request_id == r.id
+            for j in jobs_by_req_id.get(r.id, []):
+                if j.filename and j.filename.lower() not in seen_files:
+                    seen_files.add(j.filename.lower())
+                    stacked_files.append({
+                        "filename": j.filename,
+                        "path": j.output_path or "",
+                        "file_size_mb": j.file_size_mb or 0.0,
+                        "created_at": str(j.created_at) if hasattr(j, "created_at") and j.created_at else "",
+                        "layers": j.layers or extract_bands_from_stack_filename(j.filename),
+                        "download_url": f"/api/v1/requests/layer-stack/download?file_path={j.filename}"
+                    })
+
+            # B. Correlate files from NAS Composites/stack for this district
+            dist_val = getattr(r, "district", "") or ""
+            dist_key = dist_val.strip().lower()
+            d_norm = re.sub(r'[^a-zA-Z0-9]', '', dist_key)
+            req_s_str = r.start_date.strftime('%Y%m%d') if getattr(r, 'start_date', None) and hasattr(r.start_date, 'strftime') else ''
+
+            for fname, fpath, fsize in nas_files_by_dist.get(dist_key, []):
+                if fname.lower() in seen_files:
+                    continue
+                f_norm = re.sub(r'[^a-zA-Z0-9]', '', fname).lower()
+                if d_norm in f_norm:
+                    date_match = False
+                    if req_s_str and req_s_str in fname.replace('-', ''):
+                        date_match = True
+                    elif getattr(r, "season", None) and r.season.lower() in fname.lower():
+                        date_match = True
+                    elif not req_s_str:
+                        date_match = True
+
+                    if date_match:
+                        seen_files.add(fname.lower())
+                        stacked_files.append({
+                            "filename": fname,
+                            "path": fpath,
+                            "file_size_mb": fsize,
+                            "created_at": "",
+                            "layers": extract_bands_from_stack_filename(fname),
+                            "download_url": f"/api/v1/requests/layer-stack/download?file_path={fname}"
+                        })
+
+            count = len(stacked_files)
+            if count > 0:
+                stk_status = "COMPLETED"
+            elif getattr(r, "status", None) in ["COMPLETED", "HELD", "SUCCESS"]:
+                stk_status = "NOT_DONE"
+            else:
+                stk_status = "NOT_STARTED"
+
+            results[r.id] = {
+                "count": count,
+                "status": stk_status,
+                "files": stacked_files
+            }
+
+        _REQUEST_STACKS_CACHE[cache_key] = results
+        _REQUEST_STACKS_CACHE_TIME = now
+        return results
+    finally:
+        if close_session and session:
+            session.close()
+
+
+def get_layer_stacks_for_request(req: Any, db: Optional[Any] = None) -> Dict[str, Any]:
+    """Single request helper returning count, status, and stacked files."""
+    bulk = get_layer_stacks_for_requests_bulk([req], db=db)
+    return bulk.get(req.id, {"count": 0, "status": "NOT_STARTED", "files": []})
+

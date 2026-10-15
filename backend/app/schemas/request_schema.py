@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field, field_validator
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Any
 from datetime import datetime, timezone
 
 # Earliest date available from AWS Open Data (SRS Section 10)
@@ -117,6 +117,10 @@ class RequestResponse(BaseModel):
     execution_logs: Optional[str] = None
     created_at: datetime
 
+    stacking_count: Optional[int] = 0
+    stacking_status: Optional[str] = "NOT_STARTED"
+    stacked_files: Optional[List[Dict[str, Any]]] = []
+
     class Config:
         from_attributes = True
 
@@ -132,13 +136,24 @@ class LayerStackCreate(BaseModel):
     output_filename: Optional[str] = Field(None, description="Preserve exact original filename or custom name")
     selected_files: Optional[List[str]] = Field(None, description="Specific file paths to stack")
     selected_files_by_band: Optional[Dict[str, List[str]]] = Field(None, description="Mapping of band name to specific file paths to stack")
+    force_recreate: Optional[bool] = Field(False, description="Force re-generation even if an exact matching file exists on NAS")
     request_id: Optional[int] = Field(None, description="Associated request ID")
 
 
 class LayerStackTaskResponse(BaseModel):
     status: str
-    task_id: str
+    task_id: Optional[str] = None
     message: str
+    already_completed: Optional[bool] = None
+    already_in_nas: Optional[bool] = None
+    filename: Optional[str] = None
+    path: Optional[str] = None
+    file_size_mb: Optional[float] = None
+    matches: Optional[List[Dict[str, Any]]] = None
+    district: Optional[str] = None
+    state: Optional[str] = None
+    season: Optional[str] = None
+    layers_order: Optional[List[str]] = None
 
 
 class LayerStackResponse(BaseModel):
