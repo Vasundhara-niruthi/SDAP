@@ -75,6 +75,9 @@ class Settings(BaseSettings):
     AWS_SENTINEL_1_BUCKET: str = "sentinel-s1-l1c"
     AWS_SENTINEL_1_REGION: str = "eu-central-1"
 
+    # ESA SNAP GPT Engine Path for Sentinel-1 Processing
+    SNAP_GPT_PATH: str = r"C:\Program Files\snap\bin\gpt.exe"
+
     model_config = SettingsConfigDict(
         env_file=[_ENV_FILE_PATH, "backend/.env", ".env"],
         env_file_encoding="utf-8",

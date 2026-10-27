@@ -788,7 +788,7 @@ def download_complete_s1_scene(
     logger.info(start_msg)
     if request_id:
         try:
-            from scripts.download_district_tiles import append_request_log
+            from app.db.scripts.download_district_tiles import append_request_log
             append_request_log(db, request_id, start_msg)
         except Exception:
             pass
@@ -888,7 +888,7 @@ def download_complete_s1_scene(
             # Log individual band completion
             if rel.lower().endswith((".tif", ".tiff")) and request_id:
                 try:
-                    from scripts.download_district_tiles import append_request_log
+                    from app.db.scripts.download_district_tiles import append_request_log
                     sz_mb = sz / (1024 * 1024)
                     append_request_log(db, request_id, f"     ↳ Band '{rel}' ({sz_mb:.1f} MB) downloaded & verified on NAS.")
                 except Exception:
@@ -1114,7 +1114,7 @@ def download_complete_s1_scene(
     logger.info(complete_msg)
     if request_id:
         try:
-            from scripts.download_district_tiles import append_request_log
+            from app.db.scripts.download_district_tiles import append_request_log
             append_request_log(db, request_id, complete_msg)
         except Exception:
             pass
@@ -1127,7 +1127,8 @@ def download_and_verify_scene(
     scene: SceneModel,
     bands: list[str] = None,
     user_id: int = None,
-    request_id: int = None
+    request_id: int = None,
+    district_name: Optional[str] = None
 ) -> tuple[bool, list[dict], str]:
     """
     Fetch required bands for a scene, verify each raster, and record.
@@ -1153,12 +1154,35 @@ def download_and_verify_scene(
     staging_dir = settings.STAGING_DIR
     archive_dir = settings.RAW_ARCHIVE_DIR
 
+    if not district_name and request_id:
+        try:
+            req_row = db.query(RequestModel.district).filter(RequestModel.id == request_id).first()
+            if req_row and req_row[0]:
+                district_name = req_row[0].strip()
+        except Exception:
+            pass
+
     sat_subfolder = "Sentinel-1" if is_s1 else "Sentinel-2"
-    scene_archive_dir = os.path.join(archive_dir, sat_subfolder, tile, year, month, folder)
-    if not os.path.exists(scene_archive_dir):
-        legacy = os.path.join(archive_dir, tile, year, month, folder)
-        if os.path.exists(legacy):
-            scene_archive_dir = legacy
+    if is_s1 and district_name:
+        dist_scene_archive_dir = os.path.join(archive_dir, sat_subfolder, tile, district_name, year, month, folder)
+        if os.path.exists(dist_scene_archive_dir):
+            scene_archive_dir = dist_scene_archive_dir
+        else:
+            fallback_nodist = os.path.join(archive_dir, sat_subfolder, tile, year, month, folder)
+            if os.path.exists(fallback_nodist):
+                scene_archive_dir = fallback_nodist
+            else:
+                legacy = os.path.join(archive_dir, tile, year, month, folder)
+                if os.path.exists(legacy):
+                    scene_archive_dir = legacy
+                else:
+                    scene_archive_dir = dist_scene_archive_dir
+    else:
+        scene_archive_dir = os.path.join(archive_dir, sat_subfolder, tile, year, month, folder)
+        if not os.path.exists(scene_archive_dir):
+            legacy = os.path.join(archive_dir, tile, year, month, folder)
+            if os.path.exists(legacy):
+                scene_archive_dir = legacy
 
     if scene_archive_dir.startswith("\\\\") or ":" in scene_archive_dir:
         if not ensure_nas_connection(scene_archive_dir):
@@ -1319,7 +1343,7 @@ def download_and_verify_scene(
                     mb = size / (1024 * 1024)
                     b_msg = f"     ↳ Band '{local_filename}' ({mb:.1f} MB) downloaded & verified on NAS."
                     logger.info(b_msg)
-                    from scripts.download_district_tiles import append_request_log
+                    from app.db.scripts.download_district_tiles import append_request_log
                     append_request_log(db, request_id, b_msg)
                 except Exception:
                     pass
@@ -1631,7 +1655,9 @@ def resolve_tif_path(raw_path: str) -> tuple:
     """
     if not raw_path:
         return raw_path, False
-    if os.path.exists(raw_path):
+    from app.services.sentinel1_processor_service import win_safe_path
+    safe_raw = win_safe_path(raw_path)
+    if os.path.exists(safe_raw) or os.path.exists(raw_path):
         return os.path.abspath(raw_path), True
     backend_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
     alt_path = os.path.join(backend_root, raw_path)
@@ -1685,7 +1711,7 @@ def get_downloaded_tifs_for_request(db: Session, request_id: int) -> dict:
     scene_ids_from_logs = set()
     if not scene_ids_from_jobs and req.execution_logs:
         import re
-        for m in re.finditer(r"Scene\s+'([A-Za-z0-9_]+)'", req.execution_logs):
+        for m in re.finditer(r"(?:Scene:?\s*|Processing\s+(?:Sentinel-1\s+Scene:\s*)?)['\"]([A-Za-z0-9_]+)['\"]", req.execution_logs):
             scene_ids_from_logs.add(m.group(1))
 
     matched_scene_ids = set(scene_ids_from_jobs) if scene_ids_from_jobs else scene_ids_from_logs
@@ -1778,6 +1804,15 @@ def get_downloaded_tifs_for_request(db: Session, request_id: int) -> dict:
         }
 
     # 3. Query all verified .tif / .tiff band files for these scenes
+    if has_s1_request and not has_s2_request:
+        try:
+            s1_scene_objs = [db.query(SceneModel).filter(SceneModel.scene_id == sid).first() for sid in matched_scene_ids if sid.startswith("S1")]
+            s1_scene_objs = [so for so in s1_scene_objs if so]
+            if s1_scene_objs:
+                ensure_s1_calibrated_rasters_available(db, s1_scene_objs)
+        except Exception as e:
+            logger.warning(f"Could not pre-sync calibrated S1 rasters: {e}")
+
     bf_query = db.query(BandFileModel).filter(
         BandFileModel.scene_id.in_(list(matched_scene_ids)),
         BandFileModel.verified == 1
@@ -1805,6 +1840,13 @@ def get_downloaded_tifs_for_request(db: Session, request_id: int) -> dict:
     total_size = 0
     scenes_indexed = set()
 
+    # Detect which S1 scenes have calibrated files to strictly exclude uncalibrated raw tiles
+    scenes_with_s1_calibrated = set()
+    for bf in band_records:
+        b_p = (bf.path or "").lower()
+        if "cal_tc_db" in b_p or "orb_tnr" in b_p or "_cal_" in b_p:
+            scenes_with_s1_calibrated.add(bf.scene_id)
+
     for bf in band_records:
         raw_p = bf.path
         if not (raw_p.lower().endswith(".tif") or raw_p.lower().endswith(".tiff")):
@@ -1812,8 +1854,13 @@ def get_downloaded_tifs_for_request(db: Session, request_id: int) -> dict:
 
         # Enforce spatial validation for Sentinel-1 rasters so out-of-bounds scenes from other continents/regions are omitted
         is_s1_band = (bf.tile == "S1_SAR" or bf.satellite == "Sentinel-1" or (bf.scene_id and bf.scene_id.startswith("S1")))
-        if d_bbox and is_s1_band:
-            if not is_raster_overlapping_district(raw_p, d_bbox):
+        if is_s1_band:
+            # If calibrated files exist for this scene, omit raw uncalibrated measurement tiles
+            if bf.scene_id in scenes_with_s1_calibrated:
+                norm_p = raw_p.replace("\\", "/").lower()
+                if "/measurement/" in norm_p or not ("cal_tc_db" in norm_p or "orb_tnr" in norm_p or "_cal_" in norm_p):
+                    continue
+            if d_bbox and not is_raster_overlapping_district(raw_p, d_bbox):
                 continue
 
         f_size = bf.size_bytes or 0
@@ -1821,13 +1868,29 @@ def get_downloaded_tifs_for_request(db: Session, request_id: int) -> dict:
 
         tif_paths.append(raw_p)
         scenes_indexed.add(bf.scene_id)
+
+        fname = os.path.basename(raw_p)
+        f_upper = os.path.splitext(fname)[0].upper()
+        is_cal = bool("CAL" in f_upper or "TC_DB" in f_upper or "ORB_TNR" in f_upper)
+
+        b_canonical = bf.band
+        if is_s1_band:
+            if "VV_VH" in f_upper or "VV/VH" in f_upper or "VV-VH" in f_upper or "RATIO" in f_upper or "VV_VH" in bf.band.upper():
+                b_canonical = "VV_VH"
+            elif "VV" in f_upper and "VH" not in f_upper:
+                b_canonical = "VV"
+            elif "VH" in f_upper and "VV" not in f_upper:
+                b_canonical = "VH"
+
         tif_files.append({
             "scene_id": bf.scene_id,
             "tile": bf.tile,
             "sensing_date": bf.sensing_date,
             "satellite": bf.satellite,
-            "band": bf.band,
+            "band": b_canonical,
+            "filename": fname,
             "path": raw_p,
+            "is_calibrated": is_cal,
             "size_bytes": f_size,
             "exists_on_disk": True
         })
@@ -1855,10 +1918,18 @@ def get_downloaded_tifs_for_request(db: Session, request_id: int) -> dict:
                     s_tile = (sc_obj.tile if sc_obj else None) or ("S1_SAR" if sc_id.startswith("S1") else (sc_id.split('_')[1] if len(sc_id.split('_')) > 1 else ""))
                     s_folder = (sc_obj.folder if sc_obj else None) or sc_id
                     if s_tile:
-                        cand = os.path.join(settings.RAW_ARCHIVE_DIR, s_tile, s_yr, s_mo, s_folder)
-                        cand_res, cand_ex = resolve_tif_path(cand)
-                        if cand_ex or os.path.isdir(cand_res):
-                            arch_p = cand_res
+                        is_s1_curr = s_tile == "S1_SAR" or sc_id.startswith("S1")
+                        sat_folder = "Sentinel-1" if is_s1_curr else "Sentinel-2"
+                        candidates = []
+                        if is_s1_curr and req.district:
+                            candidates.append(os.path.join(settings.RAW_ARCHIVE_DIR, sat_folder, s_tile, req.district, s_yr, s_mo, s_folder))
+                        candidates.append(os.path.join(settings.RAW_ARCHIVE_DIR, sat_folder, s_tile, s_yr, s_mo, s_folder))
+                        candidates.append(os.path.join(settings.RAW_ARCHIVE_DIR, s_tile, s_yr, s_mo, s_folder))
+                        for cand in candidates:
+                            cand_res, cand_ex = resolve_tif_path(cand)
+                            if cand_ex or os.path.isdir(cand_res):
+                                arch_p = cand_res
+                                break
                 except Exception:
                     pass
 
@@ -1870,14 +1941,29 @@ def get_downloaded_tifs_for_request(db: Session, request_id: int) -> dict:
                     sc_tile = sc_obj.tile if sc_obj else ("S1_SAR" if sc_id.startswith("S1") else (sc_id.split('_')[1] if len(sc_id.split('_')) > 1 else "AOI"))
                     sc_sat = "Sentinel-1" if sc_id.startswith("S1") else "Sentinel-2"
                     cand_files = []
-                    for fname in os.listdir(target_dir):
-                        if fname.lower().endswith((".tif", ".tiff")):
-                            cand_files.append((fname, os.path.join(target_dir, fname)))
-                    m_dir = os.path.join(target_dir, "measurement")
-                    if os.path.isdir(m_dir):
-                        for fname in os.listdir(m_dir):
+                    if sc_sat == "Sentinel-1" or sc_id.startswith("S1"):
+                        try:
+                            repair_missing_s1_rasters_in_dir(target_dir)
+                        except Exception:
+                            pass
+                        s1_cal_found = []
+                        for fname in os.listdir(target_dir):
                             if fname.lower().endswith((".tif", ".tiff")):
-                                cand_files.append((fname, os.path.join(m_dir, fname)))
+                                fn_up = fname.upper()
+                                if "CAL_TC_DB" in fn_up or "ORB_TNR" in fn_up:
+                                    s1_cal_found.append((fname, os.path.join(target_dir, fname)))
+                        if s1_cal_found:
+                            cand_files = s1_cal_found
+                        else:
+                            m_dir = os.path.join(target_dir, "measurement")
+                            if os.path.isdir(m_dir):
+                                for fname in os.listdir(m_dir):
+                                    if fname.lower().endswith((".tif", ".tiff")):
+                                        cand_files.append((fname, os.path.join(m_dir, fname)))
+                    else:
+                        for fname in os.listdir(target_dir):
+                            if fname.lower().endswith((".tif", ".tiff")):
+                                cand_files.append((fname, os.path.join(target_dir, fname)))
 
                     for fname, f_path in cand_files:
                         if not os.path.isfile(f_path):
@@ -1890,7 +1976,16 @@ def get_downloaded_tifs_for_request(db: Session, request_id: int) -> dict:
                         tif_paths.append(f_path)
 
                         f_upper = os.path.splitext(fname)[0].upper()
-                        b_canonical = "VV" if ("VV" in f_upper and "VH" not in f_upper) else ("VH" if ("VH" in f_upper and "VV" not in f_upper) else fname)
+                        is_cal = bool("CAL" in f_upper or "TC_DB" in f_upper or "ORB_TNR" in f_upper)
+
+                        if "VV_VH" in f_upper or "VV/VH" in f_upper or "VV-VH" in f_upper or "RATIO" in f_upper:
+                            b_canonical = "VV_VH"
+                        elif "VV" in f_upper and "VH" not in f_upper:
+                            b_canonical = "VV"
+                        elif "VH" in f_upper and "VV" not in f_upper:
+                            b_canonical = "VH"
+                        else:
+                            b_canonical = fname
 
                         tif_files.append({
                             "scene_id": sc_id,
@@ -1898,7 +1993,9 @@ def get_downloaded_tifs_for_request(db: Session, request_id: int) -> dict:
                             "sensing_date": sc_date,
                             "satellite": sc_sat,
                             "band": b_canonical,
+                            "filename": fname,
                             "path": f_path,
+                            "is_calibrated": is_cal,
                             "size_bytes": f_size,
                             "exists_on_disk": True
                         })
@@ -1919,6 +2016,12 @@ def get_downloaded_tifs_for_request(db: Session, request_id: int) -> dict:
                                     verified=1
                                 ))
                                 db.commit()
+                            else:
+                                if is_cal or not ("cal_tc_db" in existing_bf.path.lower() or "orb_tnr" in existing_bf.path.lower()):
+                                    existing_bf.path = f_path
+                                    existing_bf.size_bytes = f_size
+                                    existing_bf.verified = 1
+                                    db.commit()
                         except Exception:
                             db.rollback()
 
@@ -2034,6 +2137,221 @@ def ensure_scene_indices_available(
                 except Exception as ex:
                     logger.warning(f"Could not compute on-demand {idx_type} for {sc_id}: {ex}")
                     db.rollback()
+
+
+def repair_missing_s1_rasters_in_dir(scene_dir: str) -> None:
+    """
+    Checks a Sentinel-1 scene folder. If any of the 3 calibrated GeoTIFFs
+    (VV_Orb_tnr_cal_Tc_db, VH_Orb_tnr_cal_Tc_db, VV_VH_Orb_tnr_cal_Tc_db)
+    is missing, automatically recovers/computes it from the other two or raw SAFE files.
+    Supports both .tif and .tiff file naming conventions seamlessly.
+    """
+    from app.services.sentinel1_processor_service import win_safe_path
+    import rasterio
+    import numpy as np
+
+    def _locate_s1_file(stem):
+        for ext in (".tif", ".tiff", ".TIF", ".TIFF"):
+            candidate = os.path.join(scene_dir, f"{stem}{ext}")
+            safe_c = win_safe_path(candidate)
+            if os.path.isfile(safe_c) and os.path.getsize(safe_c) > 1024:
+                return candidate, safe_c, ext
+        return None, None, ".tif"
+
+    vv_path, safe_vv, vv_ext = _locate_s1_file("VV_Orb_tnr_cal_Tc_db")
+    vh_path, safe_vh, vh_ext = _locate_s1_file("VH_Orb_tnr_cal_Tc_db")
+    ratio_path, safe_ratio, r_ext = _locate_s1_file("VV_VH_Orb_tnr_cal_Tc_db")
+
+    has_vv = bool(vv_path and safe_vv)
+    has_vh = bool(vh_path and safe_vh)
+    has_ratio = bool(ratio_path and safe_ratio)
+
+    target_ext = vv_ext or r_ext or vh_ext or ".tif"
+
+    # Case 1: VV and Ratio exist, but VH is missing -> VH = VV - Ratio
+    if has_vv and has_ratio and not has_vh:
+        try:
+            out_vh_path = os.path.join(scene_dir, f"VH_Orb_tnr_cal_Tc_db{target_ext}")
+            safe_out_vh = win_safe_path(out_vh_path)
+            with rasterio.open(safe_vv) as src_vv, rasterio.open(safe_ratio) as src_r:
+                vv = src_vv.read(1).astype(np.float32)
+                r = src_r.read(1).astype(np.float32)
+                prof = src_vv.profile.copy()
+            vh = vv - r
+            nodata_mask = (vv <= -990.0) | (r <= -990.0) | np.isnan(vv) | np.isnan(r) | np.isinf(vv) | np.isinf(r)
+            vh[nodata_mask] = -999.0
+            prof.update(dtype=rasterio.float32, count=1, nodata=-999.0, compress="lzw")
+            with rasterio.open(safe_out_vh, "w", **prof) as dst:
+                dst.write(vh, 1)
+            logger.info(f"Reconstructed missing VH calibrated raster: '{out_vh_path}'")
+        except Exception as e:
+            logger.warning(f"Could not reconstruct VH raster in '{scene_dir}': {e}")
+
+    # Case 2: VV and VH exist, but Ratio is missing -> Ratio = VV - VH
+    elif has_vv and has_vh and not has_ratio:
+        try:
+            from app.services.sentinel1_processor_service import compute_s1_vv_vh_ratio
+            out_ratio_path = os.path.join(scene_dir, f"VV_VH_Orb_tnr_cal_Tc_db{target_ext}")
+            compute_s1_vv_vh_ratio(vv_path, vh_path, out_ratio_path)
+            logger.info(f"Computed missing VV_VH ratio raster: '{out_ratio_path}'")
+        except Exception as e:
+            logger.warning(f"Could not compute VV_VH ratio in '{scene_dir}': {e}")
+
+
+def ensure_s1_calibrated_rasters_available(
+    db: Session,
+    scenes: List[Any],
+    requested_bands: Optional[List[str]] = None
+) -> None:
+    """
+    Ensures that calibrated Sentinel-1 products:
+      - VV_Orb_tnr_cal_Tc_db.tiff
+      - VH_Orb_tnr_cal_Tc_db.tiff
+      - VV_VH_Orb_tnr_cal_Tc_db.tiff
+    exist on disk and are registered in BandFileModel.
+    If the files exist on disk, registers them in PostgreSQL.
+    If missing on disk but raw SAFE rasters exist, executes the sequential
+    SAR calibration pipeline on-the-fly to generate them.
+    """
+    if not scenes:
+        return
+
+    from app.services.sentinel1_processor_service import (
+        run_sentinel_1_processing,
+        sync_s1_processed_rasters_to_db,
+        win_safe_path
+    )
+
+    s1_bands_to_find = [
+        ("VV_Orb_tnr_cal_Tc_db", "VV_Orb_tnr_cal_Tc_db.tiff"),
+        ("VH_Orb_tnr_cal_Tc_db", "VH_Orb_tnr_cal_Tc_db.tiff"),
+        ("VV_VH_Orb_tnr_cal_Tc_db", "VV_VH_Orb_tnr_cal_Tc_db.tiff"),
+    ]
+
+    for sc in scenes:
+        sc_sat = getattr(sc, "satellite", "") or ""
+        sc_id = getattr(sc, "scene_id", "") or ""
+        sc_tile = getattr(sc, "tile", "") or ""
+        if sc_sat != "Sentinel-1" and not sc_id.startswith("S1") and sc_tile != "S1_SAR":
+            continue
+
+        sc_dir = None
+        arch_p = getattr(sc, "archive_path", None)
+        if arch_p:
+            safe_arch = win_safe_path(arch_p)
+            if os.path.isdir(safe_arch):
+                sc_dir = arch_p
+            elif arch_p.lower().endswith("manifest.safe"):
+                sc_dir = os.path.dirname(arch_p)
+
+        if not sc_dir:
+            existing_bfs = db.query(BandFileModel).filter(BandFileModel.scene_id == sc_id).all()
+            for bf in existing_bfs:
+                if bf.path:
+                    rp, exists = resolve_tif_path(bf.path)
+                    safe_rp = win_safe_path(rp)
+                    if os.path.exists(safe_rp) or os.path.exists(rp):
+                        p_dir = os.path.dirname(rp)
+                        if os.path.basename(p_dir).lower() == "measurement":
+                            sc_dir = os.path.dirname(p_dir)
+                        else:
+                            sc_dir = p_dir
+                        break
+
+        if not sc_dir:
+            continue
+
+        safe_sc_dir = win_safe_path(sc_dir)
+        if not os.path.isdir(safe_sc_dir):
+            continue
+
+        # First run fast repair in case 2 of 3 rasters exist on disk
+        repair_missing_s1_rasters_in_dir(sc_dir)
+
+        all_found = True
+        found_paths = {}
+        for b_name in ("VV_Orb_tnr_cal_Tc_db", "VH_Orb_tnr_cal_Tc_db", "VV_VH_Orb_tnr_cal_Tc_db"):
+            matched_p = None
+            for ext in (".tif", ".tiff", ".TIF", ".TIFF"):
+                cand = os.path.join(sc_dir, f"{b_name}{ext}")
+                safe_cand = win_safe_path(cand)
+                if os.path.isfile(safe_cand) and os.path.getsize(safe_cand) > 1024:
+                    matched_p = cand
+                    break
+            if matched_p:
+                found_paths[b_name] = matched_p
+            else:
+                all_found = False
+
+        if not all_found:
+            meas_dir = os.path.join(sc_dir, "measurement")
+            has_raw = os.path.isdir(win_safe_path(meas_dir)) or os.path.isfile(win_safe_path(os.path.join(sc_dir, "manifest.safe")))
+            if has_raw:
+                try:
+                    res = run_sentinel_1_processing(sc_dir)
+                    if res.get("success"):
+                        sync_s1_processed_rasters_to_db(db, sc, res)
+                        for b_name, fname in s1_bands_to_find:
+                            fpath = os.path.join(sc_dir, fname)
+                            safe_fpath = win_safe_path(fpath)
+                            if os.path.isfile(safe_fpath):
+                                found_paths[b_name] = fpath
+                except Exception as ex:
+                    logger.warning(f"Could not run S1 processing for {sc_id} during retrieval: {ex}")
+
+        now = datetime.utcnow()
+        for b_name, fpath in found_paths.items():
+            safe_fpath = win_safe_path(fpath)
+            f_size = os.path.getsize(safe_fpath)
+            existing = db.query(BandFileModel).filter(
+                BandFileModel.scene_id == sc_id,
+                BandFileModel.band == b_name
+            ).first()
+            if existing:
+                existing.path = fpath
+                existing.size_bytes = f_size
+                existing.verified = 1
+            else:
+                db.add(BandFileModel(
+                    scene_id=sc_id,
+                    tile=getattr(sc, "tile", "S1_SAR") or "S1_SAR",
+                    sensing_date=getattr(sc, "sensing_date", None),
+                    satellite="Sentinel-1",
+                    band=b_name,
+                    path=fpath,
+                    size_bytes=f_size,
+                    verified=1,
+                    downloaded_at=now
+                ))
+
+            # Also register/update the canonical short band name (VV, VH, VV_VH) so standard queries retrieve the calibrated file
+            short_b = "VV_VH" if "VV_VH" in b_name else ("VV" if "VV_Orb" in b_name else ("VH" if "VH_Orb" in b_name else None))
+            if short_b:
+                ex_short = db.query(BandFileModel).filter(
+                    BandFileModel.scene_id == sc_id,
+                    BandFileModel.band == short_b
+                ).first()
+                if ex_short:
+                    ex_short.path = fpath
+                    ex_short.size_bytes = f_size
+                    ex_short.verified = 1
+                else:
+                    db.add(BandFileModel(
+                        scene_id=sc_id,
+                        tile=getattr(sc, "tile", "S1_SAR") or "S1_SAR",
+                        sensing_date=getattr(sc, "sensing_date", None),
+                        satellite="Sentinel-1",
+                        band=short_b,
+                        path=fpath,
+                        size_bytes=f_size,
+                        verified=1,
+                        downloaded_at=now
+                    ))
+        try:
+            db.commit()
+        except Exception as e:
+            db.rollback()
+            logger.warning(f"Could not commit S1 band_file sync for {sc_id}: {e}")
 
 
 def search_downloaded_tifs_by_region(
@@ -2170,8 +2488,19 @@ def search_downloaded_tifs_by_region(
         for r_obj in req_q.all():
             if r_obj.execution_logs:
                 import re
-                for m in re.finditer(r"Scene\s+'([A-Za-z0-9_]+)'", r_obj.execution_logs):
+                for m in re.finditer(r"(?:Scene:?\s*|Processing\s+(?:Sentinel-1\s+Scene:\s*)?)['\"]([A-Za-z0-9_]+)['\"]", r_obj.execution_logs):
                     allowed_scene_ids.add(m.group(1))
+                for m in re.finditer(r"\b(S1[A-C0-9]_[0-9A-Za-z_]+)\b", r_obj.execution_logs):
+                    allowed_scene_ids.add(m.group(1))
+
+        if district:
+            s1_bfs = db.query(BandFileModel.scene_id).filter(
+                BandFileModel.satellite == "Sentinel-1",
+                BandFileModel.path.ilike(f"%{clean_d}%")
+            ).distinct().all()
+            for bf_row in s1_bfs:
+                if bf_row[0]:
+                    allowed_scene_ids.add(bf_row[0])
 
         # Also include held S1 scenes specifically for this district if none were found
         s1_req_q = db.query(RequestModel).filter(RequestModel.satellite.ilike("%Sentinel-1%"))
@@ -2224,8 +2553,18 @@ def search_downloaded_tifs_by_region(
     total_size = 0
     matched_scenes = []
 
-    # 2. Build Scene Query for raw individual scenes (skip if user explicitly requested only interval composite products)
-    skip_raw_scenes = clean_interval in ("weekly", "fortnightly", "monthly")
+    # 2. Build Scene Query for individual scenes
+    is_s1_request = bool((satellite and "Sentinel-1" in satellite) or (band and ("ORB" in band.upper() or "VV" in band.upper() or "VH" in band.upper())))
+    has_explicit_scene_band = bool(band and any(
+        b.upper() not in ("ALL", "COMPOSITE", "COMPOSITES")
+        for b in band.split(",")
+    ))
+
+    # Never skip individual scene queries for Sentinel-1 or when user requested specific scene bands
+    if is_s1_request or has_explicit_scene_band:
+        skip_raw_scenes = False
+    else:
+        skip_raw_scenes = clean_interval in ("weekly", "fortnightly", "monthly")
     if not skip_raw_scenes:
         scene_query = db.query(SceneModel).filter(SceneModel.status == "HELD")
         if tiles:
@@ -2253,20 +2592,37 @@ def search_downloaded_tifs_by_region(
         scene_ids = [s.scene_id for s in matched_scenes]
 
         if scene_ids:
-            if band and band.strip() and band.upper() != "ALL":
-                band_tokens = [
-                    b.replace(".tif", "").replace(".tiff", "").strip()
-                    for b in band.split(",")
-                    if b.strip() and b.strip().upper() != "ALL"
-                ]
-                if band_tokens:
-                    ensure_scene_indices_available(db, matched_scenes, band_tokens)
+            band_tokens = [
+                b.replace(".tif", "").replace(".tiff", "").strip()
+                for b in (band or "").split(",")
+                if b.strip() and b.strip().upper() != "ALL"
+            ] if (band and band.strip() and band.upper() != "ALL") else []
+
+            if band_tokens:
+                ensure_scene_indices_available(db, matched_scenes, band_tokens)
+
+            # Ensure calibrated SAR products exist on NAS & DB for any Sentinel-1 scenes
+            ensure_s1_calibrated_rasters_available(db, matched_scenes, band_tokens)
 
             # 3. Query Band Files from DB using path column
             bf_query = db.query(BandFileModel).filter(
                 BandFileModel.scene_id.in_(scene_ids),
                 BandFileModel.verified == 1
             )
+
+            is_pure_s1_retrieval = bool(satellite and "Sentinel-1" in satellite and "Sentinel-2" not in satellite)
+            if is_pure_s1_retrieval and (not band or band.strip().upper() == "ALL"):
+                # If user asked for Sentinel-1 ALL bands, return strictly the 3 calibrated GeoTIFF deliverables
+                bf_query = bf_query.filter(or_(
+                    BandFileModel.band.ilike("%VV_Orb_tnr_cal_Tc_db%"),
+                    BandFileModel.band.ilike("%VH_Orb_tnr_cal_Tc_db%"),
+                    BandFileModel.band.ilike("%VV_VH_Orb_tnr_cal_Tc_db%"),
+                    BandFileModel.path.ilike("%VV_Orb_tnr_cal_Tc_db%"),
+                    BandFileModel.path.ilike("%VH_Orb_tnr_cal_Tc_db%"),
+                    BandFileModel.path.ilike("%VV_VH_Orb_tnr_cal_Tc_db%"),
+                    BandFileModel.band.ilike("%VV_VH%"),
+                    BandFileModel.path.ilike("%VV_VH%")
+                ))
 
             if band and band.strip() and band.upper() != "ALL":
                 band_tokens = [
@@ -2276,15 +2632,30 @@ def search_downloaded_tifs_by_region(
                 ]
                 if band_tokens:
                     from sqlalchemy import or_, and_
-                    user_wants_vv_vh = any(bt.upper() in ("VV_VH", "VV/VH", "SAR_RATIO", "VV-VH") for bt in band_tokens)
+                    user_wants_vv_vh = any("VV_VH" in bt.upper() or "VV/VH" in bt.upper() or "SAR_RATIO" in bt.upper() or "VV-VH" in bt.upper() for bt in band_tokens)
                     conditions = []
                     for b_token in band_tokens:
                         b_up = b_token.upper()
-                        if b_up in ("VV_VH", "VV/VH", "SAR_RATIO"):
+                        if "VV_VH" in b_up or "VV/VH" in b_up or b_up in ("VV_VH", "VV/VH", "SAR_RATIO"):
                             conditions.append(or_(
                                 BandFileModel.band.ilike("%VV_VH%"),
                                 BandFileModel.band.ilike("%VV/VH%"),
-                                BandFileModel.band.ilike("%VV-VH%")
+                                BandFileModel.band.ilike("%VV-VH%"),
+                                BandFileModel.path.ilike("%VV_VH%")
+                            ))
+                        elif "VV_ORB" in b_up:
+                            conditions.append(or_(
+                                BandFileModel.band.ilike("%VV_Orb_tnr_cal_Tc_db%"),
+                                BandFileModel.path.ilike("%VV_Orb_tnr_cal_Tc_db%"),
+                                BandFileModel.band.ilike("%VV_Orb%"),
+                                BandFileModel.path.ilike("%VV_Orb%")
+                            ))
+                        elif "VH_ORB" in b_up:
+                            conditions.append(or_(
+                                BandFileModel.band.ilike("%VH_Orb_tnr_cal_Tc_db%"),
+                                BandFileModel.path.ilike("%VH_Orb_tnr_cal_Tc_db%"),
+                                BandFileModel.band.ilike("%VH_Orb%"),
+                                BandFileModel.path.ilike("%VH_Orb%")
                             ))
                         elif b_up in ("COMPOSITE", "COMPOSITES"):
                             conditions.append(or_(
@@ -2420,14 +2791,22 @@ def search_downloaded_tifs_by_region(
                     f_upper = f.upper()
                     if band_tokens_comp:
                         matched_token = False
-                        user_wants_vv_vh_comp = any(b in ("VV_VH", "VV/VH", "SAR_RATIO", "VV-VH") for b in band_tokens_comp)
+                        user_wants_vv_vh_comp = any("VV_VH" in b or "VV/VH" in b or "SAR_RATIO" in b or "VV-VH" in b for b in band_tokens_comp)
                         for b_tok in band_tokens_comp:
                             if b_tok in ("COMPOSITE", "COMPOSITES"):
                                 if "COMPOSITE" in f_upper or "CLIPPED" in f_upper:
                                     matched_token = True
                                     break
-                            elif b_tok in ("VV_VH", "VV/VH", "SAR_RATIO"):
+                            elif "VV_VH" in b_tok or b_tok in ("VV_VH", "VV/VH", "SAR_RATIO"):
                                 if "VV_VH" in f_upper or "VV/VH" in f_upper or "VV-VH" in f_upper:
+                                    matched_token = True
+                                    break
+                            elif "VV_ORB" in b_tok:
+                                if "VV_ORB" in f_upper or ("VV" in f_upper and "VH" not in f_upper):
+                                    matched_token = True
+                                    break
+                            elif "VH_ORB" in b_tok:
+                                if "VH_ORB" in f_upper or ("VH" in f_upper and "VV_VH" not in f_upper and "VV/VH" not in f_upper):
                                     matched_token = True
                                     break
                             elif b_tok in ("VV", "VH"):
@@ -2474,6 +2853,132 @@ def search_downloaded_tifs_by_region(
                         "size_bytes": actual_size,
                         "exists_on_disk": True
                     })
+
+    # 3.5. Direct NAS storage scan fallback for Sentinel-1 calibrated deliverables
+    if is_s1_request or (satellite and "Sentinel-1" in satellite):
+        from app.services.sentinel1_processor_service import win_safe_path
+        s1_target_stems = ["VV_Orb_tnr_cal_Tc_db", "VH_Orb_tnr_cal_Tc_db", "VV_VH_Orb_tnr_cal_Tc_db"]
+        if band and band.strip().upper() != "ALL":
+            b_tokens_upper = [b.upper().replace(".TIFF", "").replace(".TIF", "").strip() for b in band.split(",") if b.strip()]
+            filtered_targets = []
+            for st in s1_target_stems:
+                st_up = st.upper()
+                if any(bt in st_up or st_up in bt for bt in b_tokens_upper):
+                    filtered_targets.append(st)
+            if filtered_targets:
+                s1_target_stems = filtered_targets
+
+        s1_roots = []
+        clean_d = district.split(",")[0].strip() if district else ""
+        if clean_d:
+            s1_roots.append(os.path.join(settings.RAW_ARCHIVE_DIR, "Sentinel-1", "S1_SAR", clean_d))
+            s1_roots.append(os.path.join(settings.RAW_ARCHIVE_DIR, "Sentinel-1", clean_d))
+            s1_roots.append(os.path.join(settings.RAW_ARCHIVE_DIR, clean_d))
+            s1_roots.append(rf"\\{settings.NAS_SERVER_IP}\Remote_Sensing\SriKanth_R\sdpp\{clean_d}")
+            s1_roots.append(rf"\\{settings.NAS_SERVER_IP}\Remote_Sensing\SriKanth_R\sdpp\{clean_d}\orb")
+            s1_roots.append(rf"\\{settings.NAS_SERVER_IP}\Remote-sensing\SDAP_DATA_STORAGE\Sentinel-1\S1_SAR\{clean_d}")
+            s1_roots.append(rf"\\{settings.NAS_SERVER_IP}\Remote-sensing\SDAP_DATA_STORAGE\Sentinel-1\{clean_d}")
+        else:
+            s1_roots.append(os.path.join(settings.RAW_ARCHIVE_DIR, "Sentinel-1"))
+            s1_roots.append(rf"\\{settings.NAS_SERVER_IP}\Remote_Sensing\SriKanth_R\sdpp")
+            s1_roots.append(rf"\\{settings.NAS_SERVER_IP}\Remote-sensing\SDAP_DATA_STORAGE\Sentinel-1")
+
+        seen_disk_paths = set(os.path.normpath(p).lower() for p in tif_paths)
+        seen_scene_bands = set((f.get("scene_id"), f.get("band")) for f in tif_files)
+        valid_scene_ids = set(s.scene_id for s in matched_scenes) if matched_scenes else None
+        import re
+
+        for s1_root in s1_roots:
+            try:
+                safe_root = win_safe_path(s1_root)
+                if not os.path.exists(safe_root):
+                    continue
+                for root_dir, dirs, fnames in os.walk(safe_root):
+                    # Prune SNAP BEAM-DIMAP data folders and temp dirs
+                    dirs[:] = [d for d in dirs if not d.endswith(".data") and not d.startswith("_temp") and not d.startswith(".")]
+                    if root_dir.endswith(".data") or ".data" in root_dir or "_temp" in root_dir:
+                        continue
+
+                    # Extract scene ID from directory name
+                    scene_folder_name = os.path.basename(root_dir)
+                    s1_m = re.search(r'(S1[AB]_[0-9A-Za-z_]+)', scene_folder_name)
+                    sc_id_detected = s1_m.group(1) if s1_m else scene_folder_name
+
+                    # If scenes were queried from database for this request/district, enforce scene match
+                    if valid_scene_ids:
+                        if not any(v_id in sc_id_detected or sc_id_detected in v_id for v_id in valid_scene_ids):
+                            continue
+
+                    # Date filtering from scene ID timestamp
+                    date_m = re.search(r'S1[AB]_[0-9A-Za-z_]+_(\d{4})(\d{2})(\d{2})T', sc_id_detected)
+                    if date_m:
+                        sc_sensing_date = f"{date_m.group(1)}-{date_m.group(2)}-{date_m.group(3)}"
+                        if start_date and sc_sensing_date < start_date:
+                            continue
+                        if end_date and sc_sensing_date > end_date:
+                            continue
+                    else:
+                        sc_sensing_date = start_date or "2026-06-01"
+
+                    try:
+                        # Run quick repair if needed in this scene directory
+                        repair_missing_s1_rasters_in_dir(root_dir)
+                    except Exception as rep_err:
+                        logger.debug(f"Quick repair skipped for {root_dir}: {rep_err}")
+
+                    for fn in fnames:
+                        fn_lower = fn.lower()
+                        if not fn_lower.endswith((".tif", ".tiff")):
+                            continue
+                        fn_stem = os.path.splitext(fn_lower)[0]
+                        matched_stem = None
+                        for target in s1_target_stems:
+                            if target.lower() in fn_stem or fn_stem == target.lower():
+                                matched_stem = target
+                                break
+
+                        if matched_stem:
+                            # Avoid adding the same scene band multiple times from different NAS mounts
+                            scene_band_key = (sc_id_detected, matched_stem)
+                            if scene_band_key in seen_scene_bands:
+                                continue
+
+                            full_file = os.path.join(root_dir, fn)
+                            norm_f = full_file.replace(r"\\?\\UNC\\", r"\\").replace(r"\\?\\", "")
+                            norm_lower = os.path.normpath(norm_f).lower()
+                            if norm_lower in seen_disk_paths:
+                                continue
+                            seen_disk_paths.add(norm_lower)
+                            seen_scene_bands.add(scene_band_key)
+
+                            safe_f = win_safe_path(full_file)
+                            f_size = os.path.getsize(safe_f) if os.path.isfile(safe_f) else 0
+                            total_size += f_size
+                            tif_paths.append(norm_f)
+                            tif_files.append({
+                                "scene_id": sc_id_detected,
+                                "tile": "S1_SAR",
+                                "sensing_date": sc_sensing_date,
+                                "satellite": "Sentinel-1",
+                                "band": matched_stem,
+                                "path": norm_f,
+                                "size_bytes": f_size,
+                                "exists_on_disk": True
+                            })
+            except Exception as walk_err:
+                logger.warning(f"Error scanning Sentinel-1 path {s1_root}: {walk_err}")
+
+    # If pure Sentinel-1 is requested, return ONLY the 3 calibrated GeoTIFF deliverables
+    is_pure_s1 = bool(satellite and "Sentinel-1" in satellite and "Sentinel-2" not in satellite)
+    if is_pure_s1:
+        s1_valid_stems = ("vv_orb_tnr_cal_tc_db", "vh_orb_tnr_cal_tc_db", "vv_vh_orb_tnr_cal_tc_db")
+        tif_files = [
+            f for f in tif_files
+            if any(v in os.path.splitext(os.path.basename(f.get("path", "")))[0].lower() for v in s1_valid_stems)
+            or any(v in f.get("band", "").lower() for v in s1_valid_stems)
+        ]
+        tif_paths = [f["path"] for f in tif_files]
+        total_size = sum(f.get("size_bytes", 0) for f in tif_files)
 
     total_scenes_cnt = len(matched_scenes) if not skip_raw_scenes else len(set(f["scene_id"] for f in tif_files))
     actual_tiles = sorted(list(set(s.tile for s in matched_scenes if s.tile))) if matched_scenes else (tiles if not region_filtered else [])

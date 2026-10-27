@@ -604,31 +604,70 @@ def perform_gap_check(
         sc_sat = sc.get("satellite", "Sentinel-2")
         year = s_date[0:4]
         month = str(int(s_date[5:7]))
-        sat_subfolder = "Sentinel-1" if sc_sat == "Sentinel-1" else "Sentinel-2"
+        is_s1_scene = sc_sat == "Sentinel-1"
+        sat_subfolder = "Sentinel-1" if is_s1_scene else "Sentinel-2"
 
-        # Resolve NAS path first (both subfolder and legacy layouts), fallback to local archive
-        scene_archive_dir_nas = os.path.join(settings.RAW_ARCHIVE_DIR, sat_subfolder, tile, year, month, folder)
-        if not os.path.isdir(scene_archive_dir_nas):
-            legacy_nas = os.path.join(settings.RAW_ARCHIVE_DIR, tile, year, month, folder)
-            if os.path.isdir(legacy_nas):
-                scene_archive_dir_nas = legacy_nas
+        # Resolve NAS path first (district-aware for Sentinel-1, both subfolder and legacy layouts), fallback to local archive
+        if is_s1_scene and district_name:
+            cand_dist_nas = os.path.join(settings.RAW_ARCHIVE_DIR, sat_subfolder, tile, district_name, year, month, folder)
+            if os.path.isdir(cand_dist_nas):
+                scene_archive_dir_nas = cand_dist_nas
             else:
-                parent_nas = os.path.join(settings.RAW_ARCHIVE_DIR, sat_subfolder, tile, year, month)
-                if not os.path.isdir(parent_nas):
-                    parent_nas = os.path.join(settings.RAW_ARCHIVE_DIR, tile, year, month)
-                if os.path.isdir(parent_nas):
-                    try:
-                        for cand in os.listdir(parent_nas):
-                            if cand.startswith(folder) or folder.startswith(cand):
-                                scene_archive_dir_nas = os.path.join(parent_nas, cand)
-                                break
-                    except Exception:
-                        pass
+                legacy_s1_nas = os.path.join(settings.RAW_ARCHIVE_DIR, sat_subfolder, tile, year, month, folder)
+                if os.path.isdir(legacy_s1_nas):
+                    scene_archive_dir_nas = legacy_s1_nas
+                else:
+                    legacy_nas = os.path.join(settings.RAW_ARCHIVE_DIR, tile, year, month, folder)
+                    if os.path.isdir(legacy_nas):
+                        scene_archive_dir_nas = legacy_nas
+                    else:
+                        parent_nas = os.path.join(settings.RAW_ARCHIVE_DIR, sat_subfolder, tile, district_name, year, month)
+                        if not os.path.isdir(parent_nas):
+                            parent_nas = os.path.join(settings.RAW_ARCHIVE_DIR, sat_subfolder, tile, year, month)
+                        if not os.path.isdir(parent_nas):
+                            parent_nas = os.path.join(settings.RAW_ARCHIVE_DIR, tile, year, month)
+                        found = False
+                        if os.path.isdir(parent_nas):
+                            try:
+                                for cand in os.listdir(parent_nas):
+                                    if cand.startswith(folder) or folder.startswith(cand):
+                                        scene_archive_dir_nas = os.path.join(parent_nas, cand)
+                                        found = True
+                                        break
+                            except Exception:
+                                pass
+                        if not found:
+                            scene_archive_dir_nas = cand_dist_nas
+        else:
+            scene_archive_dir_nas = os.path.join(settings.RAW_ARCHIVE_DIR, sat_subfolder, tile, year, month, folder)
+            if not os.path.isdir(scene_archive_dir_nas):
+                legacy_nas = os.path.join(settings.RAW_ARCHIVE_DIR, tile, year, month, folder)
+                if os.path.isdir(legacy_nas):
+                    scene_archive_dir_nas = legacy_nas
+                else:
+                    parent_nas = os.path.join(settings.RAW_ARCHIVE_DIR, sat_subfolder, tile, year, month)
+                    if not os.path.isdir(parent_nas):
+                        parent_nas = os.path.join(settings.RAW_ARCHIVE_DIR, tile, year, month)
+                    if os.path.isdir(parent_nas):
+                        try:
+                            for cand in os.listdir(parent_nas):
+                                if cand.startswith(folder) or folder.startswith(cand):
+                                    scene_archive_dir_nas = os.path.join(parent_nas, cand)
+                                    break
+                        except Exception:
+                            pass
 
         backend_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-        scene_archive_dir_local = os.path.abspath(
-            os.path.join(backend_root, "data", "archive", sat_subfolder, tile, year, month, folder)
-        )
+        if is_s1_scene and district_name:
+            cand_dist_loc = os.path.abspath(os.path.join(backend_root, "data", "archive", sat_subfolder, tile, district_name, year, month, folder))
+            if os.path.isdir(cand_dist_loc):
+                scene_archive_dir_local = cand_dist_loc
+            else:
+                scene_archive_dir_local = os.path.abspath(os.path.join(backend_root, "data", "archive", sat_subfolder, tile, year, month, folder))
+        else:
+            scene_archive_dir_local = os.path.abspath(
+                os.path.join(backend_root, "data", "archive", sat_subfolder, tile, year, month, folder)
+            )
         if not os.path.isdir(scene_archive_dir_local):
             legacy_local = os.path.abspath(os.path.join(backend_root, "data", "archive", tile, year, month, folder))
             if os.path.isdir(legacy_local):
@@ -715,13 +754,20 @@ def perform_gap_check(
         else:
             st = "PENDING_DOWNLOAD"
 
+        if t == "S1_SAR" and district_name:
+            t_archive = os.path.join(settings.RAW_ARCHIVE_DIR, "Sentinel-1", t, district_name)
+        elif t == "S1_SAR":
+            t_archive = os.path.join(settings.RAW_ARCHIVE_DIR, "Sentinel-1", t)
+        else:
+            t_archive = os.path.join(settings.RAW_ARCHIVE_DIR, "Sentinel-2", t)
+
         tile_statuses[t] = {
             "tile": t,
             "status": st,
             "total_scenes": t_total,
             "held_scenes": t_held,
             "missing_scenes": t_missing,
-            "archive_dir": os.path.join(settings.RAW_ARCHIVE_DIR, t)
+            "archive_dir": t_archive
         }
 
     summary = {

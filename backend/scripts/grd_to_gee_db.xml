@@ -1,0 +1,117 @@
+<graph id="Graph">
+  <version>1.0</version>
+  
+  <!-- 1. Read Raw AWS GRD Folder -->
+  <node id="Read">
+    <operator>Read</operator>
+    <sources/>
+    <parameters class="com.bc.ceres.binding.dom.XppDomElement">
+      <file>${input_file}</file>
+    </parameters>
+  </node>
+
+  <!-- 2. Apply Orbit File -->
+  <node id="Apply-Orbit-File">
+    <operator>Apply-Orbit-File</operator>
+    <sources>
+      <sourceProduct>Read</sourceProduct>
+    </sources>
+    <parameters class="com.bc.ceres.binding.dom.XppDomElement">
+      <orbitType>Sentinel Restituted (Auto Download)</orbitType>
+      <polyDegree>3</polyDegree>
+      <continueOnFail>true</continueOnFail>
+    </parameters>
+  </node>
+
+  <!-- 3. Thermal Noise Removal -->
+  <node id="ThermalNoiseRemoval">
+    <operator>ThermalNoiseRemoval</operator>
+    <sources>
+      <sourceProduct>Apply-Orbit-File</sourceProduct>
+    </sources>
+    <parameters class="com.bc.ceres.binding.dom.XppDomElement">
+      <selectedPolarisations/>
+      <removeThermalNoise>true</removeThermalNoise>
+      <outputNoise>false</outputNoise>
+    </parameters>
+  </node>
+
+  <!-- 4. Radiometric Calibration (Sigma0 Intensity) -->
+  <node id="Calibration">
+    <operator>Calibration</operator>
+    <sources>
+      <sourceProduct>ThermalNoiseRemoval</sourceProduct>
+    </sources>
+    <parameters class="com.bc.ceres.binding.dom.XppDomElement">
+      <sourceBands/>
+      <auxFile>Product Auxiliary File</auxFile>
+      <outputImageInComplex>false</outputImageInComplex>
+      <outputImageScaleInDb>false</outputImageScaleInDb>
+      <createGammaBand>false</createGammaBand>
+      <createBetaBand>false</createBetaBand>
+      <selectedPolarisations>VV,VH</selectedPolarisations>
+      <outputSigmaBand>true</outputSigmaBand>
+    </parameters>
+  </node>
+
+  <!-- 5. Range-Doppler Terrain Correction (Orthorectification) -->
+  <node id="Terrain-Correction">
+    <operator>Terrain-Correction</operator>
+    <sources>
+      <sourceProduct>Calibration</sourceProduct>
+    </sources>
+    <parameters class="com.bc.ceres.binding.dom.XppDomElement">
+      <sourceBands/>
+      <demName>SRTM 3Sec (Auto Download)</demName>
+      <demResamplingMethod>BILINEAR_INTERPOLATION</demResamplingMethod>
+      <imgResamplingMethod>BILINEAR_INTERPOLATION</imgResamplingMethod>
+      <pixelSpacingInMeter>10.0</pixelSpacingInMeter>
+      <mapProjection>GEOGCS[&quot;WGS84(DD)&quot;, &#xd;
+  DATUM[&quot;WGS84&quot;, &#xd;
+    SPHEROID[&quot;WGS84&quot;, 6378137.0, 298.257223563]], &#xd;
+  PRIMEM[&quot;Greenwich&quot;, 0.0], &#xd;
+  UNIT[&quot;degree&quot;, 0.017453292519943295]]</mapProjection>
+      <nodataValueAtSea>true</nodataValueAtSea>
+      <saveDEM>false</saveDEM>
+    </parameters>
+  </node>
+
+  <!-- 6. Band Math: GEE Logarithmic Scaling & Standardized Naming -->
+  <node id="BandMaths">
+    <operator>BandMaths</operator>
+    <sources>
+      <sourceProduct>Terrain-Correction</sourceProduct>
+    </sources>
+    <parameters class="com.bc.ceres.binding.dom.XppDomElement">
+      <targetBands>
+        <!-- Replicate GEE Standard Naming and Logarithmic Scaling for VV -->
+        <targetBand>
+          <name>VV</name>
+          <type>float32</type>
+          <expression>Sigma0_VV &gt; 0 ? 10.0 * log10(Sigma0_VV) : -999.0</expression>
+          <noDataValue>-999.0</noDataValue>
+        </targetBand>
+        <!-- Replicate GEE Standard Naming and Logarithmic Scaling for VH -->
+        <targetBand>
+          <name>VH</name>
+          <type>float32</type>
+          <expression>Sigma0_VH &gt; 0 ? 10.0 * log10(Sigma0_VH) : -999.0</expression>
+          <noDataValue>-999.0</noDataValue>
+        </targetBand>
+      </targetBands>
+    </parameters>
+  </node>
+
+  <!-- 7. Save out as a Multi-Band GeoTIFF -->
+  <node id="Write">
+    <operator>Write</operator>
+    <sources>
+      <sourceProduct>BandMaths</sourceProduct>
+    </sources>
+    <parameters class="com.bc.ceres.binding.dom.XppDomElement">
+      <file>${output_file}</file>
+      <format>GeoTIFF</format>
+    </parameters>
+  </node>
+</graph>
+

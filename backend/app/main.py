@@ -4,9 +4,9 @@ from contextlib import asynccontextmanager
 import logging
 
 from app.core.config import settings
-from app.core.database import engine, Base
-from app.api.v1.api import api_router
-from app.models import RequestModel, SceneModel, SceneFileModel, ProcessJobModel # ensure models are registered
+from app.db import engine, Base
+from app.routes import api_router
+from app.db.models import RequestModel, SceneModel, SceneFileModel, ProcessJobModel # ensure models are registered
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("sdap.main")

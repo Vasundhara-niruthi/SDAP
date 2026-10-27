@@ -9,10 +9,10 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
-from app.core.database import engine, Base, SessionLocal
-from app.db.migrations.user_data import run_user_data_migrations
+from app.db import engine, Base, SessionLocal
+from app.db.seeds import run_user_data_migrations
 from app.core.security import hash_password
-from app.models.sdap_models import UserModel, RequestModel, SceneModel, BandFileModel, ProcessJobModel
+from app.db.models import UserModel, RequestModel, SceneModel, BandFileModel, ProcessJobModel
 
 
 

@@ -94,6 +94,14 @@ export default function App() {
   const satellite = selectedSatellites.join(', ');
   const [selectedIndices, setSelectedIndices] = useState(['NDVI', 'LSWI']);
   const [compositeInterval, setCompositeInterval] = useState('none');
+
+  const isOnlyS1 = selectedSatellites.includes('Sentinel-1') && !selectedSatellites.includes('Sentinel-2');
+
+  useEffect(() => {
+    if (isOnlyS1 && (compositeInterval === 'weekly' || compositeInterval === 'monthly')) {
+      setCompositeInterval('fortnightly');
+    }
+  }, [isOnlyS1, compositeInterval]);
   const [level, setLevel] = useState('max');
   const [maxCloudCover, setMaxCloudCover] = useState(100);
   const [submittingReq, setSubmittingReq] = useState(false);
@@ -152,8 +160,21 @@ export default function App() {
   // 7. Data Retrieval & Export State & Handlers
   // ---------------------------------------------------------------------------
   const RET_S1_BANDS = [
-    { id: 'VV', label: 'VV', tag: 'SAR Co-pol (10m)' },
-    { id: 'VH', label: 'VH', tag: 'SAR Cross-pol (10m)' },
+    {
+      id: 'VV_Orb_tnr_cal_Tc_db.tiff',
+      label: 'VV_Orb_tnr_cal_Tc_db.tiff',
+      tag: 'Calibrated Co-pol Sigma0 (dB, 10m)'
+    },
+    {
+      id: 'VH_Orb_tnr_cal_Tc_db.tiff',
+      label: 'VH_Orb_tnr_cal_Tc_db.tiff',
+      tag: 'Calibrated Cross-pol Sigma0 (dB, 10m)'
+    },
+    {
+      id: 'VV_VH_Orb_tnr_cal_Tc_db.tiff',
+      label: 'VV_VH_Orb_tnr_cal_Tc_db.tiff',
+      tag: 'Dual-Pol Ratio (VV_dB - VH_dB)'
+    },
   ];
 
   const RET_S2_BANDS = [
@@ -415,12 +436,23 @@ export default function App() {
     } catch (err) {
       console.error('Failed to download ZIP archive:', err);
       let errMsg = 'Failed to download ZIP file.';
-      if (err.response && err.response.data instanceof Blob) {
-        try {
-          const txt = await err.response.data.text();
-          const j = JSON.parse(txt);
-          if (j.detail) errMsg = j.detail;
-        } catch (e) {}
+      if (err.response) {
+        if (err.response.data instanceof Blob) {
+          try {
+            const txt = await err.response.data.text();
+            try {
+              const j = JSON.parse(txt);
+              if (j.detail) errMsg = j.detail;
+              else if (txt && txt.length < 300) errMsg = txt;
+            } catch (pErr) {
+              if (txt && txt.length < 300) errMsg = txt;
+            }
+          } catch (e) {}
+        } else if (err.response.data && err.response.data.detail) {
+          errMsg = err.response.data.detail;
+        } else if (err.response.statusText) {
+          errMsg = `${err.response.status}: ${err.response.statusText}`;
+        }
       } else if (err.message) {
         errMsg = err.message;
       }
@@ -580,7 +612,8 @@ export default function App() {
 
   const AVAILABLE_SAR_BANDS = [
     { id: 'VV', label: 'VV - Vertical-Vertical Co-polarization (10m)' },
-    { id: 'VH', label: 'VH - Vertical-Horizontal Cross-polarization (10m)' }
+    { id: 'VH', label: 'VH - Vertical-Horizontal Cross-polarization (10m)' },
+    { id: 'VV_VH', label: 'VV_VH - Dual-pol Cross-ratio Backscatter (10m)' }
   ];
 
   const AVAILABLE_INDICES = [
@@ -629,9 +662,10 @@ export default function App() {
       }
 
       // 2. Find matching requests for this district / state
+      // If a specificRequestId is supplied, strictly limit to that exact request!
       let matchingList = matchingReq ? [matchingReq] : [];
 
-      if (distVal) {
+      if (!specificRequestId && distVal) {
         const dList = candidateRequests.filter(r => 
           r.district && r.district.toLowerCase() === distVal.toLowerCase() &&
           (!stateVal || !r.state || r.state.toLowerCase() === stateVal.toLowerCase())
@@ -657,8 +691,22 @@ export default function App() {
         matchingReq = matchingList[0];
       }
 
+      // If matchingReq is identified, partition by satellite so Sentinel-1 and Sentinel-2 requests never cross-contaminate
+      if (matchingReq && matchingReq.satellite && !specificRequestId) {
+        const isS1 = matchingReq.satellite.toLowerCase().includes('sentinel-1') && !matchingReq.satellite.toLowerCase().includes('sentinel-2');
+        const isS2 = matchingReq.satellite.toLowerCase().includes('sentinel-2') && !matchingReq.satellite.toLowerCase().includes('sentinel-1');
+        matchingList = matchingList.filter(r => {
+          if (!r.satellite) return true;
+          const rS1 = r.satellite.toLowerCase().includes('sentinel-1') && !r.satellite.toLowerCase().includes('sentinel-2');
+          const rS2 = r.satellite.toLowerCase().includes('sentinel-2') && !r.satellite.toLowerCase().includes('sentinel-1');
+          if (isS1 && !rS1) return false;
+          if (isS2 && !rS2) return false;
+          return true;
+        });
+      }
+
       let tifs = [];
-      const reqsToTry = matchingList.length > 0 ? matchingList : (matchingReq ? [matchingReq] : []);
+      const reqsToTry = specificRequestId ? (matchingReq ? [matchingReq] : []) : (matchingReq ? [matchingReq] : matchingList);
       if (matchingReq || reqsToTry.length > 0) {
         if (matchingReq) {
           if (matchingReq.state && !stateVal) setStackState(matchingReq.state);
@@ -668,7 +716,7 @@ export default function App() {
           if (matchingReq.end_date && !endVal) setStackEndDate(matchingReq.end_date.split('T')[0]);
         }
 
-        // Query candidate requests for tifs - merge across matching requests
+        // Query candidate requests for tifs
         const allTifsMap = new Map();
         for (const r of reqsToTry) {
           try {
@@ -750,6 +798,8 @@ export default function App() {
         if (!grouped[b]) grouped[b] = [];
         const filePath = item.path;
         const fileName = item.path ? item.path.split(/[\\/]/).pop() : (item.filename || `${b}.tif`);
+        const fnUp = fileName.toUpperCase();
+        const isCalibrated = Boolean(item.is_calibrated || fnUp.includes('CAL_TC_DB') || fnUp.includes('ORB_TNR') || fnUp.includes('_CAL_'));
 
         let tileVal = item.tile || '';
         if (!tileVal && item.path) {
@@ -757,37 +807,48 @@ export default function App() {
           if (tm) tileVal = tm[1];
         }
 
-        // Deduplicate scenes strictly by file path or unique (scene_id + tile). Never deduplicate by generic band filename like B04.tif!
-        const isDuplicate = grouped[b].some(existing => {
+        let sDate = item.sensing_date || '';
+        if (!sDate && fileName) {
+          const dm = fileName.match(/(\d{4})(\d{2})(\d{2})_(\d{4})(\d{2})(\d{2})/);
+          if (dm) sDate = `${dm[1]}-${dm[2]}-${dm[3]} to ${dm[4]}-${dm[5]}-${dm[6]}`;
+        }
+        const isComp = fileName.toLowerCase().includes('composite');
+
+        const sceneObj = {
+          scene_id: item.scene_id || (isComp ? 'Composite' : 'Scene'),
+          tile: tileVal,
+          sensing_date: sDate,
+          path: filePath,
+          filename: fileName,
+          size_bytes: item.size_bytes,
+          is_composite: isComp,
+          is_calibrated: isCalibrated
+        };
+
+        const existingIdx = grouped[b].findIndex(existing => {
           if (existing.path && filePath && existing.path.toLowerCase() === filePath.toLowerCase()) return true;
-          if (existing.scene_id && item.scene_id && existing.scene_id === item.scene_id && existing.tile === tileVal) return true;
+          if (existing.scene_id && item.scene_id && existing.scene_id === item.scene_id) return true;
           return false;
         });
 
-        if (!isDuplicate) {
-          let sDate = item.sensing_date || '';
-          if (!sDate && fileName) {
-            const dm = fileName.match(/(\d{4})(\d{2})(\d{2})_(\d{4})(\d{2})(\d{2})/);
-            if (dm) sDate = `${dm[1]}-${dm[2]}-${dm[3]} to ${dm[4]}-${dm[5]}-${dm[6]}`;
+        if (existingIdx >= 0) {
+          // If existing is uncalibrated raw but this one is calibrated, upgrade to calibrated GeoTIFF
+          if (!grouped[b][existingIdx].is_calibrated && isCalibrated) {
+            grouped[b][existingIdx] = sceneObj;
           }
-          const isComp = fileName.toLowerCase().includes('composite');
-          grouped[b].push({
-            scene_id: item.scene_id || (isComp ? 'Composite' : 'Scene'),
-            tile: tileVal,
-            sensing_date: sDate,
-            path: filePath,
-            filename: fileName,
-            size_bytes: item.size_bytes,
-            is_composite: isComp
-          });
+        } else {
+          grouped[b].push(sceneObj);
         }
       });
 
-      // Also try fetching composites for all matched requests
-      const candidateReqs = (typeof reqsToTry !== 'undefined' && reqsToTry.length > 0) ? reqsToTry : (matchingReq ? [matchingReq] : []);
-      for (const reqItem of candidateReqs) {
-        try {
-          const compRes = await axios.get(`${API_BASE}/requests/${reqItem.id}/composites`, { headers: getAuthHeader() });
+      // Also try fetching composites for matched requests (skip optical composites for pure Sentinel-1 requests)
+      const isPureS1 = matchingReq && matchingReq.satellite && matchingReq.satellite.toLowerCase().includes('sentinel-1') && !matchingReq.satellite.toLowerCase().includes('sentinel-2');
+      if (!isPureS1) {
+        const candidateReqs = (typeof reqsToTry !== 'undefined' && reqsToTry.length > 0) ? reqsToTry : (matchingReq ? [matchingReq] : []);
+        for (const reqItem of candidateReqs) {
+          if (reqItem.satellite && reqItem.satellite.toLowerCase().includes('sentinel-1') && !reqItem.satellite.toLowerCase().includes('sentinel-2')) continue;
+          try {
+            const compRes = await axios.get(`${API_BASE}/requests/${reqItem.id}/composites`, { headers: getAuthHeader() });
           const comps = compRes.data?.composites || compRes.data || [];
           comps.forEach(c => {
             let b = c.index;
@@ -833,6 +894,7 @@ export default function App() {
           // ignore
         }
       }
+    }
 
       setStackDownloadedBandsData(grouped);
 
@@ -840,11 +902,16 @@ export default function App() {
       const initialLayers = [];
       const initSelectedScenes = {};
 
+      const isS1Only = matchingReq && matchingReq.satellite && matchingReq.satellite.includes('Sentinel-1') && !matchingReq.satellite.includes('Sentinel-2');
+      const isS2Only = matchingReq && matchingReq.satellite && matchingReq.satellite.includes('Sentinel-2') && !matchingReq.satellite.includes('Sentinel-1');
+
       if (matchingReq) {
         const reqIndices = Array.isArray(matchingReq.indices) ? matchingReq.indices : (matchingReq.indices ? [matchingReq.indices] : []);
         reqIndices.forEach(idx => {
           let cleanIdx = idx.toUpperCase().trim();
           if (cleanIdx === 'VV/VH' || cleanIdx === 'VV-VH') cleanIdx = 'VV_VH';
+          if (isS1Only && !['VV', 'VH', 'VV_VH'].includes(cleanIdx)) return;
+          if (isS2Only && ['VV', 'VH', 'VV_VH'].includes(cleanIdx)) return;
           if (['NDVI', 'LSWI', 'VV_VH'].includes(cleanIdx) && !initialLayers.includes(cleanIdx)) {
             initialLayers.push(cleanIdx);
           }
@@ -856,16 +923,25 @@ export default function App() {
           if (cleanB === 'VV/VH' || cleanB === 'VV-VH') cleanB = 'VV_VH';
           if (cleanB === 'IW-VV' || cleanB.endsWith('-VV') || cleanB.endsWith('_VV') || (cleanB.includes('VV') && !cleanB.includes('VH'))) cleanB = 'VV';
           if (cleanB === 'IW-VH' || cleanB.endsWith('-VH') || cleanB.endsWith('_VH') || (cleanB.includes('VH') && !cleanB.includes('VV'))) cleanB = 'VH';
+          if (isS1Only && !['VV', 'VH', 'VV_VH'].includes(cleanB)) return;
+          if (isS2Only && ['VV', 'VH', 'VV_VH'].includes(cleanB)) return;
           if (!initialLayers.includes(cleanB)) initialLayers.push(cleanB);
         });
       }
 
-      // Auto-select available SAR bands (VV, VH) and optical indices/bands if present in grouped
-      if (grouped['VV'] && !initialLayers.includes('VV')) initialLayers.push('VV');
-      if (grouped['VH'] && !initialLayers.includes('VH')) initialLayers.push('VH');
-      if (grouped['NDVI'] && !initialLayers.includes('NDVI')) initialLayers.push('NDVI');
-      if (grouped['LSWI'] && !initialLayers.includes('LSWI')) initialLayers.push('LSWI');
-      if (grouped['VV_VH'] && !initialLayers.includes('VV_VH') && (matchingReq?.satellite?.includes('Sentinel-1') || matchingReq?.indices?.includes('VV/VH'))) initialLayers.push('VV_VH');
+      if (isS1Only) {
+        if (grouped['VV'] && grouped['VV'].length > 0 && !initialLayers.includes('VV')) initialLayers.push('VV');
+        if (grouped['VH'] && grouped['VH'].length > 0 && !initialLayers.includes('VH')) initialLayers.push('VH');
+        if (grouped['VV_VH'] && grouped['VV_VH'].length > 0 && !initialLayers.includes('VV_VH')) initialLayers.push('VV_VH');
+      } else if (isS2Only) {
+        if (grouped['NDVI'] && grouped['NDVI'].length > 0 && !initialLayers.includes('NDVI')) initialLayers.push('NDVI');
+        if (grouped['LSWI'] && grouped['LSWI'].length > 0 && !initialLayers.includes('LSWI')) initialLayers.push('LSWI');
+      } else {
+        if (grouped['VV'] && grouped['VV'].length > 0 && !initialLayers.includes('VV')) initialLayers.push('VV');
+        if (grouped['VH'] && grouped['VH'].length > 0 && !initialLayers.includes('VH')) initialLayers.push('VH');
+        if (grouped['NDVI'] && grouped['NDVI'].length > 0 && !initialLayers.includes('NDVI')) initialLayers.push('NDVI');
+        if (grouped['LSWI'] && grouped['LSWI'].length > 0 && !initialLayers.includes('LSWI')) initialLayers.push('LSWI');
+      }
 
       // Keep only layers that have actual scenes/rasters present in grouped
       let validLayers = initialLayers.filter(l => grouped[l] && grouped[l].length > 0);
@@ -1987,8 +2063,9 @@ export default function App() {
     // Step 4: Temporal Compositing & District Clipping (Runs only if compositeInterval !== 'none')
     const hasStep4 = Boolean(compositeInterval && compositeInterval !== 'none');
     let compositeWindows = 0;
+    const s1FortnightStep = (isS1 && !isS2) ? 12 : 15;
     if (compositeInterval === 'weekly') compositeWindows = Math.max(1, Math.ceil(days / 7));
-    else if (compositeInterval === 'fortnightly') compositeWindows = Math.max(1, Math.ceil(days / 15));
+    else if (compositeInterval === 'fortnightly') compositeWindows = Math.max(1, Math.ceil(days / s1FortnightStep));
     else if (compositeInterval === 'monthly') compositeWindows = Math.max(1, Math.ceil(days / 30));
 
     const levelFactor = level === 'mean' ? 1.25 : 1.0;
@@ -2333,7 +2410,10 @@ export default function App() {
     let activeLogs = rawLogs || '';
     if (activeLogs.includes('--- USER TRIGGERED RE-RUN')) {
       const parts = activeLogs.split(/--- USER TRIGGERED RE-RUN[^-\n]*---/);
-      activeLogs = parts[parts.length - 1];
+      const latestRunLogs = parts[parts.length - 1];
+      if (latestRunLogs && latestRunLogs.trim().length > 30) {
+        activeLogs = latestRunLogs;
+      }
     } else if (activeLogs) {
       const execHeaders = activeLogs.split(/={40,}\r?\n\s*SDAP PIPELINE EXECUTION/);
       if (execHeaders.length > 1) {
@@ -2448,13 +2528,15 @@ export default function App() {
 
         // 6. Parse Processing Scene lines: e.g. [1/51 - 1%] Processing 'S2B_43PHS_20260502_0_L2A'
         // or Processing time-step 1/20 (S1_20240601T001631_VH)
-        const procM = line.match(/(?:\[(\d+\/\d+)\s*-\s*(\d+%)\]\s*)?Processing\s+['"]?(S[12][A-C]_[0-9A-Za-z_]+)['"]?/i)
-          || line.match(/Processing\s+time-step\s+(\d+\/\d+)\s*\((S1_[0-9A-Za-z_]+)\)/i);
+        const procM = line.match(/(?:\[(\d+\/\d+)(?:\s*-\s*\d+%)?\]\s*)?Processing\s+(?:Sentinel-1\s+Scene:\s*)?['"]?(S[12][A-C0-9]_[0-9A-Za-z_]+)['"]?/i)
+          || line.match(/Processing\s+time-step\s+(\d+\/\d+)\s*\((S1_[0-9A-Za-z_]+)\)/i)
+          || line.match(/(?:Already processed at|Processing Sentinel-1 Scene:?)\s*['"]?(?:.*[\\/])?(S1[A-C0-9]_[0-9A-Za-z_]+)['"]?/i);
 
         if (procM) {
-          const folderName = procM[3] || procM[2];
-          currentActiveFolder = folderName;
-          const parts = folderName.split('_');
+          const folderName = [procM[3], procM[2], procM[1]].find(g => g && (g.startsWith('S1') || g.startsWith('S2'))) || procM[2] || procM[1];
+          if (folderName) {
+            currentActiveFolder = folderName;
+            const parts = folderName.split('_');
           const sat = parts[0] || (folderName.startsWith('S1') ? 'S1A' : 'S2');
           const isS1 = sat.startsWith('S1');
           let tile = isS1 ? 'S1_SAR' : (parts[1] || '—');
@@ -2503,6 +2585,7 @@ export default function App() {
             if (procM[2]) scenesMap[folderName].progressPct = procM[2];
           }
         }
+      }
 
         // 7. Parse Band download progress lines in real time:
         // Examples:
@@ -2626,6 +2709,51 @@ export default function App() {
           if (tSc && scenesMap[tSc]) {
             if (line.includes('NDVI.tif') && !scenesMap[tSc].bands.includes('NDVI')) scenesMap[tSc].bands.push('NDVI');
             if (line.includes('LSWI.tif') && !scenesMap[tSc].bands.includes('LSWI')) scenesMap[tSc].bands.push('LSWI');
+          }
+        }
+
+        // Sentinel-1 SAR Sequential Calibration Steps & Deliverables
+        const s1StepM = line.match(/\[STEP\s*(\d)\/5:\s*([^\]]+)\]/i);
+        if (s1StepM) {
+          const tSc = currentActiveFolder;
+          if (tSc && scenesMap[tSc]) {
+            scenesMap[tSc].s1CurrentStep = parseInt(s1StepM[1]);
+            scenesMap[tSc].s1StepDesc = s1StepM[2].trim();
+            scenesMap[tSc].hasSarCalibrated = true;
+          }
+        }
+
+        if (/VV_Orb_tnr_cal_Tc_db/i.test(line) || /Calibrated VV/i.test(line)) {
+          const tSc = currentActiveFolder;
+          if (tSc && scenesMap[tSc]) {
+            if (!scenesMap[tSc].bands.includes('VV_Orb_tnr_cal_Tc_db')) scenesMap[tSc].bands.push('VV_Orb_tnr_cal_Tc_db');
+            scenesMap[tSc].hasSarCalibrated = true;
+          }
+        }
+        if (/VH_Orb_tnr_cal_Tc_db/i.test(line) || /Calibrated VH/i.test(line)) {
+          const tSc = currentActiveFolder;
+          if (tSc && scenesMap[tSc]) {
+            if (!scenesMap[tSc].bands.includes('VH_Orb_tnr_cal_Tc_db')) scenesMap[tSc].bands.push('VH_Orb_tnr_cal_Tc_db');
+            scenesMap[tSc].hasSarCalibrated = true;
+          }
+        }
+        if (/VV_VH_Orb_tnr_cal_Tc_db/i.test(line) || /polarimetric decibel ratio/i.test(line) || /Saved GeoTIFF:.*VV_VH/i.test(line)) {
+          const tSc = currentActiveFolder;
+          if (tSc && scenesMap[tSc]) {
+            if (!scenesMap[tSc].bands.includes('VV_VH_Orb_tnr_cal_Tc_db')) scenesMap[tSc].bands.push('VV_VH_Orb_tnr_cal_Tc_db');
+            if (!scenesMap[tSc].bands.includes('VV_VH')) scenesMap[tSc].bands.push('VV_VH');
+            scenesMap[tSc].hasSarCalibrated = true;
+          }
+        }
+        if (/\[SAR CACHED\]/i.test(line) || /deliverables archived successfully/i.test(line) || /SENTINEL-1 SAR CALIBRATION/i.test(line)) {
+          const tSc = currentActiveFolder;
+          if (tSc && scenesMap[tSc]) {
+            scenesMap[tSc].hasSarCalibrated = true;
+            scenesMap[tSc].status = 'COMPLETE';
+            if (!scenesMap[tSc].bands.includes('VV_Orb_tnr_cal_Tc_db')) scenesMap[tSc].bands.push('VV_Orb_tnr_cal_Tc_db');
+            if (!scenesMap[tSc].bands.includes('VH_Orb_tnr_cal_Tc_db')) scenesMap[tSc].bands.push('VH_Orb_tnr_cal_Tc_db');
+            if (!scenesMap[tSc].bands.includes('VV_VH_Orb_tnr_cal_Tc_db')) scenesMap[tSc].bands.push('VV_VH_Orb_tnr_cal_Tc_db');
+            if (!scenesMap[tSc].bands.includes('VV_VH')) scenesMap[tSc].bands.push('VV_VH');
           }
         }
 
@@ -3023,6 +3151,7 @@ export default function App() {
   const lightKpiLabelStyle = { fontSize: '0.74rem', fontWeight: 600, color: '#64748b', marginBottom: '0.2rem' };
 
   const renderLogTableView = (rawLogs, selectedReq, verifiedTifs = [], backendComposites = []) => {
+    try {
     const {
       scenes,
       totalScenes,
@@ -3098,10 +3227,21 @@ export default function App() {
       return ['B02', 'B03', 'B04', 'B08', 'B8A', 'B11', 'SCL', 'TCI'];
     };
 
-    // Step 2: Strictly raw spectral bands ONLY (no NDVI, no LSWI)
+    // Step 2: Strictly raw spectral bands ONLY (no NDVI, no LSWI, no SAR calibrated dB products)
     const getRawBandsForScene = (sc) => {
       const isS1 = sc.satellite?.startsWith('S1') || sc.folder?.startsWith('S1') || sc.tile === 'S1_SAR';
-      const defaultRaw = isS1 ? ['VV', 'VH'] : ['B02', 'B03', 'B04', 'B08', 'B8A', 'B11', 'SCL', 'TCI'];
+      if (isS1) {
+        const rawS1 = [];
+        const rawVerified = (sc.bands || []).filter(b => {
+          const u = b.toUpperCase();
+          return !u.includes('ORB') && !u.includes('DB') && !u.includes('RATIO') && !['NDVI', 'LSWI', 'VV_VH'].includes(u);
+        });
+        if (rawVerified.includes('manifest.safe') || sc.hasManifest) rawS1.push('manifest.safe');
+        if (rawVerified.includes('VV') || sc.status === 'COMPLETE' || rawVerified.length > 0) rawS1.push('VV');
+        if (rawVerified.includes('VH') || sc.status === 'COMPLETE' || rawVerified.length > 0) rawS1.push('VH');
+        return rawS1.length > 0 ? rawS1 : ['VV', 'VH'];
+      }
+      const defaultRaw = ['B02', 'B03', 'B04', 'B08', 'B8A', 'B11', 'SCL', 'TCI'];
       const rawVerified = (sc.bands || []).filter(b => !['NDVI', 'LSWI'].includes(b));
       if (rawVerified.length > 0) {
         return sortBands(rawVerified);
@@ -3112,10 +3252,16 @@ export default function App() {
       return [];
     };
 
-    // Step 3: Strictly surface reflectance indices ONLY (NDVI, LSWI)
+    // Step 3: Strictly surface reflectance indices ONLY (NDVI, LSWI) or SAR Calibrated Products (VV_dB, VH_dB, VV_VH)
     const getIndicesBandsForScene = (sc) => {
       const isS1 = sc.satellite?.startsWith('S1') || sc.folder?.startsWith('S1') || sc.tile === 'S1_SAR';
       if (isS1) {
+        const defaultSarBands = ['VV_Orb_tnr_cal_Tc_db.tiff', 'VH_Orb_tnr_cal_Tc_db.tiff', 'VV_VH_Orb_tnr_cal_Tc_db.tiff'];
+        const bList = (sc.bands || []).map(b => b.toUpperCase());
+        const hasSarProducts = sc.hasSarCalibrated || bList.some(b => b.includes('ORB') || b.includes('DB') || b.includes('VV_VH'));
+        if (hasSarProducts || sc.status === 'COMPLETE' || selectedReq?.status === 'COMPLETED') {
+          return defaultSarBands;
+        }
         return [];
       }
       const defaultIndices = ['NDVI', 'LSWI'];
@@ -3209,12 +3355,16 @@ export default function App() {
           const fmtD = (d) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
           const fmtCompact = (d) => `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}`;
 
+          const isS1ReqOnly = Boolean(selectedReq?.satellite?.includes('Sentinel-1') && !selectedReq?.satellite?.includes('Sentinel-2'));
+          const fortnightSpan = isS1ReqOnly ? 11 : 14; // 12-day window for Sentinel-1; 15-day for Sentinel-2
+          const fortnightStep = isS1ReqOnly ? 12 : 15;
+
           while (curr <= eDate) {
             let next;
             let windowLabel = `Week ${windowIdx}`;
             if (interval === 'fortnightly' || interval === 'biweekly') {
               next = new Date(curr);
-              next.setDate(next.getDate() + 14); // 15-day discrete window
+              next.setDate(next.getDate() + fortnightSpan);
               windowLabel = `Fortnight ${windowIdx}`;
             } else if (interval === 'monthly') {
               // Full calendar month
@@ -3319,7 +3469,7 @@ export default function App() {
 
             windowIdx++;
             if (interval === 'fortnightly' || interval === 'biweekly') {
-              curr.setDate(curr.getDate() + 15);
+              curr.setDate(curr.getDate() + fortnightStep);
             } else if (interval === 'monthly') {
               curr = new Date(curr.getFullYear(), curr.getMonth() + 1, 1);
             } else if (interval === 'none') {
@@ -3689,11 +3839,99 @@ export default function App() {
       );
     };
 
-    // Step 3 Scene Row (Strictly Indices Only: NDVI, LSWI, VV_VH)
+    // Step 3 Scene Row (Strictly Indices Only: NDVI, LSWI or SAR Calibrated deliverables)
     const renderStep3SceneRow = (sc, idx) => {
-      const isComplete = sc.status === 'COMPLETE';
+      const isS1 = sc.satellite?.startsWith('S1') || sc.folder?.startsWith('S1') || sc.tile === 'S1_SAR';
+      const isComplete = sc.status === 'COMPLETE' || sc.hasSarCalibrated || selectedReq?.status === 'COMPLETED';
       const indicesBands = getIndicesBandsForScene(sc);
       const rowBg = idx % 2 === 0 ? '#ffffff' : '#fcfdfd';
+
+      if (isS1) {
+        return (
+          <tr key={`step3_${sc.folder}_${idx}`} style={{ borderBottom: '1px solid #f1f5f9', backgroundColor: rowBg }}>
+            <td style={{ padding: '0.65rem 1rem', color: '#1e293b', fontFamily: 'monospace', fontWeight: 600, whiteSpace: 'nowrap' }}>
+              {sc.date}
+            </td>
+            <td style={{ padding: '0.65rem 1rem', color: '#2563eb', fontWeight: 700, fontFamily: 'monospace' }}>
+              {sc.tile}
+            </td>
+            <td style={{ padding: '0.65rem 1rem', color: '#475569', fontWeight: 600 }}>
+              {sc.satellite}
+            </td>
+            <td style={{ padding: '0.65rem 1rem' }}>
+              <div style={{ color: '#0f172a', fontFamily: 'monospace', fontSize: '0.76rem', fontWeight: 700 }}>
+                {cleanFolderName(sc.folder)}
+              </div>
+              <div style={{ marginTop: '0.35rem', display: 'flex', flexWrap: 'wrap', gap: '0.25rem', alignItems: 'center' }}>
+                <span style={{ fontSize: '0.65rem', fontWeight: 700, padding: '0.1rem 0.35rem', borderRadius: '0.2rem', backgroundColor: '#eff6ff', color: '#1d4ed8', border: '1px solid #bfdbfe' }}>
+                  ✓ 1. Orbit .EOF
+                </span>
+                <span style={{ fontSize: '0.65rem', fontWeight: 700, padding: '0.1rem 0.35rem', borderRadius: '0.2rem', backgroundColor: '#eff6ff', color: '#1d4ed8', border: '1px solid #bfdbfe' }}>
+                  ✓ 2. Thermal Noise
+                </span>
+                <span style={{ fontSize: '0.65rem', fontWeight: 700, padding: '0.1rem 0.35rem', borderRadius: '0.2rem', backgroundColor: '#eff6ff', color: '#1d4ed8', border: '1px solid #bfdbfe' }}>
+                  ✓ 3. Sigma0 Cal
+                </span>
+                <span style={{ fontSize: '0.65rem', fontWeight: 700, padding: '0.1rem 0.35rem', borderRadius: '0.2rem', backgroundColor: '#eff6ff', color: '#1d4ed8', border: '1px solid #bfdbfe' }}>
+                  ✓ 4. Terrain Cor. (SRTM)
+                </span>
+                <span style={{ fontSize: '0.65rem', fontWeight: 700, padding: '0.1rem 0.35rem', borderRadius: '0.2rem', backgroundColor: '#eff6ff', color: '#1d4ed8', border: '1px solid #bfdbfe' }}>
+                  ✓ 5. dB Ratio
+                </span>
+              </div>
+              <div style={{ fontSize: '0.67rem', color: '#64748b', marginTop: '0.2rem', fontStyle: 'italic' }}>
+                Intermediate BEAM-DIMAP (.dim / .data) archived in /orb/ folder
+              </div>
+            </td>
+            <td style={{ padding: '0.65rem 1rem' }}>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '0.2rem', alignItems: 'flex-start' }}>
+                <span style={{
+                  padding: '0.18rem 0.5rem',
+                  borderRadius: '0.25rem',
+                  fontSize: '0.71rem',
+                  fontWeight: 700,
+                  backgroundColor: isComplete ? '#ecfdf5' : '#eff6ff',
+                  color: isComplete ? '#047857' : '#1d4ed8',
+                  border: isComplete ? '1px solid #a7f3d0' : '1px solid #bfdbfe',
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  gap: '0.3rem'
+                }}>
+                  {!isComplete && <RefreshCw size={9} className="animate-spin" />}
+                  {isComplete ? 'CALIBRATED' : 'PROCESSING'}
+                </span>
+                <div style={{ fontSize: '0.67rem', color: isComplete ? '#16a34a' : '#2563eb', fontWeight: 600 }}>
+                  {isComplete ? '3 SAR products verified' : 'Running SNAP pipeline...'}
+                </div>
+              </div>
+            </td>
+            <td style={{ padding: '0.65rem 1rem' }}>
+              <div style={{ display: 'flex', gap: '0.35rem', flexWrap: 'wrap', alignItems: 'center' }}>
+                {indicesBands.map((bName, bIdx) => (
+                  <span key={bIdx} style={{
+                    padding: '0.16rem 0.5rem',
+                    borderRadius: '0.25rem',
+                    fontSize: '0.71rem',
+                    fontWeight: 700,
+                    fontFamily: 'monospace',
+                    backgroundColor: '#ecfdf5',
+                    border: '1px solid #a7f3d0',
+                    color: '#047857',
+                    display: 'inline-flex',
+                    alignItems: 'center',
+                    gap: '0.25rem'
+                  }}>
+                    <CheckCircle size={10} color="#047857" /> {bName}
+                  </span>
+                ))}
+                {indicesBands.length === 0 && (
+                  <span style={{ color: '#94a3b8', fontSize: '0.73rem' }}>Awaiting SAR calibration...</span>
+                )}
+              </div>
+            </td>
+          </tr>
+        );
+      }
 
       return (
         <tr key={`step3_${sc.folder}_${idx}`} style={{ borderBottom: '1px solid #f1f5f9', backgroundColor: rowBg }}>
@@ -4161,27 +4399,49 @@ export default function App() {
 
     const isPureS1Req = (selectedReq?.satellite || '').includes('Sentinel-1') && !(selectedReq?.satellite || '').includes('Sentinel-2');
 
-    const hasReachedStep3 = !isPureS1Req && Boolean(
+    const hasReachedStep3 = Boolean(
       hasReachedStep2 && (
-        (rawLogs && (
-          /STAGE\s*3/i.test(rawLogs) ||
-          /STEP\s*3/i.test(rawLogs) ||
-          /CLOUD MASKING/i.test(rawLogs) ||
-          /INDICES COMPUTED/i.test(rawLogs) ||
-          /INDICES VERIFIED/i.test(rawLogs) ||
-          /NDVI\.tif/i.test(rawLogs) ||
-          /LSWI\.tif/i.test(rawLogs)
-        )) ||
-        displayScenes.some(s => (s.bands || []).some(b => ['NDVI', 'LSWI', 'EVI', 'NDWI'].includes(b))) ||
-        (selectedReq?.status === 'COMPLETED' && !isPureS1Req)
+        isPureS1Req
+          ? (
+              (rawLogs && (
+                /SENTINEL-1 SAR CALIBRATION/i.test(rawLogs) ||
+                /SNAP/i.test(rawLogs) ||
+                /APPLY ORBIT FILE/i.test(rawLogs) ||
+                /THERMAL NOISE REMOVAL/i.test(rawLogs) ||
+                /RADIOMETRIC CALIBRATION/i.test(rawLogs) ||
+                /TERRAIN CORRECTION/i.test(rawLogs) ||
+                /DECIBEL CONVERSION/i.test(rawLogs) ||
+                /_Orb/i.test(rawLogs) ||
+                /VV_Orb_tnr_cal_Tc_db/i.test(rawLogs) ||
+                /VH_Orb_tnr_cal_Tc_db/i.test(rawLogs) ||
+                /SAR CACHED/i.test(rawLogs) ||
+                /Calibrated VV/i.test(rawLogs)
+              )) ||
+              displayScenes.some(s => s.hasSarCalibrated || (s.bands || []).some(b => b.includes('Orb') || b.includes('VV_VH') || b.includes('_db'))) ||
+              (selectedReq?.status === 'COMPLETED')
+            )
+          : (
+              (rawLogs && (
+                /STAGE\s*3/i.test(rawLogs) ||
+                /STEP\s*3/i.test(rawLogs) ||
+                /CLOUD MASKING/i.test(rawLogs) ||
+                /INDICES COMPUTED/i.test(rawLogs) ||
+                /INDICES VERIFIED/i.test(rawLogs) ||
+                /NDVI\.tif/i.test(rawLogs) ||
+                /LSWI\.tif/i.test(rawLogs)
+              )) ||
+              displayScenes.some(s => (s.bands || []).some(b => ['NDVI', 'LSWI', 'EVI', 'NDWI'].includes(b))) ||
+              (selectedReq?.status === 'COMPLETED')
+            )
       )
     );
 
     const hasReachedStep4 = Boolean(
-      hasCompositeInterval && (hasReachedStep3 || isPureS1Req) && (
+      hasCompositeInterval && (hasReachedStep3 || hasReachedStep2) && (
         (rawLogs && (
           /TEMPORAL COMPOSITING/i.test(rawLogs) ||
-          /DELIVERY_CLIP/i.test(rawLogs)
+          /DELIVERY_CLIP/i.test(rawLogs) ||
+          /Composite_/i.test(rawLogs)
         )) ||
         (backendComposites && backendComposites.length > 0) ||
         (selectedReq?.status === 'COMPLETED')
@@ -4194,14 +4454,16 @@ export default function App() {
       { id: 'step1', label: `Step-1: Discovery & Gap Check (${displayScenes.length})` },
     ];
     if (hasReachedStep2) {
-      stepTabs.push({ id: 'step2', label: `Step-2: Band Acquisition (${displayScenes.length})` });
+      stepTabs.push({ id: 'step2', label: isPureS1Req ? `Step-2: Raw SAR Acquisition (${displayScenes.length})` : `Step-2: Band Acquisition (${displayScenes.length})` });
     }
     if (hasReachedStep3) {
-      stepTabs.push({ id: 'step3', label: `Step-3: Indices & Masking (${displayScenes.length})` });
+      const step3Label = isPureS1Req
+        ? `Step-3: SAR Calibration & Ratio (${displayScenes.length})`
+        : `Step-3: Indices & Masking (${displayScenes.length})`;
+      stepTabs.push({ id: 'step3', label: step3Label });
     }
     if (hasReachedStep4) {
-      const compStepLabel = isPureS1Req ? `Step-3: ${intervalLabel} Composites (${step4Rows.length} windows)` : `Step-4: ${intervalLabel} Composites (${step4Rows.length} windows)`;
-      stepTabs.push({ id: 'step4', label: compStepLabel });
+      stepTabs.push({ id: 'step4', label: `Step-4: ${intervalLabel} Composites (${step4Rows.length} windows)` });
     }
     if (['COMPLETED', 'HELD', 'SUCCESS'].includes(selectedReq?.status) || (selectedReq?.stacking_count && selectedReq.stacking_count > 0)) {
       const stackCount = selectedReq?.stacking_count || (selectedReq?.stacked_files || []).length || 0;
@@ -4433,9 +4695,37 @@ export default function App() {
             <tbody>
               {displayScenes.length === 0 ? (
                 <tr>
-                  <td colSpan={6} style={{ padding: '3rem 1rem', textAlign: 'center', color: '#64748b', backgroundColor: '#ffffff' }}>
-                    <RefreshCw size={22} className="animate-spin" style={{ margin: '0 auto 0.5rem auto', color: '#2563eb' }} />
-                    <div>Synchronizing acquisition stream... Connecting to NAS &amp; AWS S3...</div>
+                  <td colSpan={6} style={{ padding: '1.5rem 1rem', textAlign: 'center', color: '#64748b', backgroundColor: '#ffffff' }}>
+                    {selectedReq?.execution_logs && selectedReq.execution_logs.trim().length > 0 ? (
+                      <div style={{ textAlign: 'left', maxWidth: '100%', margin: '0 auto' }}>
+                        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '0.65rem', paddingBottom: '0.45rem', borderBottom: '1px solid #e2e8f0' }}>
+                          <span style={{ fontSize: '0.78rem', fontWeight: 700, color: '#1e293b', display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
+                            <Terminal size={14} color="#2563eb" /> Live Pipeline Execution Output
+                          </span>
+                          <span style={{ fontSize: '0.72rem', color: '#64748b' }}>Real-time execution log recorder</span>
+                        </div>
+                        <div className="log-terminal" style={{
+                          backgroundColor: '#0f172a',
+                          color: '#f8fafc',
+                          padding: '0.85rem 1.1rem',
+                          borderRadius: '0.375rem',
+                          fontFamily: 'monospace',
+                          fontSize: '0.74rem',
+                          maxHeight: '380px',
+                          overflowY: 'auto',
+                          whiteSpace: 'pre-wrap',
+                          wordBreak: 'break-word',
+                          lineHeight: '1.55'
+                        }}>
+                          {renderLogContent(selectedReq.execution_logs)}
+                        </div>
+                      </div>
+                    ) : (
+                      <>
+                        <RefreshCw size={22} className="animate-spin" style={{ margin: '0 auto 0.5rem auto', color: '#2563eb' }} />
+                        <div>Synchronizing acquisition stream... Connecting to NAS &amp; AWS S3...</div>
+                      </>
+                    )}
                   </td>
                 </tr>
               ) : (
@@ -4458,24 +4748,30 @@ export default function App() {
                     <>
                       {renderStepHeader(
                         2,
-                        'Raw Band Acquisition & NAS Download',
+                        isPureS1Req ? 'Raw Band Acquisition & SAFE Download' : 'Raw Band Acquisition & NAS Download',
                         isPureS1Req
-                          ? 'Downloading SAR polarizations (VV, VH) to local NAS storage'
+                          ? 'Downloading raw SAR polarizations (VV, VH) & SAFE manifest to local NAS storage'
                           : 'Downloading spectral bands (B02-B11, SCL, TCI) to local NAS storage',
-                        `✓ STEP-2 · ALL BANDS VERIFIED`
+                        isPureS1Req ? `✓ STEP-2 · SAFE ARCHIVE VERIFIED` : `✓ STEP-2 · ALL BANDS VERIFIED`
                       )}
                       {displayScenes.map((sc, idx) => renderStep2SceneRow(sc, idx))}
                     </>
                   )}
 
-                  {/* STEP 3: Masking & Surface Reflectance Indices Calculation (Optical Sentinel-2 Only) */}
+                  {/* STEP 3: SAR Calibration & Terrain Correction (S1) or Indices & Masking (S2) */}
                   {hasReachedStep3 && (activeStepFilter === 'all' || activeStepFilter === 'step3') && (
                     <>
                       {renderStepHeader(
                         3,
-                        'Masking & Surface Reflectance Indices Calculation',
-                        'SCL cloud masking evaluated · Computing NDVI, LSWI',
-                        `✓ STEP-3 · INDICES COMPUTED`
+                        isPureS1Req
+                          ? 'Sentinel-1 SAR Calibration, Terrain Correction & Polarimetric Ratio'
+                          : 'Masking & Surface Reflectance Indices Calculation',
+                        isPureS1Req
+                          ? 'ESA SNAP Pipeline: Apply-Orbit-File (.EOF) · Thermal Noise Removal · Sigma0 Radiometric Calibration · Range-Doppler Terrain Correction (SRTM DEM) · Decibel Conversion & Dual-Pol Ratio (VV_dB - VH_dB)'
+                          : 'SCL cloud masking evaluated · Computing NDVI, LSWI surface reflectance indices',
+                        isPureS1Req
+                          ? `✓ STEP-3 · SAR CALIBRATION COMPLETE`
+                          : `✓ STEP-3 · INDICES COMPUTED`
                       )}
                       {displayScenes.map((sc, idx) => renderStep3SceneRow(sc, idx))}
                     </>
@@ -4497,16 +4793,22 @@ export default function App() {
                   {/* STEP 5: Multi-Band Layer Stacking Studio Deliverables */}
                   {((['COMPLETED', 'HELD', 'SUCCESS'].includes(selectedReq?.status) || (selectedReq?.stacking_count && selectedReq.stacking_count > 0)) && (activeStepFilter === 'all' || activeStepFilter === 'step5')) && (
                     <>
-                      {renderStepHeader(
-                        5,
-                        'Multi-Band Layer Stacking Deliverables (Studio)',
-                        (selectedReq?.stacking_count || (selectedReq?.stacked_files || []).length || 0) > 0
-                          ? `Total ${selectedReq.stacking_count || selectedReq.stacked_files.length} layer stack(s) completed (${selectedReq.stacking_count || selectedReq.stacked_files.length} times done) · Archived on NAS`
-                          : 'Pipeline steps 1 to 4 completed successfully · Layer stacking has not been performed yet',
-                        (selectedReq?.stacking_count || (selectedReq?.stacked_files || []).length || 0) > 0
-                          ? `✓ STEP-5 · ${selectedReq.stacking_count || selectedReq.stacked_files.length} STACK${(selectedReq.stacking_count || selectedReq.stacked_files.length) > 1 ? 'S' : ''} DONE`
-                          : `⚠️ STEP-5 · NOT STACKED YET (0)`
-                      )}
+                      {(() => {
+                        const sCount = typeof selectedReq?.stacking_count === 'number'
+                          ? selectedReq.stacking_count
+                          : ((selectedReq?.stacked_files && selectedReq.stacked_files.length) || 0);
+
+                        return renderStepHeader(
+                          5,
+                          'Multi-Band Layer Stacking Deliverables (Studio)',
+                          sCount > 0
+                            ? `Total ${sCount} layer stack(s) completed (${sCount} ${sCount === 1 ? 'time done' : 'times done'}) · Archived on NAS`
+                            : 'Pipeline steps 1 to 4 completed successfully · Layer stacking has not been performed yet',
+                          sCount > 0
+                            ? `✓ STEP-5 · ${sCount} STACK${sCount > 1 ? 'S' : ''} DONE`
+                            : `⚠️ STEP-5 · NOT STACKED YET (0)`
+                        );
+                      })()}
 
                       {(selectedReq?.stacked_files && selectedReq.stacked_files.length > 0) ? (
                         selectedReq.stacked_files.map((sf, sidx) => (
@@ -4667,6 +4969,19 @@ export default function App() {
 
       </div>
     );
+    } catch (tblErr) {
+      console.error('Error rendering log table view:', tblErr);
+      return (
+        <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: '0.75rem', padding: '0.5rem' }}>
+          <div style={{ fontSize: '0.82rem', fontWeight: 700, color: '#1e293b', display: 'flex', alignItems: 'center', gap: '0.45rem' }}>
+            <Terminal size={14} color="#2563eb" /> Live Pipeline Execution Console
+          </div>
+          <div className="log-terminal" style={{ flex: 1, minHeight: '380px', maxHeight: '600px', backgroundColor: '#f8fafc', border: '1px solid #e2e8f0', color: '#0f172a', padding: '1rem 1.25rem', overflowY: 'auto' }}>
+            {renderLogContent(rawLogs || selectedReq?.execution_logs)}
+          </div>
+        </div>
+      );
+    }
   };
 
 
@@ -5552,8 +5867,8 @@ export default function App() {
                           <td style={{ padding: '0.85rem 1rem', color: '#64748b', fontSize: '0.78rem' }}>
                             {new Date(req.created_at).toLocaleString()}
                           </td>
-                          <td style={{ padding: '0.85rem 1rem', textAlign: 'right' }} onClick={(e) => e.stopPropagation()}>
-                            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'flex-end', gap: '0.5rem' }}>
+                          <td style={{ padding: '0.85rem 1rem', textAlign: 'right', whiteSpace: 'nowrap' }} onClick={(e) => e.stopPropagation()}>
+                            <div style={{ display: 'inline-flex', alignItems: 'center', justifyContent: 'flex-end', gap: '0.5rem', flexWrap: 'nowrap' }}>
                               <button
                                 onClick={() => openLogsModal(req)}
                                 style={{
@@ -5567,6 +5882,7 @@ export default function App() {
                                   fontSize: '0.75rem',
                                   fontWeight: 600,
                                   color: '#334155',
+                                  whiteSpace: 'nowrap',
                                   cursor: 'pointer'
                                 }}
                               >
@@ -5575,50 +5891,69 @@ export default function App() {
 
                               {['COMPLETED', 'HELD', 'SUCCESS'].includes(req.status) && (
                                 <>
-                                  {(req.stacking_count > 0 || (req.stacked_files && req.stacked_files.length > 0)) ? (
-                                    <button
-                                      onClick={(e) => {
-                                        e.stopPropagation();
-                                        setStackFilesModalReq(req);
-                                      }}
-                                      style={{
-                                        display: 'inline-flex',
-                                        alignItems: 'center',
-                                        gap: '0.25rem',
-                                        padding: '0.3rem 0.55rem',
-                                        borderRadius: '9999px',
-                                        border: '1px solid #86efac',
-                                        backgroundColor: '#f0fdf4',
-                                        fontSize: '0.72rem',
-                                        fontWeight: 700,
-                                        color: '#166534',
-                                        cursor: 'pointer',
-                                        transition: 'all 0.15s ease'
-                                      }}
-                                      title={`Click to view ${req.stacking_count || req.stacked_files.length} stacked GeoTIFF file(s)`}
-                                    >
-                                      <CheckCircle size={11} color="#16a34a" />
-                                      {req.stacking_count || req.stacked_files.length} {(req.stacking_count || req.stacked_files.length) === 1 ? 'time done' : 'times done'}
-                                    </button>
-                                  ) : (
-                                    <span
-                                      style={{
-                                        display: 'inline-flex',
-                                        alignItems: 'center',
-                                        gap: '0.25rem',
-                                        padding: '0.3rem 0.55rem',
-                                        borderRadius: '9999px',
-                                        border: '1px solid #fed7aa',
-                                        backgroundColor: '#fff7ed',
-                                        fontSize: '0.72rem',
-                                        fontWeight: 700,
-                                        color: '#c2410c'
-                                      }}
-                                      title="Pipeline steps 1 to 4 completed, but layer stacking has not been performed yet"
-                                    >
-                                      Stacking: Not Done
-                                    </span>
-                                  )}
+                                  {(() => {
+                                    const stackCount = typeof req.stacking_count === 'number'
+                                      ? req.stacking_count
+                                      : ((req.stacked_files && req.stacked_files.length) || 0);
+
+                                    return stackCount > 0 ? (
+                                      <button
+                                        onClick={(e) => {
+                                          e.stopPropagation();
+                                          setStackFilesModalReq(req);
+                                        }}
+                                        style={{
+                                          display: 'inline-flex',
+                                          alignItems: 'center',
+                                          justifyContent: 'center',
+                                          gap: '0.32rem',
+                                          padding: '0.32rem 0.65rem',
+                                          borderRadius: '9999px',
+                                          border: '1px solid #86efac',
+                                          backgroundColor: '#f0fdf4',
+                                          fontSize: '0.72rem',
+                                          fontWeight: 700,
+                                          color: '#166534',
+                                          whiteSpace: 'nowrap',
+                                          lineHeight: 1,
+                                          cursor: 'pointer',
+                                          boxShadow: '0 1px 2px rgba(22, 101, 52, 0.05)',
+                                          transition: 'all 0.15s ease'
+                                        }}
+                                        title={`Click to view ${stackCount} stacked GeoTIFF file(s)`}
+                                      >
+                                        <CheckCircle size={11} color="#16a34a" style={{ flexShrink: 0 }} />
+                                        <span>{stackCount} {stackCount === 1 ? 'time done' : 'times done'}</span>
+                                      </button>
+                                    ) : (
+                                      <span
+                                        style={{
+                                          display: 'inline-flex',
+                                          alignItems: 'center',
+                                          justifyContent: 'center',
+                                          gap: '0.35rem',
+                                          padding: '0.25rem 0.7rem',
+                                          borderRadius: '9999px',
+                                          border: '1px solid #fed7aa',
+                                          backgroundColor: '#fff7ed',
+                                          fontSize: '0.72rem',
+                                          fontWeight: 700,
+                                          color: '#c2410c',
+                                          whiteSpace: 'nowrap',
+                                          flexShrink: 0,
+                                          minWidth: 'max-content',
+                                          textAlign: 'center',
+                                          lineHeight: 1.2,
+                                          boxShadow: '0 1px 2px rgba(194, 65, 12, 0.05)',
+                                          userSelect: 'none'
+                                        }}
+                                        title="Pipeline steps 1 to 4 completed, but layer stacking has not been performed yet for this request"
+                                      >
+                                        <Layers size={11} color="#ea580c" style={{ flexShrink: 0 }} />
+                                        <span style={{ whiteSpace: 'nowrap' }}>Stacking: Not Done</span>
+                                      </span>
+                                    );
+                                  })()}
 
                                   <button
                                     onClick={() => {
@@ -6003,12 +6338,14 @@ export default function App() {
                 {/* Composite Interval + Level Row */}
                 <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: '1rem' }}>
                   <div>
-                    <label style={{ display: 'block', fontSize: '0.8rem', fontWeight: 600, color: '#334155', marginBottom: '0.35rem' }}>Composite Interval</label>
+                    <label style={{ display: 'block', fontSize: '0.8rem', fontWeight: 600, color: '#334155', marginBottom: '0.35rem' }}>
+                      Composite Interval {isOnlyS1 && <span style={{ fontSize: '0.72rem', color: '#2563eb', fontWeight: 600 }}>(Sentinel-1: Fortnightly - 12 Days)</span>}
+                    </label>
                     <select value={compositeInterval} onChange={(e) => setCompositeInterval(e.target.value)} style={{ width: '100%', padding: '0.6rem 0.75rem', borderRadius: '0.375rem', border: '1px solid #cbd5e1', fontSize: '0.875rem', backgroundColor: '#ffffff', outline: 'none' }}>
                       <option value="none">None (Individual Scenes)</option>
-                      <option value="weekly">Weekly</option>
-                      <option value="fortnightly">Fortnightly</option>
-                      <option value="monthly">Monthly</option>
+                      {!isOnlyS1 && <option value="weekly">Weekly (7-Day Composite)</option>}
+                      <option value="fortnightly">{isOnlyS1 ? 'Fortnightly (12-Day Composite)' : 'Fortnightly (15-Day Composite)'}</option>
+                      {!isOnlyS1 && <option value="monthly">Monthly (30-Day Composite)</option>}
                     </select>
                   </div>
 
@@ -7122,8 +7459,8 @@ export default function App() {
                                                 <td style={{ padding: '0.6rem 0.75rem', color: '#64748b', fontSize: '0.75rem' }}>
                                                   {new Date(req.created_at).toLocaleString()}
                                                 </td>
-                                                <td style={{ padding: '0.6rem 0.75rem', textAlign: 'right' }}>
-                                                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'flex-end', gap: '0.4rem' }}>
+                                                <td style={{ padding: '0.6rem 0.75rem', textAlign: 'right', whiteSpace: 'nowrap' }}>
+                                                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'flex-end', gap: '0.4rem', flexWrap: 'nowrap' }}>
                                                     {/* View Execution Logs */}
                                                     <button
                                                       onClick={() => openLogsModal(req)}
@@ -7139,6 +7476,7 @@ export default function App() {
                                                         fontSize: '0.75rem',
                                                         fontWeight: 600,
                                                         color: '#334155',
+                                                        whiteSpace: 'nowrap',
                                                         cursor: 'pointer'
                                                       }}
                                                     >
@@ -7147,49 +7485,65 @@ export default function App() {
 
                                                     {['COMPLETED', 'HELD', 'SUCCESS'].includes(req.status) && (
                                                       <>
-                                                        {(req.stacking_count > 0 || (req.stacked_files && req.stacked_files.length > 0)) ? (
-                                                          <button
-                                                            onClick={(e) => {
-                                                              e.stopPropagation();
-                                                              setStackFilesModalReq(req);
-                                                            }}
-                                                            style={{
-                                                              display: 'inline-flex',
-                                                              alignItems: 'center',
-                                                              gap: '0.25rem',
-                                                              padding: '0.25rem 0.5rem',
-                                                              borderRadius: '9999px',
-                                                              border: '1px solid #86efac',
-                                                              backgroundColor: '#f0fdf4',
-                                                              fontSize: '0.72rem',
-                                                              fontWeight: 700,
-                                                              color: '#166534',
-                                                              cursor: 'pointer'
-                                                            }}
-                                                            title={`View ${req.stacking_count || req.stacked_files.length} stacked GeoTIFF file(s)`}
-                                                          >
-                                                            <CheckCircle size={10} color="#16a34a" />
-                                                            {req.stacking_count || req.stacked_files.length} {(req.stacking_count || req.stacked_files.length) === 1 ? 'time done' : 'times done'}
-                                                          </button>
-                                                        ) : (
-                                                          <span
-                                                            style={{
-                                                              display: 'inline-flex',
-                                                              alignItems: 'center',
-                                                              gap: '0.25rem',
-                                                              padding: '0.25rem 0.5rem',
-                                                              borderRadius: '9999px',
-                                                              border: '1px solid #fed7aa',
-                                                              backgroundColor: '#fff7ed',
-                                                              fontSize: '0.72rem',
-                                                              fontWeight: 700,
-                                                              color: '#c2410c'
-                                                            }}
-                                                            title="Pipeline steps 1 to 4 completed, but layer stacking has not been performed yet"
-                                                          >
-                                                            Stacking: Not Done
-                                                          </span>
-                                                        )}
+                                                        {(() => {
+                                                          const stackCount = typeof req.stacking_count === 'number'
+                                                            ? req.stacking_count
+                                                            : ((req.stacked_files && req.stacked_files.length) || 0);
+
+                                                          return stackCount > 0 ? (
+                                                            <button
+                                                              onClick={(e) => {
+                                                                e.stopPropagation();
+                                                                setStackFilesModalReq(req);
+                                                              }}
+                                                              style={{
+                                                                display: 'inline-flex',
+                                                                alignItems: 'center',
+                                                                justifyContent: 'center',
+                                                                gap: '0.3rem',
+                                                                padding: '0.28rem 0.6rem',
+                                                                borderRadius: '9999px',
+                                                                border: '1px solid #86efac',
+                                                                backgroundColor: '#f0fdf4',
+                                                                fontSize: '0.72rem',
+                                                                fontWeight: 700,
+                                                                color: '#166534',
+                                                                whiteSpace: 'nowrap',
+                                                                lineHeight: 1,
+                                                                cursor: 'pointer'
+                                                              }}
+                                                              title={`View ${stackCount} stacked GeoTIFF file(s)`}
+                                                            >
+                                                              <CheckCircle size={10} color="#16a34a" style={{ flexShrink: 0 }} />
+                                                              <span>{stackCount} {stackCount === 1 ? 'time done' : 'times done'}</span>
+                                                            </button>
+                                                          ) : (
+                                                            <span
+                                                              style={{
+                                                                display: 'inline-flex',
+                                                                alignItems: 'center',
+                                                                justifyContent: 'center',
+                                                                gap: '0.35rem',
+                                                                padding: '0.25rem 0.65rem',
+                                                                borderRadius: '9999px',
+                                                                border: '1px solid #fed7aa',
+                                                                backgroundColor: '#fff7ed',
+                                                                fontSize: '0.72rem',
+                                                                fontWeight: 700,
+                                                                color: '#c2410c',
+                                                                whiteSpace: 'nowrap',
+                                                                flexShrink: 0,
+                                                                minWidth: 'max-content',
+                                                                textAlign: 'center',
+                                                                lineHeight: 1.2
+                                                              }}
+                                                              title="Pipeline steps 1 to 4 completed, but layer stacking has not been performed yet for this request"
+                                                            >
+                                                              <Layers size={11} color="#ea580c" style={{ flexShrink: 0 }} />
+                                                              <span style={{ whiteSpace: 'nowrap' }}>Stacking: Not Done</span>
+                                                            </span>
+                                                          );
+                                                        })()}
 
                                                         <button
                                                           onClick={() => {
@@ -7414,7 +7768,7 @@ export default function App() {
                 {/* Temporal Composite Interval */}
                 <div>
                   <label style={{ display: 'block', fontSize: '0.8rem', fontWeight: 600, color: '#334155', marginBottom: '0.35rem' }}>
-                    Temporal Composite Interval {retSelectedBands.length > 0 && <span style={{ color: '#2563eb', fontSize: '0.72rem', fontWeight: 700 }}>• Active</span>}
+                    Temporal Composite Interval {retSatellite === 'Sentinel-1' && <span style={{ fontSize: '0.72rem', color: '#2563eb', fontWeight: 600 }}>(Sentinel-1: Fortnightly - 12 Days)</span>} {retSelectedBands.length > 0 && <span style={{ color: '#2563eb', fontSize: '0.72rem', fontWeight: 700 }}>• Active</span>}
                   </label>
                   <select
                     value={retCompositeInterval}
@@ -7429,9 +7783,9 @@ export default function App() {
                     }}
                   >
                     <option value="ALL">All Intervals / Any</option>
-                    <option value="weekly">Weekly (7-Day Composite)</option>
-                    <option value="fortnightly">Fortnightly (15-Day Composite)</option>
-                    <option value="monthly">Monthly (30-Day Composite)</option>
+                    {retSatellite !== 'Sentinel-1' && <option value="weekly">Weekly (7-Day Composite)</option>}
+                    <option value="fortnightly">{retSatellite === 'Sentinel-1' ? 'Fortnightly (12-Day Composite)' : 'Fortnightly (15-Day Composite)'}</option>
+                    {retSatellite !== 'Sentinel-1' && <option value="monthly">Monthly (30-Day Composite)</option>}
                     <option value="none">None (Individual Scene Rasters)</option>
                   </select>
                 </div>
@@ -7530,7 +7884,7 @@ export default function App() {
                   {retSatellite === 'Sentinel-1' && (
                     <div style={{
                       display: 'grid',
-                      gridTemplateColumns: 'repeat(auto-fill, minmax(210px, 1fr))',
+                      gridTemplateColumns: 'repeat(auto-fill, minmax(290px, 1fr))',
                       gap: '0.6rem',
                       padding: '0.75rem',
                       backgroundColor: '#ffffff',
@@ -7545,8 +7899,8 @@ export default function App() {
                             style={{
                               display: 'flex',
                               alignItems: 'center',
-                              gap: '0.6rem',
-                              padding: '0.5rem 0.75rem',
+                              gap: '0.65rem',
+                              padding: '0.55rem 0.85rem',
                               borderRadius: '0.375rem',
                               border: `1px solid ${isChecked ? '#86efac' : '#e2e8f0'}`,
                               backgroundColor: isChecked ? '#f0fdf4' : '#fafafa',
@@ -7558,13 +7912,13 @@ export default function App() {
                               type="checkbox"
                               checked={isChecked}
                               onChange={() => handleToggleRetBand(b.id)}
-                              style={{ width: '16px', height: '16px', accentColor: '#16a34a', cursor: 'pointer' }}
+                              style={{ width: '16px', height: '16px', accentColor: '#16a34a', cursor: 'pointer', flexShrink: 0 }}
                             />
-                            <div>
-                              <div style={{ fontSize: '0.85rem', fontWeight: 700, color: isChecked ? '#14532d' : '#1e293b' }}>
+                            <div style={{ overflow: 'hidden' }}>
+                              <div style={{ fontSize: '0.82rem', fontFamily: 'monospace', fontWeight: 700, color: isChecked ? '#14532d' : '#1e293b', wordBreak: 'break-all' }}>
                                 {b.label}
                               </div>
-                              <div style={{ fontSize: '0.72rem', color: isChecked ? '#166534' : '#64748b' }}>
+                              <div style={{ fontSize: '0.72rem', color: isChecked ? '#166534' : '#64748b', marginTop: '0.15rem' }}>
                                 {b.tag}
                               </div>
                             </div>
@@ -7634,11 +7988,11 @@ export default function App() {
                       }}>
                         <div style={{ fontSize: '0.78rem', fontWeight: 700, color: '#166534', marginBottom: '0.5rem', display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
                           <span style={{ width: '8px', height: '8px', borderRadius: '50%', backgroundColor: '#16a34a', display: 'inline-block' }}></span>
-                          Sentinel-1 SAR Radar Bands
+                          Sentinel-1 Calibrated SAR Products
                         </div>
                         <div style={{
                           display: 'grid',
-                          gridTemplateColumns: 'repeat(auto-fill, minmax(210px, 1fr))',
+                          gridTemplateColumns: 'repeat(auto-fill, minmax(290px, 1fr))',
                           gap: '0.5rem'
                         }}>
                           {RET_S1_BANDS.map(b => {
@@ -7649,8 +8003,8 @@ export default function App() {
                                 style={{
                                   display: 'flex',
                                   alignItems: 'center',
-                                  gap: '0.55rem',
-                                  padding: '0.45rem 0.65rem',
+                                  gap: '0.65rem',
+                                  padding: '0.55rem 0.85rem',
                                   borderRadius: '0.375rem',
                                   border: `1px solid ${isChecked ? '#86efac' : '#e2e8f0'}`,
                                   backgroundColor: isChecked ? '#f0fdf4' : '#fafafa',
@@ -7662,15 +8016,15 @@ export default function App() {
                                   type="checkbox"
                                   checked={isChecked}
                                   onChange={() => handleToggleRetBand(b.id)}
-                                  style={{ width: '15px', height: '15px', accentColor: '#16a34a', cursor: 'pointer' }}
+                                  style={{ width: '16px', height: '16px', accentColor: '#16a34a', cursor: 'pointer', flexShrink: 0 }}
                                 />
-                                <div>
-                                  <span style={{ fontSize: '0.825rem', fontWeight: 700, color: isChecked ? '#14532d' : '#1e293b' }}>
+                                <div style={{ overflow: 'hidden' }}>
+                                  <div style={{ fontSize: '0.82rem', fontFamily: 'monospace', fontWeight: 700, color: isChecked ? '#14532d' : '#1e293b', wordBreak: 'break-all' }}>
                                     {b.label}
-                                  </span>{' '}
-                                  <span style={{ fontSize: '0.7rem', color: isChecked ? '#166534' : '#64748b' }}>
-                                    ({b.tag})
-                                  </span>
+                                  </div>
+                                  <div style={{ fontSize: '0.72rem', color: isChecked ? '#166534' : '#64748b', marginTop: '0.15rem' }}>
+                                    {b.tag}
+                                  </div>
                                 </div>
                               </label>
                             );
@@ -9057,9 +9411,15 @@ export default function App() {
                                                 {s.tile}
                                               </span>
                                             )}
-                                            <span style={{ backgroundColor: '#e0f2fe', color: '#0369a1', border: '1px solid #bae6fd', borderRadius: '0.2rem', padding: '0.05rem 0.35rem', fontSize: '0.66rem', fontWeight: 700, marginLeft: '0.35rem' }}>
-                                              RAW SCENE
-                                            </span>
+                                            {s.is_calibrated || (s.filename && (s.filename.toUpperCase().includes('CAL_TC_DB') || s.filename.toUpperCase().includes('ORB_TNR'))) ? (
+                                              <span style={{ backgroundColor: '#dcfce7', color: '#15803d', border: '1px solid #86efac', borderRadius: '0.2rem', padding: '0.05rem 0.35rem', fontSize: '0.66rem', fontWeight: 700, marginLeft: '0.35rem' }}>
+                                                CALIBRATED dB
+                                              </span>
+                                            ) : (
+                                              <span style={{ backgroundColor: '#e0f2fe', color: '#0369a1', border: '1px solid #bae6fd', borderRadius: '0.2rem', padding: '0.05rem 0.35rem', fontSize: '0.66rem', fontWeight: 700, marginLeft: '0.35rem' }}>
+                                                RAW SCENE
+                                              </span>
+                                            )}
                                             <span style={{ color: isSceneSelected ? '#334155' : '#94a3b8', marginLeft: '0.35rem' }}>
                                               🛰️ {s.scene_id ? (s.scene_id.length > 25 ? s.scene_id.substring(0, 22) + '...' : s.scene_id) : 'Scene'}
                                             </span>
@@ -9964,47 +10324,61 @@ export default function App() {
               <div style={{ display: 'flex', alignItems: 'center', gap: '0.65rem' }}>
                 {['COMPLETED', 'HELD', 'SUCCESS'].includes(selectedReqForLogs.status) && (
                   <>
-                    {(selectedReqForLogs.stacking_count > 0 || (selectedReqForLogs.stacked_files && selectedReqForLogs.stacked_files.length > 0)) ? (
-                      <button
-                        onClick={() => setStackFilesModalReq(selectedReqForLogs)}
-                        style={{
-                          display: 'inline-flex',
-                          alignItems: 'center',
-                          gap: '0.35rem',
-                          padding: '0.38rem 0.75rem',
-                          borderRadius: '0.375rem',
-                          border: '1px solid #86efac',
-                          backgroundColor: '#f0fdf4',
-                          fontSize: '0.78rem',
-                          fontWeight: 700,
-                          color: '#166534',
-                          cursor: 'pointer'
-                        }}
-                        title="Click to view all stacked GeoTIFF files and downloads for this request"
-                      >
-                        <CheckCircle size={13} color="#16a34a" />
-                        Stacking: {selectedReqForLogs.stacking_count || selectedReqForLogs.stacked_files.length} {(selectedReqForLogs.stacking_count || selectedReqForLogs.stacked_files.length) === 1 ? 'time done' : 'times done'}
-                      </button>
-                    ) : (
-                      <span
-                        style={{
-                          display: 'inline-flex',
-                          alignItems: 'center',
-                          gap: '0.35rem',
-                          padding: '0.38rem 0.75rem',
-                          borderRadius: '0.375rem',
-                          border: '1px solid #fed7aa',
-                          backgroundColor: '#fff7ed',
-                          fontSize: '0.78rem',
-                          fontWeight: 700,
-                          color: '#c2410c'
-                        }}
-                        title="Pipeline steps 1 to 4 completed, but layer stacking has not been performed yet"
-                      >
-                        <Layers size={13} color="#ea580c" />
-                        Stacking: Not Done (0)
-                      </span>
-                    )}
+                    {(() => {
+                      const stackCount = typeof selectedReqForLogs.stacking_count === 'number'
+                        ? selectedReqForLogs.stacking_count
+                        : ((selectedReqForLogs.stacked_files && selectedReqForLogs.stacked_files.length) || 0);
+
+                      return stackCount > 0 ? (
+                        <button
+                          onClick={() => setStackFilesModalReq(selectedReqForLogs)}
+                          style={{
+                            display: 'inline-flex',
+                            alignItems: 'center',
+                            justifyContent: 'center',
+                            gap: '0.35rem',
+                            padding: '0.38rem 0.75rem',
+                            borderRadius: '9999px',
+                            border: '1px solid #86efac',
+                            backgroundColor: '#f0fdf4',
+                            fontSize: '0.78rem',
+                            fontWeight: 700,
+                            color: '#166534',
+                            whiteSpace: 'nowrap',
+                            cursor: 'pointer'
+                          }}
+                          title="Click to view all stacked GeoTIFF files and downloads for this request"
+                        >
+                          <CheckCircle size={13} color="#16a34a" style={{ flexShrink: 0 }} />
+                          <span>Stacking: {stackCount} {stackCount === 1 ? 'time done' : 'times done'}</span>
+                        </button>
+                      ) : (
+                        <span
+                          style={{
+                            display: 'inline-flex',
+                            alignItems: 'center',
+                            justifyContent: 'center',
+                            gap: '0.35rem',
+                            padding: '0.3rem 0.8rem',
+                            borderRadius: '9999px',
+                            border: '1px solid #fed7aa',
+                            backgroundColor: '#fff7ed',
+                            fontSize: '0.76rem',
+                            fontWeight: 700,
+                            color: '#c2410c',
+                            whiteSpace: 'nowrap',
+                            flexShrink: 0,
+                            minWidth: 'max-content',
+                            textAlign: 'center',
+                            lineHeight: 1.2
+                          }}
+                          title="Pipeline steps 1 to 4 completed, but layer stacking has not been performed yet for this request"
+                        >
+                          <Layers size={13} color="#ea580c" style={{ flexShrink: 0 }} />
+                          <span style={{ whiteSpace: 'nowrap' }}>Stacking: Not Done</span>
+                        </span>
+                      );
+                    })()}
 
                     <button
                       onClick={() => {

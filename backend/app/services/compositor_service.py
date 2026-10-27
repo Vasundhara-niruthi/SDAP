@@ -52,13 +52,13 @@ logger = logging.getLogger("sdap.compositor")
 # 1. Date Window Generator
 # ─────────────────────────────────────────────────────────────────────────────
 
-def generate_composite_windows(start_date: str, end_date: str, interval: str) -> List[Dict[str, Any]]:
+def generate_composite_windows(start_date: str, end_date: str, interval: str, satellite: Optional[str] = None) -> List[Dict[str, Any]]:
     """
     Slices a date range into discrete composite windows based on the requested interval.
     
     Intervals supported:
       - 'weekly' (7-day intervals)
-      - 'fortnightly' / 'biweekly' (15-day intervals)
+      - 'fortnightly' / 'biweekly' (12-day intervals for Sentinel-1 repeat cycle; 15-day intervals for Sentinel-2)
       - 'monthly' (full calendar months)
     """
     if not interval or interval.lower() in ("none", "null", "false", "0"):
@@ -90,11 +90,14 @@ def generate_composite_windows(start_date: str, end_date: str, interval: str) ->
             cur = w_end + timedelta(days=1)
             w_idx += 1
 
-    elif interval_lower in ("fortnightly", "biweekly", "15-day", "15day", "fortnight"):
+    elif interval_lower in ("fortnightly", "biweekly", "15-day", "15day", "fortnight", "12-day", "12day"):
+        is_s1_only = bool(satellite and "Sentinel-1" in satellite and "Sentinel-2" not in satellite)
+        # Sentinel-1 repeat cycle is 12 days; Sentinel-2 is 15 days
+        span_days = 11 if is_s1_only else 14
         cur = start_dt
         w_idx = 1
         while cur <= end_dt:
-            w_end = min(end_dt, cur + timedelta(days=14))
+            w_end = min(end_dt, cur + timedelta(days=span_days))
             windows.append({
                 "type": "fortnightly",
                 "index": w_idx,
@@ -551,12 +554,12 @@ def run_temporal_compositing_for_request(
         spectral_indices = ["NDVI", "LSWI"]
 
     # 1. Compute discrete composite windows (e.g. weekly 7-day, fortnightly 15-day, monthly)
-    windows = generate_composite_windows(start_str, end_str, interval)
+    windows = generate_composite_windows(start_str, end_str, interval, satellite=getattr(req, "satellite", None))
     if not windows:
         logger.info(f"No composite windows generated for interval '{interval}' between {start_str} and {end_str}.")
         return []
 
-    from scripts.download_district_tiles import append_request_log
+    from app.db.scripts.download_district_tiles import append_request_log
 
     header_msg = (
         f"\n==============================================================================\n"

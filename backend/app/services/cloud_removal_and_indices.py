@@ -11,7 +11,7 @@ Description:
 =============================================================================
 """
 
-from scripts.cloud_removal_and_indices import (
+from app.db.scripts.cloud_removal_and_indices import (
     process_and_save_indices,
     SCL_DROP_CLASSES,
     BASELINE_04_CUTOFF,

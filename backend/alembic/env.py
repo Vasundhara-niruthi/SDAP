@@ -13,8 +13,8 @@ from alembic import context
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
 
 from app.core.config import settings
-from app.core.database import Base
-import app.models  # Ensure models are imported for metadata reflection
+from app.db import Base
+import app.db.models  # Ensure models are imported for metadata reflection
 
 # this is the Alembic Config object
 config = context.config

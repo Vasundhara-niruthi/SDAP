@@ -224,6 +224,7 @@ def find_band_rasters_for_district(
     clean_b = re.sub(r"\.(tif|tiff)$", "", band_name.strip(), flags=re.IGNORECASE)
     is_s1_vv = clean_b.upper() in ("VV", "IW-VV", "IW_VV")
     is_s1_vh = clean_b.upper() in ("VH", "IW-VH", "IW_VH")
+    is_s1_ratio = clean_b.upper() in ("VV_VH", "SAR_RATIO", "VV/VH", "VV-VH")
 
     # Query scenes linked through completed download process jobs for this district
     pj_query = db.query(ProcessJobModel.scene_id).join(
@@ -287,20 +288,33 @@ def find_band_rasters_for_district(
         bf_query = bf_query.filter(BandFileModel.sensing_date <= end_date)
 
     if is_s1_vv:
-        vv_aliases = ["vv", "vv.tif", "vv.tiff", "iw-vv", "iw-vv.tif", "iw-vv.tiff"]
+        vv_aliases = ["vv", "vv.tif", "vv.tiff", "iw-vv", "iw-vv.tif", "iw-vv.tiff", "vv_orb_tnr_cal_tc_db", "vv_orb_tnr_cal_tc_db.tif", "vv_orb_tnr_cal_tc_db.tiff"]
         bf_query = bf_query.filter(
-            func.lower(BandFileModel.band).in_(vv_aliases) |
+            (func.lower(BandFileModel.band).in_(vv_aliases) |
             func.lower(BandFileModel.path).like("%iw-vv.tif%") |
             func.lower(BandFileModel.path).like("%/vv.tif%") |
-            func.lower(BandFileModel.path).like("%\\vv.tif%")
+            func.lower(BandFileModel.path).like("%\\vv.tif%") |
+            func.lower(BandFileModel.path).like("%vv_orb_tnr_cal_tc_db%")) &
+            ~func.lower(BandFileModel.band).like("%vv_vh%") &
+            ~func.lower(BandFileModel.path).like("%vv_vh%")
         )
     elif is_s1_vh:
-        vh_aliases = ["vh", "vh.tif", "vh.tiff", "iw-vh", "iw-vh.tif", "iw-vh.tiff"]
+        vh_aliases = ["vh", "vh.tif", "vh.tiff", "iw-vh", "iw-vh.tif", "iw-vh.tiff", "vh_orb_tnr_cal_tc_db", "vh_orb_tnr_cal_tc_db.tif", "vh_orb_tnr_cal_tc_db.tiff"]
         bf_query = bf_query.filter(
-            func.lower(BandFileModel.band).in_(vh_aliases) |
+            (func.lower(BandFileModel.band).in_(vh_aliases) |
             func.lower(BandFileModel.path).like("%iw-vh.tif%") |
             func.lower(BandFileModel.path).like("%/vh.tif%") |
-            func.lower(BandFileModel.path).like("%\\vh.tif%")
+            func.lower(BandFileModel.path).like("%\\vh.tif%") |
+            func.lower(BandFileModel.path).like("%vh_orb_tnr_cal_tc_db%")) &
+            ~func.lower(BandFileModel.band).like("%vv_vh%") &
+            ~func.lower(BandFileModel.path).like("%vv_vh%")
+        )
+    elif is_s1_ratio:
+        ratio_aliases = ["vv_vh", "vv_vh.tif", "vv_vh.tiff", "vv/vh", "sar_ratio", "vv_vh_orb_tnr_cal_tc_db", "vv_vh_orb_tnr_cal_tc_db.tif", "vv_vh_orb_tnr_cal_tc_db.tiff"]
+        bf_query = bf_query.filter(
+            func.lower(BandFileModel.band).in_(ratio_aliases) |
+            func.lower(BandFileModel.path).like("%vv_vh%") |
+            func.lower(BandFileModel.path).like("%sar_ratio%")
         )
     else:
         bf_query = bf_query.filter(
@@ -315,7 +329,34 @@ def find_band_rasters_for_district(
     for r in records:
         resolved, exists = resolve_tif_path(r.path)
         if exists and os.path.exists(resolved):
-            norm = _normalize_unc_path(resolved)
+            candidate_p = resolved
+            parent_dir = os.path.dirname(resolved)
+            if os.path.basename(parent_dir).lower() == "measurement":
+                scene_root = os.path.dirname(parent_dir)
+            else:
+                scene_root = parent_dir
+
+            # If matching S1 band and calibrated file exists, upgrade to calibrated GeoTIFF
+            if is_s1_vv:
+                for ext in (".tiff", ".tif", ".TIFF", ".TIF"):
+                    cal_cand = os.path.join(scene_root, f"VV_Orb_tnr_cal_Tc_db{ext}")
+                    if os.path.isfile(cal_cand) and os.path.getsize(cal_cand) > 1024:
+                        candidate_p = cal_cand
+                        break
+            elif is_s1_vh:
+                for ext in (".tiff", ".tif", ".TIFF", ".TIF"):
+                    cal_cand = os.path.join(scene_root, f"VH_Orb_tnr_cal_Tc_db{ext}")
+                    if os.path.isfile(cal_cand) and os.path.getsize(cal_cand) > 1024:
+                        candidate_p = cal_cand
+                        break
+            elif is_s1_ratio:
+                for ext in (".tiff", ".tif", ".TIFF", ".TIF"):
+                    cal_cand = os.path.join(scene_root, f"VV_VH_Orb_tnr_cal_Tc_db{ext}")
+                    if os.path.isfile(cal_cand) and os.path.getsize(cal_cand) > 1024:
+                        candidate_p = cal_cand
+                        break
+
+            norm = _normalize_unc_path(candidate_p)
             if norm.lower() not in seen_paths:
                 seen_paths.add(norm.lower())
                 found_paths.append(norm)
@@ -1940,16 +1981,18 @@ _REQUEST_STACKS_CACHE_TIME: float = 0.0
 
 def invalidate_request_stacks_cache() -> None:
     """Invalidates the in-memory cache for request layer stack lookups."""
-    global _REQUEST_STACKS_CACHE_TIME
+    global _REQUEST_STACKS_CACHE_TIME, _REQUEST_STACKS_CACHE
     _REQUEST_STACKS_CACHE_TIME = 0.0
+    _REQUEST_STACKS_CACHE.clear()
 
 
 def get_layer_stacks_for_requests_bulk(requests_list: List[Any], db: Optional[Any] = None) -> Dict[int, Dict[str, Any]]:
     """
     Computes layer stacking metadata for multiple requests efficiently:
-    - How many times layer stacking was completed for each request (count: 0, 1, 2, ...).
-    - Status: 'COMPLETED' (if count > 0), 'NOT_DONE' (if pipeline steps 1-4 completed but 0 stacks), 'NOT_STARTED'.
+    - How many times layer stacking was completed specifically for each individual request (count: 0, 1, 2, ...).
+    - Status: 'COMPLETED' (if count > 0), 'NOT_DONE' (if pipeline steps 1-4 completed but 0 stacks for this request), 'NOT_STARTED'.
     - List of generated stacked filenames with file size, path, layers, and download URL.
+    - Strictly associates stacks by request_id so previous runs or other requests for the same district do not inflate count.
     Uses an in-memory cache with 15-second TTL for maximum throughput.
     """
     global _REQUEST_STACKS_CACHE, _REQUEST_STACKS_CACHE_TIME
@@ -1971,38 +2014,24 @@ def get_layer_stacks_for_requests_bulk(requests_list: List[Any], db: Optional[An
 
     try:
         from app.models import LayerStackJobModel
-        districts = list(set(r.district.strip() for r in requests_list if getattr(r, 'district', None)))
 
-        # 1. Fetch DB jobs where status == 'SUCCESS'
-        all_jobs = session.query(LayerStackJobModel).filter(LayerStackJobModel.status == 'SUCCESS').all()
+        # Fetch DB jobs where status == 'SUCCESS' strictly partitioned by request_id
+        all_jobs = session.query(LayerStackJobModel).filter(
+            LayerStackJobModel.status == 'SUCCESS',
+            LayerStackJobModel.request_id.in_(req_ids)
+        ).all() if req_ids else []
+
         jobs_by_req_id: Dict[int, List[Any]] = {}
         for j in all_jobs:
             if j.request_id:
                 jobs_by_req_id.setdefault(j.request_id, []).append(j)
-
-        # 2. Fast scan NAS Composites/stack directories for target districts
-        base_stack = os.path.join(settings.RAW_ARCHIVE_DIR, 'Composites', 'stack')
-        nas_files_by_dist: Dict[str, List[tuple]] = {}
-        for dist in districts:
-            d_clean = dist.split(',')[0].strip()
-            p = os.path.join(base_stack, d_clean)
-            if os.path.exists(p):
-                try:
-                    nas_files_by_dist[dist.lower()] = [
-                        (entry.name, entry.path, round(entry.stat().st_size / (1024 * 1024), 2))
-                        for entry in os.scandir(p)
-                        if entry.is_file() and (entry.name.lower().endswith('.tif') or entry.name.lower().endswith('.tiff'))
-                        and not entry.name.endswith('.tmp') and not entry.name.endswith('.xml')
-                    ]
-                except Exception:
-                    pass
 
         results: Dict[int, Dict[str, Any]] = {}
         for r in requests_list:
             seen_files = set()
             stacked_files = []
 
-            # A. Jobs explicitly tagged with request_id == r.id
+            # Only include jobs explicitly executed for this individual request (request_id == r.id)
             for j in jobs_by_req_id.get(r.id, []):
                 if j.filename and j.filename.lower() not in seen_files:
                     seen_files.add(j.filename.lower())
@@ -2014,36 +2043,6 @@ def get_layer_stacks_for_requests_bulk(requests_list: List[Any], db: Optional[An
                         "layers": j.layers or extract_bands_from_stack_filename(j.filename),
                         "download_url": f"/api/v1/requests/layer-stack/download?file_path={j.filename}"
                     })
-
-            # B. Correlate files from NAS Composites/stack for this district
-            dist_val = getattr(r, "district", "") or ""
-            dist_key = dist_val.strip().lower()
-            d_norm = re.sub(r'[^a-zA-Z0-9]', '', dist_key)
-            req_s_str = r.start_date.strftime('%Y%m%d') if getattr(r, 'start_date', None) and hasattr(r.start_date, 'strftime') else ''
-
-            for fname, fpath, fsize in nas_files_by_dist.get(dist_key, []):
-                if fname.lower() in seen_files:
-                    continue
-                f_norm = re.sub(r'[^a-zA-Z0-9]', '', fname).lower()
-                if d_norm in f_norm:
-                    date_match = False
-                    if req_s_str and req_s_str in fname.replace('-', ''):
-                        date_match = True
-                    elif getattr(r, "season", None) and r.season.lower() in fname.lower():
-                        date_match = True
-                    elif not req_s_str:
-                        date_match = True
-
-                    if date_match:
-                        seen_files.add(fname.lower())
-                        stacked_files.append({
-                            "filename": fname,
-                            "path": fpath,
-                            "file_size_mb": fsize,
-                            "created_at": "",
-                            "layers": extract_bands_from_stack_filename(fname),
-                            "download_url": f"/api/v1/requests/layer-stack/download?file_path={fname}"
-                        })
 
             count = len(stacked_files)
             if count > 0:
