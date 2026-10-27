@@ -17,12 +17,20 @@ from app.core.config import settings
 
 logger = logging.getLogger("sdap.db.connection")
 
-# Synchronous PostgreSQL Engine with connection pooling
+# Synchronous PostgreSQL Engine with connection pooling and TCP keepalives
+# Prevents idle connection drops across long-running multi-gigabyte S3/NAS downloads
 engine = create_engine(
     settings.database_url,
     pool_pre_ping=True,
+    pool_recycle=300,
     pool_size=10,
-    max_overflow=20
+    max_overflow=20,
+    connect_args={
+        "keepalives": 1,
+        "keepalives_idle": 30,
+        "keepalives_interval": 10,
+        "keepalives_count": 5,
+    }
 )
 
 # Thread-local / request session maker

@@ -765,6 +765,8 @@ def sync_s1_processed_rasters_to_db(db, scene_obj, processed_res: Dict[str, Any]
         ("VV_Orb_tnr_cal_Tc_db", processed_res.get("vv_path")),
         ("VV_VH_Orb_tnr_cal_Tc_db", processed_res.get("vv_vh_path")),
         ("VV_VH", processed_res.get("vv_vh_path")),
+        ("VV", processed_res.get("vv_path")),
+        ("VH", processed_res.get("vh_path")),
     ]
 
     for b_name, b_path in band_mappings:
@@ -789,7 +791,7 @@ def sync_s1_processed_rasters_to_db(db, scene_obj, processed_res: Dict[str, Any]
                 BandFileModel.band == b_name
             ).first()
             if existing:
-                existing.path = b_path
+                existing.path = actual_path
                 existing.size_bytes = f_size
                 existing.verified = 1
                 existing.downloaded_at = now
@@ -800,7 +802,7 @@ def sync_s1_processed_rasters_to_db(db, scene_obj, processed_res: Dict[str, Any]
                     sensing_date=s_date,
                     satellite="Sentinel-1",
                     band=b_name,
-                    path=b_path,
+                    path=actual_path,
                     size_bytes=f_size,
                     verified=1,
                     downloaded_at=now

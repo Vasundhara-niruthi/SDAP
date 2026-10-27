@@ -735,8 +735,8 @@ export default function App() {
         tifs = Array.from(allTifsMap.values());
       }
 
-      // If direct request tifs yielded 0 or no matchingReq, fallback to region search
-      if (tifs.length === 0 && (distVal || stateVal)) {
+      // If direct request tifs yielded 0 or no matchingReq, fallback to region search only when no specific request is selected
+      if (tifs.length === 0 && !specificRequestId && (distVal || stateVal)) {
         try {
           const retRes = await axios.get(`${API_BASE}/requests/tifs/retrieve`, {
             params: {
@@ -754,6 +754,9 @@ export default function App() {
       }
 
       const grouped = {};
+      const isReqS1Only = Boolean(matchingReq && matchingReq.satellite && matchingReq.satellite.includes('Sentinel-1') && !matchingReq.satellite.includes('Sentinel-2'));
+      const isReqS2Only = Boolean(matchingReq && matchingReq.satellite && matchingReq.satellite.includes('Sentinel-2') && !matchingReq.satellite.includes('Sentinel-1'));
+
       tifs.forEach(item => {
         const fPath = item.path || '';
         // Skip previously generated layer stack outputs from raw input scenes
@@ -830,6 +833,10 @@ export default function App() {
           if (existing.scene_id && item.scene_id && existing.scene_id === item.scene_id) return true;
           return false;
         });
+
+        // Enforce strict satellite partitioning on grouped bands
+        if (isReqS1Only && !['VV', 'VH', 'VV_VH'].includes(b)) return;
+        if (isReqS2Only && ['VV', 'VH', 'VV_VH'].includes(b)) return;
 
         if (existingIdx >= 0) {
           // If existing is uncalibrated raw but this one is calibrated, upgrade to calibrated GeoTIFF
@@ -2528,9 +2535,9 @@ export default function App() {
 
         // 6. Parse Processing Scene lines: e.g. [1/51 - 1%] Processing 'S2B_43PHS_20260502_0_L2A'
         // or Processing time-step 1/20 (S1_20240601T001631_VH)
-        const procM = line.match(/(?:\[(\d+\/\d+)(?:\s*-\s*\d+%)?\]\s*)?Processing\s+(?:Sentinel-1\s+Scene:\s*)?['"]?(S[12][A-C0-9]_[0-9A-Za-z_]+)['"]?/i)
+        const procM = line.match(/(?:\[(\d+\/\d+)(?:\s*-\s*\d+%)?\]\s*)?Processing\s+(?:Sentinel-1\s+Scene:\s*)?['"]?(S[12][A-Za-z0-9]_[0-9A-Za-z_]+)['"]?/i)
           || line.match(/Processing\s+time-step\s+(\d+\/\d+)\s*\((S1_[0-9A-Za-z_]+)\)/i)
-          || line.match(/(?:Already processed at|Processing Sentinel-1 Scene:?)\s*['"]?(?:.*[\\/])?(S1[A-C0-9]_[0-9A-Za-z_]+)['"]?/i);
+          || line.match(/(?:Already processed at|Processing Sentinel-1 Scene:?)\s*['"]?(?:.*[\\/])?(S1[A-Za-z0-9]_[0-9A-Za-z_]+)['"]?/i);
 
         if (procM) {
           const folderName = [procM[3], procM[2], procM[1]].find(g => g && (g.startsWith('S1') || g.startsWith('S2'))) || procM[2] || procM[1];
@@ -2593,18 +2600,20 @@ export default function App() {
         // [2026-09-29 10:36:32] INFO:sdap.universal_pipeline:     ↳ Band 'B04.tif' (220.5 MB) downloaded & verified on NAS.
         // Tile 1/1 (VH.tiff) reprojected successfully.
         // [ATTACHED] Band 2/20: S1_20240606T000529_VH (21499514 valid pixels)
-        const bandM = line.match(/(?:↳\s*)?Band\s+'([A-Za-z0-9_]+)\.(?:tiff?|jp2)'(?:\s*\(([^)]+)\))?\s*downloaded/i)
-          || line.match(/Tile\s+\d+\/\d+\s*\(([A-Za-z0-9_]+)\.tiff?\)\s*reprojected/i)
-          || line.match(/\[ATTACHED\]\s*Band\s+\d+\/\d+:\s*(?:S1_[0-9A-Za-z_]+_)?([A-Za-z0-9_]+)(?:\s*\(([^)]+)\))?/i);
+        const bandM = line.match(/(?:↳\s*)?Band\s+'(?:measurement[\\/])?([A-Za-z0-9_\-]+)\.(?:tiff?|jp2)'(?:\s*\(([^)]+)\))?\s*downloaded/i)
+          || line.match(/Tile\s+\d+\/\d+\s*\(([A-Za-z0-9_\-]+)\.tiff?\)\s*reprojected/i)
+          || line.match(/\[ATTACHED\]\s*Band\s+\d+\/\d+:\s*(?:S1_[0-9A-Za-z_]+_)?([A-Za-z0-9_\-]+)(?:\s*\(([^)]+)\))?/i);
 
         if (bandM) {
           let bandName = bandM[1].toUpperCase().replace(/\.TIFF?$/, '').trim();
           if (bandName === 'B08A') bandName = 'B8A';
+          if (bandName === 'IW-VV' || bandName === 'IW_VV') bandName = 'VV';
+          if (bandName === 'IW-VH' || bandName === 'IW_VH') bandName = 'VH';
           const bandSize = bandM[2] || '';
 
           // Determine target scene: currentActiveFolder or explicit scene tag in line
           let targetSc = currentActiveFolder;
-          const scExplicit = line.match(/\[(S[12][A-C]_[0-9A-Za-z_]+|S1_\d{8}T\d+_[A-Za-z0-9_]+)\]/i);
+          const scExplicit = line.match(/\[(S[12][A-Za-z0-9]_[0-9A-Za-z_]+|S1_\d{8}T\d+_[A-Za-z0-9_]+)\]/i);
           if (scExplicit && scenesMap[scExplicit[1]]) {
             targetSc = scExplicit[1];
           }
@@ -2625,10 +2634,10 @@ export default function App() {
         // Examples:
         // [NEW DOWNLOAD COMPLETED] Scene 'S2B_43PHS_20260502_0_L2A' (Tile 43PHS, Date 2026-05-02) downloaded to '...'
         //   (8 new bands, 1205.2 MB: B02.tif: 201.6MB, B03.tif: 208.1MB, B04.tif: 220.5MB, B08.tif: 222.2MB, B8A.tif: 57.5MB, B11.tif: 57.4MB, SCL.tif: 2.0MB, TCI.tif: 314.5MB, metadata.xml stored).
-        const compMatch = line.match(/✓?\s*\[(?:NEW DOWNLOAD COMPLETED|SENTINEL-1 COMPLETE PRODUCT DOWNLOADED|ALREADY DOWNLOADED - SKIPPED)\]\s*Scene\s+['"]?(S[12][A-C0-9]_[0-9A-Za-z_]+)['"]?/i)
-          || line.match(/✓?\s*\[NAS VERIFIED - SKIPPED\]\s*['"]?(S[12][A-C0-9]_[0-9A-Za-z_]+)['"]?/i)
-          || line.match(/\[CACHE VERIFIED\]\s*Scene\s+['"]?(S[12][A-C0-9]_[0-9A-Za-z_]+)['"]?/i)
-          || line.match(/\[SAR POLARIZATIONS VERIFIED\].*Scene\s+['"]?(S[12][A-C0-9]_[0-9A-Za-z_]+)['"]?/i);
+        const compMatch = line.match(/✓?\s*\[(?:NEW DOWNLOAD COMPLETED|SENTINEL-1 COMPLETE PRODUCT DOWNLOADED|ALREADY DOWNLOADED - SKIPPED)\]\s*Scene\s+['"]?(S[12][A-Za-z0-9]_[0-9A-Za-z_]+)['"]?/i)
+          || line.match(/✓?\s*\[NAS VERIFIED - SKIPPED\]\s*['"]?(S[12][A-Za-z0-9]_[0-9A-Za-z_]+)['"]?/i)
+          || line.match(/\[CACHE VERIFIED\]\s*Scene\s+['"]?(S[12][A-Za-z0-9]_[0-9A-Za-z_]+)['"]?/i)
+          || line.match(/\[SAR POLARIZATIONS VERIFIED\].*Scene\s+['"]?(S[12][A-Za-z0-9]_[0-9A-Za-z_]+)['"]?/i);
 
         if (compMatch) {
           const folderName = compMatch[1];
@@ -2835,8 +2844,8 @@ export default function App() {
         // Examples:
         // ⚠ WARN: Missing required bands for optical indices in 'S2B_...': ['B04', 'B08']
         // Scene S2B_... incomplete missing ['B02', 'B03'] - remains PENDING
-        const missBandsM = line.match(/Missing required bands.*in\s+['"]?(S[12][A-C]_[0-9A-Za-z_]+)['"]?:\s*\[([^\]]+)\]/i)
-          || line.match(/Scene\s+['"]?(S[12][A-C]_[0-9A-Za-z_]+)['"]?\s+incomplete missing\s*\[([^\]]+)\]/i);
+        const missBandsM = line.match(/Missing required bands.*in\s+['"]?(S[12][A-Za-z0-9]_[0-9A-Za-z_]+)['"]?:\s*\[([^\]]+)\]/i)
+          || line.match(/Scene\s+['"]?(S[12][A-Za-z0-9]_[0-9A-Za-z_]+)['"]?\s+incomplete missing\s*\[([^\]]+)\]/i);
 
         if (missBandsM) {
           const folderName = missBandsM[1];
@@ -2878,7 +2887,7 @@ export default function App() {
         }
 
         // 12. Parse failed or error scenes
-        const failMatch = line.match(/Scene\s+['"]?(S[12][A-C]_[0-9A-Za-z_]+)['"]?\s+(?:incomplete|download failed)|Failed fetching.*['"]?(S[12][A-C]_[0-9A-Za-z_]+)['"]?/i);
+        const failMatch = line.match(/Scene\s+['"]?(S[12][A-Za-z0-9]_[0-9A-Za-z_]+)['"]?\s+(?:incomplete|download failed)|Failed fetching.*['"]?(S[12][A-Za-z0-9]_[0-9A-Za-z_]+)['"]?/i);
         if (failMatch) {
           const folderName = failMatch[1] || failMatch[2];
           if (scenesMap[folderName]) {
@@ -2898,7 +2907,7 @@ export default function App() {
         }
 
         // 13. General scene matching for pre-existing or cached scenes
-        const sceneMatch = line.match(/\b(S[12][A-C]_[0-9A-Za-z_]+)/i);
+        const sceneMatch = line.match(/\b(S[12][A-Za-z0-9]_[0-9A-Za-z_]+)/i);
         if (sceneMatch) {
           const folderName = sceneMatch[1];
           const parts = folderName.split('_');
@@ -4721,10 +4730,15 @@ export default function App() {
                         </div>
                       </div>
                     ) : (
-                      <>
-                        <RefreshCw size={22} className="animate-spin" style={{ margin: '0 auto 0.5rem auto', color: '#2563eb' }} />
-                        <div>Synchronizing acquisition stream... Connecting to NAS &amp; AWS S3...</div>
-                      </>
+                      <div style={{ padding: '2rem 1rem', textAlign: 'center' }}>
+                        <RefreshCw size={24} className="spin" style={{ margin: '0 auto 0.75rem auto', color: '#2563eb' }} />
+                        <div style={{ fontWeight: 600, color: '#1e293b', marginBottom: '0.35rem' }}>
+                          Loading execution logs for Request #{selectedReq?.id}...
+                        </div>
+                        <div style={{ fontSize: '0.78rem', color: '#64748b' }}>
+                          Synchronizing live acquisition stream with NAS &amp; AWS S3 storage...
+                        </div>
+                      </div>
                     )}
                   </td>
                 </tr>
@@ -9411,7 +9425,7 @@ export default function App() {
                                                 {s.tile}
                                               </span>
                                             )}
-                                            {s.is_calibrated || (s.filename && (s.filename.toUpperCase().includes('CAL_TC_DB') || s.filename.toUpperCase().includes('ORB_TNR'))) ? (
+                                            {s.is_calibrated || (s.filename && (s.filename.toUpperCase().includes('CAL_TC_DB') || s.filename.toUpperCase().includes('ORB_TNR') || s.filename.toUpperCase().includes('_CAL_') || (['VV', 'VH', 'VV_VH'].includes(item.id) && !s.filename.toLowerCase().includes('measurement')))) ? (
                                               <span style={{ backgroundColor: '#dcfce7', color: '#15803d', border: '1px solid #86efac', borderRadius: '0.2rem', padding: '0.05rem 0.35rem', fontSize: '0.66rem', fontWeight: 700, marginLeft: '0.35rem' }}>
                                                 CALIBRATED dB
                                               </span>
@@ -9469,50 +9483,113 @@ export default function App() {
                   );
                 };
 
+                const activeStackReq = stackRequestId ? (requests || []).find(r => r.id === stackRequestId) : null;
+                const isScopeS1 = Boolean(activeStackReq && activeStackReq.satellite && activeStackReq.satellite.includes('Sentinel-1') && !activeStackReq.satellite.includes('Sentinel-2'));
+                const isScopeS2 = Boolean(activeStackReq && activeStackReq.satellite && activeStackReq.satellite.includes('Sentinel-2') && !activeStackReq.satellite.includes('Sentinel-1'));
+
                 return (
-                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(300px, 1fr))', gap: '1.25rem', marginBottom: '1.5rem' }}>
-                    {/* 1. Derived Spectral Indices (FIRST) */}
-                    <div style={{ border: '1px solid #bfdbfe', borderRadius: '0.5rem', padding: '1rem', backgroundColor: '#fbfcfe' }}>
-                      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '0.75rem', borderBottom: '1px solid #dbeafe', paddingBottom: '0.5rem' }}>
-                        <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
-                          <Sliders size={16} color="#2563eb" />
-                          <span style={{ fontSize: '0.85rem', fontWeight: 700, color: '#1e40af' }}>
-                            Derived Spectral Indices
+                  <div>
+                    {activeStackReq && (
+                      <div style={{
+                        display: 'flex',
+                        alignItems: 'center',
+                        justifyContent: 'space-between',
+                        padding: '0.65rem 1rem',
+                        borderRadius: '0.5rem',
+                        marginBottom: '1rem',
+                        backgroundColor: '#eff6ff',
+                        border: '1px solid #bfdbfe',
+                        color: '#1d4ed8'
+                      }}>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', fontSize: '0.85rem' }}>
+                          <Layers size={16} />
+                          <span>
+                            <strong>Scoped to Request #{activeStackReq.id}:</strong> {activeStackReq.district || activeStackReq.state} ({activeStackReq.satellite}) &bull; Showing only verified deliverables for this request
                           </span>
                         </div>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setStackRequestId(null);
+                            loadBandsAndScenesForRegion(stackState, stackDistrict, stackSeason, stackStartDate, stackEndDate);
+                          }}
+                          style={{
+                            background: '#ffffff',
+                            border: '1px solid #93c5fd',
+                            borderRadius: '0.25rem',
+                            padding: '0.2rem 0.6rem',
+                            fontSize: '0.75rem',
+                            cursor: 'pointer',
+                            color: '#1d4ed8',
+                            fontWeight: 600
+                          }}
+                        >
+                          Clear Request Filter
+                        </button>
                       </div>
-                      <div style={{ display: 'flex', flexDirection: 'column', gap: '0.65rem' }}>
-                        {AVAILABLE_INDICES.map(idx => renderLayerCard(idx, '#1d4ed8', '#eff6ff', '#bfdbfe'))}
+                    )}
+                    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(300px, 1fr))', gap: '1.25rem', marginBottom: '1.5rem' }}>
+                      {/* 1. Derived Spectral Indices (FIRST) */}
+                      <div style={{ border: '1px solid #bfdbfe', borderRadius: '0.5rem', padding: '1rem', backgroundColor: '#fbfcfe' }}>
+                        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '0.75rem', borderBottom: '1px solid #dbeafe', paddingBottom: '0.5rem' }}>
+                          <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
+                            <Sliders size={16} color="#2563eb" />
+                            <span style={{ fontSize: '0.85rem', fontWeight: 700, color: '#1e40af' }}>
+                              Derived Spectral Indices
+                            </span>
+                          </div>
+                        </div>
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: '0.65rem' }}>
+                          {isScopeS1 ? (
+                            <div style={{ padding: '1rem', textAlign: 'center', color: '#64748b', fontSize: '0.8rem', backgroundColor: '#f8fafc', borderRadius: '0.375rem', border: '1px dashed #cbd5e1' }}>
+                              Optical indices are not applicable for Sentinel-1 SAR requests.
+                            </div>
+                          ) : (
+                            AVAILABLE_INDICES.map(idx => renderLayerCard(idx, '#1d4ed8', '#eff6ff', '#bfdbfe'))
+                          )}
+                        </div>
                       </div>
-                    </div>
 
-                    {/* 2. SAR Radar Polarizations (SECOND) */}
-                    <div style={{ border: '1px solid #fde68a', borderRadius: '0.5rem', padding: '1rem', backgroundColor: '#fffdfa' }}>
-                      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '0.75rem', borderBottom: '1px solid #fef3c7', paddingBottom: '0.5rem' }}>
-                        <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
-                          <Activity size={16} color="#d97706" />
-                          <span style={{ fontSize: '0.85rem', fontWeight: 700, color: '#92400e' }}>
-                            SAR Radar Polarizations (Sentinel-1 C-Band)
-                          </span>
+                      {/* 2. SAR Radar Polarizations (SECOND) */}
+                      <div style={{ border: '1px solid #fde68a', borderRadius: '0.5rem', padding: '1rem', backgroundColor: '#fffdfa' }}>
+                        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '0.75rem', borderBottom: '1px solid #fef3c7', paddingBottom: '0.5rem' }}>
+                          <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
+                            <Activity size={16} color="#d97706" />
+                            <span style={{ fontSize: '0.85rem', fontWeight: 700, color: '#92400e' }}>
+                              SAR Radar Polarizations (Sentinel-1 C-Band)
+                            </span>
+                          </div>
+                        </div>
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: '0.65rem' }}>
+                          {isScopeS2 ? (
+                            <div style={{ padding: '1rem', textAlign: 'center', color: '#64748b', fontSize: '0.8rem', backgroundColor: '#f8fafc', borderRadius: '0.375rem', border: '1px dashed #cbd5e1' }}>
+                              SAR radar polarizations are not applicable for Sentinel-2 Optical requests.
+                            </div>
+                          ) : (
+                            AVAILABLE_SAR_BANDS.map(b => renderLayerCard(b, '#92400e', '#fffbeb', '#fde68a'))
+                          )}
                         </div>
                       </div>
-                      <div style={{ display: 'flex', flexDirection: 'column', gap: '0.65rem' }}>
-                        {AVAILABLE_SAR_BANDS.map(b => renderLayerCard(b, '#92400e', '#fffbeb', '#fde68a'))}
-                      </div>
-                    </div>
 
-                    {/* 3. Optical Spectral Bands (THIRD) */}
-                    <div style={{ border: '1px solid #bbf7d0', borderRadius: '0.5rem', padding: '1rem', backgroundColor: '#fafffd' }}>
-                      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '0.75rem', borderBottom: '1px solid #dcfce7', paddingBottom: '0.5rem' }}>
-                        <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
-                          <Satellite size={16} color="#059669" />
-                          <span style={{ fontSize: '0.85rem', fontWeight: 700, color: '#065f46' }}>
-                            Optical Spectral Bands (Sentinel-2 MSI)
-                          </span>
+                      {/* 3. Optical Spectral Bands (THIRD) */}
+                      <div style={{ border: '1px solid #bbf7d0', borderRadius: '0.5rem', padding: '1rem', backgroundColor: '#fafffd' }}>
+                        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '0.75rem', borderBottom: '1px solid #dcfce7', paddingBottom: '0.5rem' }}>
+                          <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
+                            <Satellite size={16} color="#059669" />
+                            <span style={{ fontSize: '0.85rem', fontWeight: 700, color: '#065f46' }}>
+                              Optical Spectral Bands (Sentinel-2 MSI)
+                            </span>
+                          </div>
                         </div>
-                      </div>
-                      <div style={{ display: 'flex', flexDirection: 'column', gap: '0.65rem' }}>
-                        {AVAILABLE_OPTICAL_BANDS.map(b => renderLayerCard(b, '#065f46', '#f0fdf4', '#bbf7d0'))}
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: '0.65rem' }}>
+                          {isScopeS1 ? (
+                            <div style={{ padding: '1rem', textAlign: 'center', color: '#64748b', fontSize: '0.8rem', backgroundColor: '#f8fafc', borderRadius: '0.375rem', border: '1px dashed #cbd5e1' }}>
+                              Optical spectral bands are not applicable for Sentinel-1 SAR requests.
+                            </div>
+                          ) : (
+                            AVAILABLE_OPTICAL_BANDS.map(b => renderLayerCard(b, '#065f46', '#f0fdf4', '#bbf7d0'))
+                          )}
+                        </div>
                       </div>
                     </div>
                   </div>

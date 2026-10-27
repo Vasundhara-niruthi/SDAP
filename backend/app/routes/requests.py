@@ -216,19 +216,25 @@ def run_pipeline_background(request_id: int):
     except Exception as e:
         logger.error(f"Error running pipeline for request {request_id}: {e}", exc_info=True)
         try:
-            from app.db.scripts.download_district_tiles import append_request_log
-            append_request_log(db, request_id, f"\n[ERROR] Pipeline crashed unexpectedly: {e}", level="ERROR")
+            db.close()
         except Exception:
             pass
         try:
-            db.refresh(req)
-            if req.status != "STOPPED":
-                req.status = "FAILED"
-                db.commit()
+            fail_db = SessionLocal()
+            from app.db.scripts.download_district_tiles import append_request_log
+            append_request_log(fail_db, request_id, f"\n[ERROR] Pipeline crashed unexpectedly: {e}", level="ERROR")
+            f_req = fail_db.query(RequestModel).filter(RequestModel.id == request_id).first()
+            if f_req and f_req.status != "STOPPED":
+                f_req.status = "FAILED"
+                fail_db.commit()
+            fail_db.close()
+        except Exception as ex2:
+            logger.error(f"Could not record pipeline failure state for request #{request_id}: {ex2}")
+    finally:
+        try:
+            db.close()
         except Exception:
             pass
-    finally:
-        db.close()
 
 
 def build_request_response(

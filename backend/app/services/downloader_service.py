@@ -1806,8 +1806,24 @@ def get_downloaded_tifs_for_request(db: Session, request_id: int) -> dict:
     # 3. Query all verified .tif / .tiff band files for these scenes
     if has_s1_request and not has_s2_request:
         try:
-            s1_scene_objs = [db.query(SceneModel).filter(SceneModel.scene_id == sid).first() for sid in matched_scene_ids if sid.startswith("S1")]
-            s1_scene_objs = [so for so in s1_scene_objs if so]
+            s1_scene_objs = []
+            for sid in matched_scene_ids:
+                if sid.startswith("S1"):
+                    so = db.query(SceneModel).filter(SceneModel.scene_id == sid).first()
+                    if not so:
+                        first_bf = db.query(BandFileModel).filter(BandFileModel.scene_id == sid).first()
+                        s_dt = first_bf.sensing_date if first_bf else None
+                        first_path = first_bf.path if first_bf else None
+                        class _MockScene: pass
+                        m = _MockScene()
+                        m.scene_id = sid
+                        m.tile = "S1_SAR"
+                        m.sensing_date = s_dt
+                        m.satellite = "Sentinel-1"
+                        m.folder = sid
+                        m.archive_path = os.path.dirname(os.path.dirname(first_path)) if (first_path and "measurement" in first_path.lower()) else (os.path.dirname(first_path) if first_path else None)
+                        so = m
+                    s1_scene_objs.append(so)
             if s1_scene_objs:
                 ensure_s1_calibrated_rasters_available(db, s1_scene_objs)
         except Exception as e:
@@ -1894,6 +1910,19 @@ def get_downloaded_tifs_for_request(db: Session, request_id: int) -> dict:
             "size_bytes": f_size,
             "exists_on_disk": True
         })
+
+    # Prioritize calibrated files over raw tiles and deduplicate by (scene_id, band)
+    dedup_map = {}
+    for tf in tif_files:
+        k = (tf["scene_id"], tf["band"])
+        if k not in dedup_map:
+            dedup_map[k] = tf
+        else:
+            if tf.get("is_calibrated") and not dedup_map[k].get("is_calibrated"):
+                dedup_map[k] = tf
+    tif_files = list(dedup_map.values())
+    tif_paths = [tf["path"] for tf in tif_files]
+    total_size = sum(tf.get("size_bytes", 0) for tf in tif_files)
 
     # 3b. Check if any matched scenes exist on NAS storage but have missing records in BandFileModel
     unindexed_scenes = matched_scene_ids - scenes_indexed
