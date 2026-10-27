@@ -14,7 +14,7 @@ Description:
 import enum
 from datetime import datetime
 from sqlalchemy import (
-    Column, Integer, String, Float, Boolean, DateTime, Text, ForeignKey, JSON,
+    Column, Integer, BigInteger, String, Float, Boolean, DateTime, Text, ForeignKey, JSON,
     Enum as SQLEnum
 )
 from sqlalchemy.orm import relationship
@@ -101,9 +101,9 @@ class BandFileModel(Base):
     tile = Column(String(50), nullable=False)
     sensing_date = Column(String(20), nullable=False)
     satellite = Column(String(50), nullable=False)
-    band = Column(String(20), nullable=False)
+    band = Column(String(100), nullable=False)
     path = Column(Text, nullable=False)
-    size_bytes = Column(Integer, nullable=False, default=0)
+    size_bytes = Column(BigInteger, nullable=False, default=0)
     verified = Column(Integer, nullable=False, default=0)       # 1 if verified, 0 if failed
     downloaded_at = Column(DateTime, default=datetime.utcnow)
 

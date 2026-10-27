@@ -783,6 +783,8 @@ def run_district_acquisition_pipeline(
                 _link_scene_to_request(db, request_id, s_id)
                 arch_path = _scene_attr(sc_obj, "archive_path", "")
                 scene_dir = os.path.dirname(arch_path) if arch_path.endswith("manifest.safe") else arch_path
+                if not scene_dir or not os.path.isdir(scene_dir):
+                    scene_dir = _resolve_scene_dir(sc_obj, satellite, district_name=district_name)
 
                 if not os.path.isdir(scene_dir):
                     append_request_log(db, request_id, f"  ⚠ Scene directory '{scene_dir}' not found on disk; skipping.")

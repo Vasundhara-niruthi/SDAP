@@ -2457,7 +2457,7 @@ export default function App() {
         if (gapTilesM) {
           const rawTiles = gapTilesM[1].replace(/['"]/g, '').split(',').map(t => t.trim()).filter(Boolean);
           gapSummary.tilesIdentified = rawTiles;
-          rawTiles.forEach(t => { if (t !== 'S1_SAR') tilesSet.add(t); });
+          rawTiles.forEach(t => { if (t !== 'S1_SAR' || hasS1) tilesSet.add(t); });
         }
 
         const gapM = line.match(/Gap Check complete.*Available on S3:\s*(\d+).*Already held:\s*(\d+).*Genuinely missing:\s*(\d+)/i)
@@ -2516,7 +2516,7 @@ export default function App() {
             held: heldCount,
             total: totalCount
           };
-          if (tileName !== 'S1_SAR') tilesSet.add(tileName);
+          if (tileName !== 'S1_SAR' || hasS1) tilesSet.add(tileName);
         }
 
         // 5. Extract MGRS / S1 Tiles identified
@@ -2524,7 +2524,7 @@ export default function App() {
         if (tilesMatch) {
           tilesMatch[1].replace(/['"]/g, '').split(',').forEach(t => {
             const cleanT = t.trim();
-            if (cleanT && cleanT !== 'S1_SAR') tilesSet.add(cleanT);
+            if (cleanT && (cleanT !== 'S1_SAR' || hasS1)) tilesSet.add(cleanT);
           });
         }
 
@@ -3076,18 +3076,24 @@ export default function App() {
     const sceneList = Object.values(scenesMap);
 
     if (sceneList.length === 0) {
-      Array.from(tilesSet).forEach(t => {
+      const activeTiles = tilesSet.size > 0
+        ? Array.from(tilesSet)
+        : (hasS1 ? ['S1_SAR'] : (selectedReq?.district ? [selectedReq.district] : ['AOI']));
+
+      activeTiles.forEach(t => {
         sceneList.push({
-          folder: `Pending Scene Acquisition (${t})`,
+          folder: (gapSummary.availableS3 > 0)
+            ? `Candidate Acquisition (${t} · ${gapSummary.availableS3} scenes queued)`
+            : `Pending Scene Acquisition (${t})`,
           tile: t,
           date: (selectedReq?.start_date || '').split('T')[0] || '—',
-          satellite: selectedReq?.satellite || 'Sentinel-2',
-          status: 'PENDING',
-          bands: [], // Start EMPTY
+          satellite: selectedReq?.satellite || (hasS1 ? 'Sentinel-1' : 'Sentinel-2'),
+          status: selectedReq?.status === 'STOPPED' ? 'STOPPED' : 'PENDING',
+          bands: hasS1 ? ['VV', 'VH'] : ['B02', 'B03', 'B04', 'B08', 'B8A', 'B11', 'SCL', 'TCI'],
           missingBands: [],
           bandSizes: {},
           totalSize: '',
-          warning: null,
+          warning: selectedReq?.status === 'STOPPED' ? 'Execution halted cleanly by user' : null,
           warnings: []
         });
       });
@@ -4704,42 +4710,9 @@ export default function App() {
             <tbody>
               {displayScenes.length === 0 ? (
                 <tr>
-                  <td colSpan={6} style={{ padding: '1.5rem 1rem', textAlign: 'center', color: '#64748b', backgroundColor: '#ffffff' }}>
-                    {selectedReq?.execution_logs && selectedReq.execution_logs.trim().length > 0 ? (
-                      <div style={{ textAlign: 'left', maxWidth: '100%', margin: '0 auto' }}>
-                        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '0.65rem', paddingBottom: '0.45rem', borderBottom: '1px solid #e2e8f0' }}>
-                          <span style={{ fontSize: '0.78rem', fontWeight: 700, color: '#1e293b', display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
-                            <Terminal size={14} color="#2563eb" /> Live Pipeline Execution Output
-                          </span>
-                          <span style={{ fontSize: '0.72rem', color: '#64748b' }}>Real-time execution log recorder</span>
-                        </div>
-                        <div className="log-terminal" style={{
-                          backgroundColor: '#0f172a',
-                          color: '#f8fafc',
-                          padding: '0.85rem 1.1rem',
-                          borderRadius: '0.375rem',
-                          fontFamily: 'monospace',
-                          fontSize: '0.74rem',
-                          maxHeight: '380px',
-                          overflowY: 'auto',
-                          whiteSpace: 'pre-wrap',
-                          wordBreak: 'break-word',
-                          lineHeight: '1.55'
-                        }}>
-                          {renderLogContent(selectedReq.execution_logs)}
-                        </div>
-                      </div>
-                    ) : (
-                      <div style={{ padding: '2rem 1rem', textAlign: 'center' }}>
-                        <RefreshCw size={24} className="spin" style={{ margin: '0 auto 0.75rem auto', color: '#2563eb' }} />
-                        <div style={{ fontWeight: 600, color: '#1e293b', marginBottom: '0.35rem' }}>
-                          Loading execution logs for Request #{selectedReq?.id}...
-                        </div>
-                        <div style={{ fontSize: '0.78rem', color: '#64748b' }}>
-                          Synchronizing live acquisition stream with NAS &amp; AWS S3 storage...
-                        </div>
-                      </div>
-                    )}
+                  <td colSpan={6} style={{ padding: '3rem 1rem', textAlign: 'center', color: '#64748b', backgroundColor: '#ffffff' }}>
+                    <RefreshCw size={22} className="spin" style={{ margin: '0 auto 0.5rem auto', color: '#2563eb' }} />
+                    <div style={{ fontWeight: 600, color: '#1e293b' }}>Synchronizing acquisition stream... Connecting to NAS &amp; AWS S3...</div>
                   </td>
                 </tr>
               ) : (

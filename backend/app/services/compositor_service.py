@@ -44,6 +44,7 @@ from app.core.config import settings
 from app.models.sdap_models import RequestModel, ProcessJobModel, SceneModel, BandFileModel
 from app.services.delivery_service import get_district_geometry_from_db
 from app.services.downloader_service import verify_raster, resolve_tif_path, is_raster_overlapping_district
+from app.services.sentinel1_processor_service import win_safe_path
 
 logger = logging.getLogger("sdap.compositor")
 
@@ -337,7 +338,7 @@ def create_temporal_composite_raster(
         minx, miny, maxx, maxy = 180.0, 90.0, -180.0, -90.0
         for p in valid_inputs:
             try:
-                with rasterio.open(p) as src:
+                with rasterio.open(win_safe_path(p)) as src:
                     if src.crs:
                         b_minx, b_miny, b_maxx, b_maxy = transform_bounds(src.crs, target_crs, *src.bounds)
                         minx, miny = min(minx, b_minx), min(miny, b_miny)
@@ -381,7 +382,7 @@ def create_temporal_composite_raster(
     # 4. Reproject each tile using window slicing
     for r_idx, r_path in enumerate(valid_inputs, start=1):
         try:
-            with rasterio.open(r_path) as src:
+            with rasterio.open(win_safe_path(r_path)) as src:
                 src_crs = src.crs
                 if src_crs is None:
                     continue
@@ -638,7 +639,7 @@ def run_temporal_compositing_for_request(
                     except Exception: pass
 
                 try:
-                    with rasterio.open(existing_path) as src:
+                    with rasterio.open(win_safe_path(existing_path)) as src:
                         arr = src.read(1)
                         valid_mask = ~np.isnan(arr)
                         valid_pixels = int(np.count_nonzero(valid_mask))

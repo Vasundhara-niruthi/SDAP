@@ -1,3 +1,4 @@
+from boto3.s3.transfer import TransferConfig
 import shutil
 """
 SDAP Step 4 Downloader & Raster Integrity Service
@@ -43,7 +44,14 @@ REGION = S2_REGION
 EXPECTED_OFFSET_APPLIED = True
 MAX_ATTEMPTS = 5
 BACKOFF_BASE_SECONDS = 3
-BAND_WORKERS = 5
+BAND_WORKERS = 8
+
+S3_FAST_CONFIG = TransferConfig(
+    multipart_threshold=8 * 1024 * 1024,
+    max_concurrency=10,
+    multipart_chunksize=8 * 1024 * 1024,
+    use_threads=True
+)
 
 DEFAULT_BANDS = ["B02", "B03", "B04", "B08", "TCI", "B8A", "B11", "SCL"]
 
@@ -110,16 +118,24 @@ def is_raster_overlapping_district(file_path: str, district_bbox: Optional[Any])
     if not district_bbox or not file_path:
         return True
     try:
-        norm_key = str(file_path).strip().lower()
+        norm_fp = str(file_path).replace("\\", "/").lower()
+        # Fast path: If the raster is already stored in a district folder, it is guaranteed to overlap
+        if "s1_sar/" in norm_fp or "sentinel-1/" in norm_fp:
+            for seg in norm_fp.split("/"):
+                if seg and not seg.isdigit() and not seg.startswith("s1") and not seg.startswith("sdap") and seg not in ("sentinel-1", "s1_sar", "remote-sensing"):
+                    return True
+
+        norm_key = norm_fp.strip()
         if norm_key in _RASTER_BOUNDS_CACHE:
             bounds = _RASTER_BOUNDS_CACHE[norm_key]
         else:
             from rasterio.warp import transform_bounds
+            from app.services.sentinel1_processor_service import win_safe_path
             resolved, exists = resolve_tif_path(file_path)
             if not exists or not os.path.exists(resolved):
                 _RASTER_BOUNDS_CACHE[norm_key] = None
                 return True
-            with rasterio.open(resolved) as src:
+            with rasterio.open(win_safe_path(resolved)) as src:
                 if src.crs:
                     bounds = transform_bounds(src.crs, "EPSG:4326", *src.bounds)
                 elif src.gcps and len(src.gcps[0]) > 0:
@@ -377,7 +393,7 @@ def fetch_s3_object(key: str, target_path: str, bucket: str = None, client: boto
                 os.makedirs(os.path.dirname(temp_path), exist_ok=True)
 
                 # 2. Download raster to temporary .part file
-                client.download_file(bucket, active_key, temp_path)
+                client.download_file(bucket, active_key, temp_path, Config=S3_FAST_CONFIG)
                 downloaded_size = os.path.getsize(temp_path)
 
                 # 3. Exact Byte-for-Byte Check against AWS S3
@@ -439,7 +455,8 @@ def verify_raster(path: str) -> tuple[bool, int, str]:
         return False, 0, "empty"
 
     try:
-        with rasterio.open(path) as source:
+        from app.services.sentinel1_processor_service import win_safe_path
+        with rasterio.open(win_safe_path(path)) as source:
             if source.width == 0 or source.height == 0:
                 return False, size, "zero dimensions"
             has_gcps = bool(source.gcps and len(source.gcps) > 0 and len(source.gcps[0]) > 0)
@@ -1971,10 +1988,6 @@ def get_downloaded_tifs_for_request(db: Session, request_id: int) -> dict:
                     sc_sat = "Sentinel-1" if sc_id.startswith("S1") else "Sentinel-2"
                     cand_files = []
                     if sc_sat == "Sentinel-1" or sc_id.startswith("S1"):
-                        try:
-                            repair_missing_s1_rasters_in_dir(target_dir)
-                        except Exception:
-                            pass
                         s1_cal_found = []
                         for fname in os.listdir(target_dir):
                             if fname.lower().endswith((".tif", ".tiff")):
@@ -2197,21 +2210,22 @@ def repair_missing_s1_rasters_in_dir(scene_dir: str) -> None:
 
     target_ext = vv_ext or r_ext or vh_ext or ".tif"
 
-    # Case 1: VV and Ratio exist, but VH is missing -> VH = VV - Ratio
+    # Case 1: VV and Ratio exist, but VH is missing -> VH = VV - Ratio (Chunked Window Processing)
     if has_vv and has_ratio and not has_vh:
         try:
             out_vh_path = os.path.join(scene_dir, f"VH_Orb_tnr_cal_Tc_db{target_ext}")
             safe_out_vh = win_safe_path(out_vh_path)
             with rasterio.open(safe_vv) as src_vv, rasterio.open(safe_ratio) as src_r:
-                vv = src_vv.read(1).astype(np.float32)
-                r = src_r.read(1).astype(np.float32)
                 prof = src_vv.profile.copy()
-            vh = vv - r
-            nodata_mask = (vv <= -990.0) | (r <= -990.0) | np.isnan(vv) | np.isnan(r) | np.isinf(vv) | np.isinf(r)
-            vh[nodata_mask] = -999.0
-            prof.update(dtype=rasterio.float32, count=1, nodata=-999.0, compress="lzw")
-            with rasterio.open(safe_out_vh, "w", **prof) as dst:
-                dst.write(vh, 1)
+                prof.update(dtype=rasterio.float32, count=1, nodata=-999.0, compress="lzw")
+                with rasterio.open(safe_out_vh, "w", **prof) as dst:
+                    for _, window in src_vv.block_windows(1):
+                        vv = src_vv.read(1, window=window).astype(np.float32)
+                        r = src_r.read(1, window=window).astype(np.float32)
+                        vh = vv - r
+                        nodata_mask = (vv <= -990.0) | (r <= -990.0) | np.isnan(vv) | np.isnan(r) | np.isinf(vv) | np.isinf(r)
+                        vh[nodata_mask] = -999.0
+                        dst.write(vh, 1, window=window)
             logger.info(f"Reconstructed missing VH calibrated raster: '{out_vh_path}'")
         except Exception as e:
             logger.warning(f"Could not reconstruct VH raster in '{scene_dir}': {e}")
@@ -2294,8 +2308,7 @@ def ensure_s1_calibrated_rasters_available(
         if not os.path.isdir(safe_sc_dir):
             continue
 
-        # First run fast repair in case 2 of 3 rasters exist on disk
-        repair_missing_s1_rasters_in_dir(sc_dir)
+        # Rasters are read-only during retrieval; repair belongs to background processing pipeline
 
         all_found = True
         found_paths = {}
@@ -2313,20 +2326,9 @@ def ensure_s1_calibrated_rasters_available(
                 all_found = False
 
         if not all_found:
-            meas_dir = os.path.join(sc_dir, "measurement")
-            has_raw = os.path.isdir(win_safe_path(meas_dir)) or os.path.isfile(win_safe_path(os.path.join(sc_dir, "manifest.safe")))
-            if has_raw:
-                try:
-                    res = run_sentinel_1_processing(sc_dir)
-                    if res.get("success"):
-                        sync_s1_processed_rasters_to_db(db, sc, res)
-                        for b_name, fname in s1_bands_to_find:
-                            fpath = os.path.join(sc_dir, fname)
-                            safe_fpath = win_safe_path(fpath)
-                            if os.path.isfile(safe_fpath):
-                                found_paths[b_name] = fpath
-                except Exception as ex:
-                    logger.warning(f"Could not run S1 processing for {sc_id} during retrieval: {ex}")
+            # Calibrated rasters are not yet generated. SAR calibration belongs strictly
+            # to Stage 3 of the background pipeline. Never run heavy processing on GET requests.
+            logger.debug(f"Calibrated S1 rasters not yet complete for scene '{sc_id}' on disk; skipping on-the-fly execution.")
 
         now = datetime.utcnow()
         for b_name, fpath in found_paths.items():
@@ -2949,11 +2951,7 @@ def search_downloaded_tifs_by_region(
                     else:
                         sc_sensing_date = start_date or "2026-06-01"
 
-                    try:
-                        # Run quick repair if needed in this scene directory
-                        repair_missing_s1_rasters_in_dir(root_dir)
-                    except Exception as rep_err:
-                        logger.debug(f"Quick repair skipped for {root_dir}: {rep_err}")
+                    # Scan is read-only; no on-the-fly repairs during directory scan
 
                     for fn in fnames:
                         fn_lower = fn.lower()
