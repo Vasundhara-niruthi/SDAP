@@ -88,6 +88,43 @@ def win_safe_path(p: str) -> str:
     return norm_p
 
 
+def resolve_s1_raster_georeferencing(raster_path: str, src_dataset: Optional[rasterio.DatasetReader] = None) -> Tuple[Optional[List], Optional[Any]]:
+    """
+    Resolves spatial georeferencing for a Sentinel-1 raster:
+      Returns (gcps_list, crs).
+      - If dataset has a defined CRS and affine transform, returns (None, src_dataset.crs).
+      - If dataset has embedded GCPs, returns (src_dataset.gcps[0], src_dataset.gcps[1] or 'EPSG:4326').
+      - Fallback: Checks the scene's 'measurement/' directory for raw files containing GCPs.
+    """
+    try:
+        if src_dataset is not None:
+            if src_dataset.crs is not None:
+                return None, src_dataset.crs
+            if src_dataset.gcps and len(src_dataset.gcps[0]) > 0:
+                gcps_list, gcps_crs = src_dataset.gcps
+                return gcps_list, gcps_crs or "EPSG:4326"
+
+        # Check raw measurement files in the scene root
+        resolved = win_safe_path(raster_path)
+        parent_dir = os.path.dirname(resolved)
+        scene_dir = os.path.dirname(parent_dir) if os.path.basename(parent_dir).lower() == "measurement" else parent_dir
+        meas_dir = os.path.join(scene_dir, "measurement")
+
+        if os.path.isdir(meas_dir):
+            import glob
+            for raw_f in glob.glob(os.path.join(meas_dir, "*.tiff")) + glob.glob(os.path.join(meas_dir, "*.tif")):
+                try:
+                    with rasterio.open(win_safe_path(raw_f)) as src_raw:
+                        if src_raw.gcps and len(src_raw.gcps[0]) > 0:
+                            gcps_list, gcps_crs = src_raw.gcps
+                            return gcps_list, gcps_crs or "EPSG:4326"
+                except Exception:
+                    pass
+    except Exception as e:
+        logger.debug(f"Could not resolve georeferencing for '{raster_path}': {e}")
+    return None, None
+
+
 def safe_makedirs(path: str) -> None:
     """Safely creates directories supporting Windows extended paths and network shares."""
     if not path:
@@ -197,6 +234,8 @@ def compute_s1_vv_vh_ratio(vv_path: str, vh_path: str, output_path: str) -> bool
 
                 safe_makedirs(os.path.dirname(local_temp))
                 with rasterio.open(local_temp, "w", **profile) as dst:
+                    if src_vv.gcps and len(src_vv.gcps[0]) > 0:
+                        dst.gcps = src_vv.gcps
                     for _, window in src_vv.block_windows(1):
                         vv = src_vv.read(1, window=window).astype(np.float32)
                         vh = src_vh.read(1, window=window).astype(np.float32)
@@ -620,6 +659,8 @@ def execute_sequential_s1_pipeline(
         prof_vv = src_vv.profile.copy()
         prof_vv.update(dtype=rasterio.float32, count=1, nodata=-999.0, compress="lzw")
         with rasterio.open(win_safe_path(vv_out), "w", **prof_vv) as dst_vv:
+            if src_vv.gcps and len(src_vv.gcps[0]) > 0:
+                dst_vv.gcps = src_vv.gcps
             for r in range(0, rows, chunk_h):
                 h = min(chunk_h, rows - r)
                 win = rasterio.windows.Window(0, r, cols, h)
@@ -646,6 +687,8 @@ def execute_sequential_s1_pipeline(
         prof_vh = src_vh.profile.copy()
         prof_vh.update(dtype=rasterio.float32, count=1, nodata=-999.0, compress="lzw")
         with rasterio.open(win_safe_path(vh_out), "w", **prof_vh) as dst_vh:
+            if src_vh.gcps and len(src_vh.gcps[0]) > 0:
+                dst_vh.gcps = src_vh.gcps
             for r in range(0, rows, chunk_h):
                 h = min(chunk_h, rows - r)
                 win = rasterio.windows.Window(0, r, cols, h)

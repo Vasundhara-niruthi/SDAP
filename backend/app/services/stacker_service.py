@@ -47,6 +47,7 @@ from app.core.config import settings
 from app.models.sdap_models import RequestModel, ProcessJobModel, SceneModel, BandFileModel
 from app.services.delivery_service import get_district_geometry_from_db
 from app.services.downloader_service import resolve_tif_path, is_raster_overlapping_district
+from app.services.sentinel1_processor_service import resolve_s1_raster_georeferencing
 
 logger = logging.getLogger("sdap.stacker")
 
@@ -336,30 +337,93 @@ def find_band_rasters_for_district(
             else:
                 scene_root = parent_dir
 
-            # If matching S1 band and calibrated file exists, upgrade to calibrated GeoTIFF
+            # STRICTLY PROCESSED FILES ONLY for Sentinel-1: require calibrated GeoTIFF
             if is_s1_vv:
+                cal_cand = None
                 for ext in (".tiff", ".tif", ".TIFF", ".TIF"):
-                    cal_cand = os.path.join(scene_root, f"VV_Orb_tnr_cal_Tc_db{ext}")
-                    if os.path.isfile(cal_cand) and os.path.getsize(cal_cand) > 1024:
-                        candidate_p = cal_cand
+                    chk = os.path.join(scene_root, f"VV_Orb_tnr_cal_Tc_db{ext}")
+                    if os.path.isfile(chk) and os.path.getsize(chk) > 1024:
+                        cal_cand = chk
                         break
+                if not cal_cand and "orb_tnr_cal" in candidate_p.lower() and os.path.getsize(candidate_p) > 1024:
+                    cal_cand = candidate_p
+                if not cal_cand:
+                    continue  # Reject uncalibrated raw measurement file
+                candidate_p = cal_cand
             elif is_s1_vh:
+                cal_cand = None
                 for ext in (".tiff", ".tif", ".TIFF", ".TIF"):
-                    cal_cand = os.path.join(scene_root, f"VH_Orb_tnr_cal_Tc_db{ext}")
-                    if os.path.isfile(cal_cand) and os.path.getsize(cal_cand) > 1024:
-                        candidate_p = cal_cand
+                    chk = os.path.join(scene_root, f"VH_Orb_tnr_cal_Tc_db{ext}")
+                    if os.path.isfile(chk) and os.path.getsize(chk) > 1024:
+                        cal_cand = chk
                         break
+                if not cal_cand and "orb_tnr_cal" in candidate_p.lower() and os.path.getsize(candidate_p) > 1024:
+                    cal_cand = candidate_p
+                if not cal_cand:
+                    continue  # Reject uncalibrated raw measurement file
+                candidate_p = cal_cand
             elif is_s1_ratio:
+                cal_cand = None
                 for ext in (".tiff", ".tif", ".TIFF", ".TIF"):
-                    cal_cand = os.path.join(scene_root, f"VV_VH_Orb_tnr_cal_Tc_db{ext}")
-                    if os.path.isfile(cal_cand) and os.path.getsize(cal_cand) > 1024:
-                        candidate_p = cal_cand
+                    chk = os.path.join(scene_root, f"VV_VH_Orb_tnr_cal_Tc_db{ext}")
+                    if os.path.isfile(chk) and os.path.getsize(chk) > 1024:
+                        cal_cand = chk
                         break
+                if not cal_cand and "orb_tnr_cal" in candidate_p.lower() and os.path.getsize(candidate_p) > 1024:
+                    cal_cand = candidate_p
+                if not cal_cand:
+                    continue
+                candidate_p = cal_cand
 
             norm = _normalize_unc_path(candidate_p)
             if norm.lower() not in seen_paths:
                 seen_paths.add(norm.lower())
                 found_paths.append(norm)
+
+    # Fallback search on NAS storage for calibrated S1 processed rasters if DB query found none
+    if not found_paths and (is_s1_vv or is_s1_vh or is_s1_ratio):
+        pol_prefix = "VV" if is_s1_vv else ("VH" if is_s1_vh else "VV_VH")
+        target_stem = f"{pol_prefix}_Orb_tnr_cal_Tc_db"
+        nas_s1_dirs = [
+            os.path.join(settings.RAW_ARCHIVE_DIR, "Sentinel-1", "S1_SAR", district),
+            os.path.join(settings.RAW_ARCHIVE_DIR, "Sentinel-1", "S1_SAR", clean_d.capitalize()),
+            os.path.join(settings.RAW_ARCHIVE_DIR, "Sentinel-1", "S1_SAR"),
+            os.path.join(settings.RAW_ARCHIVE_DIR, "S1_SAR", district),
+            os.path.join(settings.RAW_ARCHIVE_DIR, "S1_SAR")
+        ]
+        for s_dir in nas_s1_dirs:
+            if not os.path.exists(s_dir):
+                continue
+            for root, _, files in os.walk(s_dir):
+                for fn in files:
+                    fn_u = fn.upper()
+                    if fn_u.startswith(target_stem.upper()) and (fn_u.endswith(".TIFF") or fn_u.endswith(".TIF")):
+                        full_p = os.path.join(root, fn)
+                        if not (os.path.isfile(full_p) and os.path.getsize(full_p) > 1024):
+                            continue
+                        date_match = None
+                        m = re.search(r"(\d{8})T", full_p.replace("\\", "/"))
+                        if m:
+                            try:
+                                d_str = m.group(1)
+                                date_match = f"{d_str[:4]}-{d_str[4:6]}-{d_str[6:8]}"
+                            except Exception:
+                                pass
+                        if not date_match:
+                            m2 = re.search(r"(\d{4})-(\d{2})-(\d{2})", fn)
+                            if m2:
+                                date_match = m2.group(0)
+
+                        if date_match:
+                            if start_date and date_match < start_date:
+                                continue
+                            if end_date and date_match > end_date:
+                                continue
+
+                        norm = _normalize_unc_path(full_p)
+                        if norm.lower() not in seen_paths:
+                            seen_paths.add(norm.lower())
+                            found_paths.append(norm)
 
     return found_paths
 
@@ -459,15 +523,23 @@ def reproject_and_mosaic_band_to_grid(
                     src_crs = src.crs
                     gcps = None
 
-                    if src_crs is None and src.gcps and len(src.gcps[0]) > 0:
-                        gcps_list, gcps_crs = src.gcps
-                        src_crs = gcps_crs or target_crs
-                        gcps = gcps_list
-                        xs = [g.x for g in gcps_list]
-                        ys = [g.y for g in gcps_list]
-                        t_minx, t_miny, t_maxx, t_maxy = transform_bounds(
-                            src_crs, target_crs, min(xs), min(ys), max(xs), max(ys)
-                        )
+                    if src_crs is None:
+                        if src.gcps and len(src.gcps[0]) > 0:
+                            gcps_list, gcps_crs = src.gcps
+                        else:
+                            gcps_list, gcps_crs = resolve_s1_raster_georeferencing(norm_p, src)
+
+                        if gcps_list:
+                            src_crs = gcps_crs or target_crs
+                            gcps = gcps_list
+                            xs = [g.x for g in gcps_list]
+                            ys = [g.y for g in gcps_list]
+                            t_minx, t_miny, t_maxx, t_maxy = transform_bounds(
+                                src_crs, target_crs, min(xs), min(ys), max(xs), max(ys)
+                            )
+                        else:
+                            logger.warning(f"Raster {fname} has no CRS or GCPs. Skipping.")
+                            continue
                     elif src_crs is not None:
                         t_minx, t_miny, t_maxx, t_maxy = transform_bounds(src_crs, target_crs, *src.bounds)
                     else:
@@ -481,8 +553,8 @@ def reproject_and_mosaic_band_to_grid(
                             log_cb(msg, "WARNING")
                         continue
 
-                    src_nodata_val = src.nodata if src.nodata is not None else 0.0
-                    # Fast path: write first overlapping tile directly into accumulated array
+                    src_nodata_val = src.nodata if (src.nodata is not None and not np.isnan(src.nodata)) else -999.0
+                    # Write into dedicated tile buffer
                     if not has_written_first:
                         target_buf = accumulated
                     else:
@@ -510,10 +582,32 @@ def reproject_and_mosaic_band_to_grid(
                         reproject_kwargs["src_crs"] = src_crs
 
                     reproject(**reproject_kwargs)
+
+                    # CRITICAL: Clean out extreme nodata artifacts (e.g. 3.4e38, -3.4e38, -999.0, inf)
+                    invalid_mask = (
+                        np.isnan(target_buf) |
+                        np.isinf(target_buf) |
+                        (target_buf <= -990.0) |
+                        (target_buf >= 1e30) |
+                        (target_buf <= -1e30)
+                    )
+                    target_buf[invalid_mask] = np.nan
+
+                    if band_name and band_name.upper().strip() in ("VV", "VH", "VV_VH"):
+                        # Calibrated Sentinel-1 SAR backscatter in dB is typically -50 dB to +5 dB.
+                        # Exclude 0.0 (swath background), values < -60 dB, and values > 15 dB:
+                        sar_invalid = (target_buf < -60.0) | (target_buf > 15.0) | (target_buf == 0.0)
+                        target_buf[sar_invalid] = np.nan
+
                     if not has_written_first:
                         has_written_first = True
                     else:
-                        np.fmax(accumulated, dest_tile, out=accumulated)
+                        # Seamless mosaic: take average of overlapping valid pixels, or the non-nan pixel
+                        accumulated = np.where(
+                            np.isnan(accumulated),
+                            dest_tile,
+                            np.where(np.isnan(dest_tile), accumulated, (accumulated + dest_tile) / 2.0)
+                        )
 
                     msg = f"Tile {idx}/{len(input_paths)} ({fname}) reprojected successfully."
                     logger.info(msg)
@@ -526,21 +620,6 @@ def reproject_and_mosaic_band_to_grid(
 
     if district_mask is not None:
         accumulated[~district_mask] = np.nan
-
-    # For Sentinel-1 SAR bands (VV, VH), calibrate raw digital numbers (DN) to backscatter in decibels (dB)
-    # Formula: sigma0 (dB) = 20 * log10(DN) - 83.0 (with -50 dB noise floor)
-    # Matches Copernicus Sentinel-1 GRD and Google Earth Engine calibrated backscatter standards
-    if band_name and band_name.upper().strip() in ("VV", "VH", "VV_VH"):
-        valid_pos = (accumulated > 0) & (~np.isnan(accumulated))
-        if np.any(valid_pos):
-            # If values are raw DN (max > 2.0, since dB values are negative <= 0.0)
-            if np.nanmax(accumulated) > 2.0:
-                with np.errstate(divide="ignore", invalid="ignore"):
-                    accumulated = np.where(
-                        valid_pos,
-                        np.clip(20.0 * np.log10(np.maximum(accumulated, 1e-4)) - 83.0, -50.0, 5.0),
-                        np.nan
-                    )
 
     return accumulated
 
@@ -1083,7 +1162,7 @@ def execute_layer_stacking(
         "dtype": "float32",
         "crs": TARGET_CRS,
         "transform": dst_transform,
-        "nodata": np.nan,
+        "nodata": -999.0,
         "compress": "DEFLATE",
         "predictor": 3,
         "zlevel": 1,
@@ -1103,7 +1182,8 @@ def execute_layer_stacking(
         with rasterio.Env(GDAL_NUM_THREADS="ALL_CPUS", GDAL_CACHEMAX=512):
             with rasterio.open(temp_target, "w", **profile) as dst:
                 for band_idx, arr_2d in enumerate(stacked_arrays, start=1):
-                    dst.write(arr_2d, band_idx)
+                    write_arr = np.where(np.isnan(arr_2d), -999.0, arr_2d).astype("float32")
+                    dst.write(write_arr, band_idx)
                     b_name = layer_names_ordered[band_idx - 1]
                     dst.set_band_description(band_idx, b_name)
                     try:
@@ -1126,7 +1206,8 @@ def execute_layer_stacking(
         with rasterio.Env(GDAL_NUM_THREADS="ALL_CPUS", GDAL_CACHEMAX=512):
             with rasterio.open(loc_tmp, "w", **profile) as dst:
                 for band_idx, arr_2d in enumerate(stacked_arrays, start=1):
-                    dst.write(arr_2d, band_idx)
+                    write_arr = np.where(np.isnan(arr_2d), -999.0, arr_2d).astype("float32")
+                    dst.write(write_arr, band_idx)
                     b_name = layer_names_ordered[band_idx - 1]
                     dst.set_band_description(band_idx, b_name)
                     try:

@@ -3446,7 +3446,8 @@ export default function App() {
             } else {
               // No files on disk yet: create expected placeholders according to formula
               indices.forEach(idx => {
-                const expectedName = `Composite_${idx}_${reqLevel}_${interval}_${district}_${cStart}_${cEnd}.tif`;
+                const effectiveLevel = isS1ReqOnly ? 'mean' : reqLevel;
+                const expectedName = `Composite_${idx}_${effectiveLevel}_${interval}_${district}_${cStart}_${cEnd}.tif`;
                 compositeFiles.push({
                   name: expectedName,
                   size: null,

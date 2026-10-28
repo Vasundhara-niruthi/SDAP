@@ -46,7 +46,7 @@ from app.core.config import settings
 from app.models.sdap_models import RequestModel, ProcessJobModel, SceneModel, BandFileModel
 from app.services.delivery_service import get_district_geometry_from_db
 from app.services.downloader_service import verify_raster, resolve_tif_path, is_raster_overlapping_district
-from app.services.sentinel1_processor_service import win_safe_path
+from app.services.sentinel1_processor_service import win_safe_path, resolve_s1_raster_georeferencing
 
 logger = logging.getLogger("sdap.compositor")
 
@@ -572,9 +572,20 @@ def create_temporal_composite_raster(
         try:
             with rasterio.open(win_safe_path(r_path)) as src:
                 src_crs = src.crs
+                src_gcps = None
+                if src_crs is None:
+                    src_gcps, src_crs = resolve_s1_raster_georeferencing(r_path, src)
                 if src_crs is None:
                     continue
-                t_minx, t_miny, t_maxx, t_maxy = transform_bounds(src_crs, target_crs, *src.bounds)
+
+                if src_gcps:
+                    xs = [g.x for g in src_gcps]
+                    ys = [g.y for g in src_gcps]
+                    t_minx, t_miny, t_maxx, t_maxy = transform_bounds(
+                        src_crs or target_crs, target_crs, min(xs), min(ys), max(xs), max(ys)
+                    )
+                else:
+                    t_minx, t_miny, t_maxx, t_maxy = transform_bounds(src_crs, target_crs, *src.bounds)
 
                 # Check spatial overlap with target grid
                 if t_maxx < minx or t_minx > maxx or t_maxy < miny or t_miny > maxy:
@@ -599,19 +610,43 @@ def create_temporal_composite_raster(
                 win_tf = rasterio.windows.transform(win_adj, dst_transform)
 
                 dest_slice = np.full((w_h, w_w), np.nan, dtype="float32")
-                src_nodata_val = src.nodata if src.nodata is not None else np.nan
-                reproject(
+                src_nodata_val = src.nodata if (src.nodata is not None and not np.isnan(src.nodata)) else -999.0
+                reproject_kwargs = dict(
                     source=rasterio.band(src, 1),
                     destination=dest_slice,
                     src_nodata=src_nodata_val,
                     dst_nodata=np.nan,
-                    src_transform=src.transform,
-                    src_crs=src_crs,
                     dst_transform=win_tf,
                     dst_crs=target_crs,
                     resampling=Resampling.bilinear,
                     num_threads=4
                 )
+                if src_gcps:
+                    reproject_kwargs["gcps"] = src_gcps
+                    reproject_kwargs["src_crs"] = src_crs or target_crs
+                else:
+                    reproject_kwargs["src_transform"] = src.transform
+                    reproject_kwargs["src_crs"] = src_crs
+
+                reproject(**reproject_kwargs)
+
+                # CRITICAL: Clean out GDAL/SNAP nodata artifacts (e.g. 3.4e38, -3.4e38, -999.0, inf)
+                invalid_mask = (
+                    np.isnan(dest_slice) |
+                    np.isinf(dest_slice) |
+                    (dest_slice <= -990.0) |
+                    (dest_slice >= 1e30) |
+                    (dest_slice <= -1e30)
+                )
+                dest_slice[invalid_mask] = np.nan
+
+                # If Sentinel-1 SAR band (VV, VH, VV_VH):
+                is_sar_raster = any(s in output_path.upper() for s in ("_VV_", "_VH_", "COMPOSITE_VV_", "COMPOSITE_VH_"))
+                if is_sar_raster:
+                    # Physical backscatter in dB is typically -50 dB to +5 dB.
+                    # Treat 0.0 (swath boundary / unassigned), < -60 dB, > 15 dB as nodata:
+                    sar_invalid = (dest_slice < -60.0) | (dest_slice > 15.0) | (dest_slice == 0.0)
+                    dest_slice[sar_invalid] = np.nan
 
                 if method_clean == "mean":
                     valid_m = ~np.isnan(dest_slice)
@@ -649,7 +684,7 @@ def create_temporal_composite_raster(
         "dtype": "float32",
         "crs": target_crs,
         "transform": dst_transform,
-        "nodata": np.nan,
+        "nodata": -999.0,  # Explicit nodata for QGIS / GDAL compatibility
         "compress": "DEFLATE",
         "predictor": 3,
         "zlevel": 1,
@@ -662,7 +697,8 @@ def create_temporal_composite_raster(
     with tempfile.TemporaryDirectory() as tmp_dir:
         temp_file = os.path.join(tmp_dir, os.path.basename(output_path))
         with rasterio.open(temp_file, "w", **profile) as dst:
-            dst.write(accumulated, 1)
+            write_arr = np.where(np.isnan(accumulated), -999.0, accumulated).astype("float32")
+            dst.write(write_arr, 1)
             dst.set_band_description(1, method_clean.upper())
             try:
                 dst.update_tags(1, DESCRIPTION=f"{method_clean.upper()} Temporal Composite", METHOD=method_clean)
@@ -679,7 +715,10 @@ def create_temporal_composite_raster(
         os.replace(temp_target, output_path)
 
     # 7. Calculate Statistics
-    valid_mask = ~np.isnan(accumulated)
+    is_sar_out = any(s in output_path.upper() for s in ("_VV_", "_VH_", "COMPOSITE_VV_", "COMPOSITE_VH_"))
+    valid_mask = (~np.isnan(accumulated)) & (accumulated != -990.0) & (accumulated != -999.0) & (accumulated < 1e30) & (accumulated > -1e30)
+    if is_sar_out:
+        valid_mask = valid_mask & (accumulated >= -60.0) & (accumulated <= 15.0) & (accumulated != 0.0)
     valid_pixels = int(np.count_nonzero(valid_mask))
     total_pixels = accumulated.size
     coverage_pct = float(valid_pixels / total_pixels * 100.0) if total_pixels > 0 else 0.0
@@ -736,10 +775,12 @@ def run_sentinel1_compositing(
         logger.info(f"No composite windows generated for S1 interval '{interval}' between {start_str} and {end_str}.")
         return []
 
+    # For Sentinel-1 SAR backscatter in dB, temporal aggregation strictly uses MEAN (average dB)
+    sar_level = "mean"
     cycle_desc = "12-DAY ORBIT CYCLES" if interval.lower() in ("fortnightly", "biweekly") else f"{interval.upper()} WINDOWS"
     header_msg = (
         f"\n==============================================================================\n"
-        f"  [STAGE 4/4] SENTINEL-1 SAR TEMPORAL COMPOSITING ({interval.upper()} - {cycle_desc}, LEVEL: '{req_level.upper()}')\n"
+        f"  [STAGE 4/4] SENTINEL-1 SAR TEMPORAL COMPOSITING ({interval.upper()} - {cycle_desc}, LEVEL: 'MEAN [AVERAGE dB]')\n"
         f"  District: {district_name} | Polarizations: ['VV', 'VH'] | Date Windows ({len(windows)}): {', '.join([w['label'] for w in windows])}\n"
         f"=============================================================================="
     )
@@ -764,10 +805,7 @@ def run_sentinel1_compositing(
     year_str = start_str[0:4]
 
     nas_composite_dir = os.path.join(settings.RAW_ARCHIVE_DIR, "Composites", district_name, year_str, interval.lower())
-    local_delivery_dir = os.path.join(settings.DELIVERY_DIR, f"request_{request_id}")
-
     os.makedirs(nas_composite_dir, exist_ok=True)
-    os.makedirs(local_delivery_dir, exist_ok=True)
 
     polarizations = ["VV", "VH"]
 
@@ -796,80 +834,73 @@ def run_sentinel1_compositing(
                 append_request_log(db, request_id, warn_msg, level="WARNING")
                 continue
 
-            out_filename = f"Composite_{pol}_{req_level}_{interval.lower()}_{district_name}_{w_start.replace('-', '')}_{w_end.replace('-', '')}.tif"
+            sar_level = "mean"
+            out_filename = f"Composite_{pol}_{sar_level}_{interval.lower()}_{district_name}_{w_start.replace('-', '')}_{w_end.replace('-', '')}.tif"
             nas_out_path = os.path.join(nas_composite_dir, out_filename)
-            local_out_path = os.path.join(local_delivery_dir, out_filename)
 
             nas_ok, _, _ = verify_raster(nas_out_path)
-            local_ok, _, _ = verify_raster(local_out_path)
 
-            if nas_ok or local_ok:
-                existing_path = nas_out_path if nas_ok else local_out_path
-                if nas_ok and not local_ok:
-                    try: shutil.copy2(nas_out_path, local_out_path)
-                    except Exception: pass
-                elif local_ok and not nas_ok:
-                    try: shutil.copy2(local_out_path, nas_out_path)
-                    except Exception: pass
-
+            if nas_ok:
                 try:
-                    with rasterio.open(win_safe_path(existing_path)) as src:
+                    with rasterio.open(win_safe_path(nas_out_path)) as src:
                         arr = src.read(1)
-                        valid_mask = ~np.isnan(arr)
+                        valid_mask = (~np.isnan(arr)) & (arr != -999.0) & (arr != -990.0) & (arr < 1e30) & (arr > -1e30)
+                        valid_mask = valid_mask & (arr >= -60.0) & (arr <= 15.0) & (arr != 0.0)
                         valid_pixels = int(np.count_nonzero(valid_mask))
                         total_pixels = arr.size
                         coverage_pct = float(valid_pixels / total_pixels * 100.0) if total_pixels > 0 else 0.0
                         mean_val = float(np.nanmean(arr[valid_mask])) if valid_pixels > 0 else 0.0
                         min_val = float(np.nanmin(arr[valid_mask])) if valid_pixels > 0 else 0.0
                         max_val = float(np.nanmax(arr[valid_mask])) if valid_pixels > 0 else 0.0
-                        file_size_mb = os.path.getsize(existing_path) / (1024 * 1024)
+                        file_size_mb = os.path.getsize(nas_out_path) / (1024 * 1024)
 
-                    stats = {
-                        "output_path": nas_out_path,
-                        "filename": out_filename,
-                        "file_size_mb": round(file_size_mb, 2),
-                        "valid_pixels": valid_pixels,
-                        "total_pixels": total_pixels,
-                        "coverage_pct": round(coverage_pct, 2),
-                        "mean_value": round(mean_val, 4),
-                        "min_value": round(min_val, 4),
-                        "max_value": round(max_val, 4),
-                        "input_scenes_count": len(input_rasters),
-                        "window": win,
-                        "index": pol,
-                        "district": district_name,
-                        "local_delivery_path": local_out_path
-                    }
-                    composite_results.append(stats)
+                    # Quality check: verify the file is not corrupted with 3.4e38, negative infinity, or all NaNs/nodata
+                    is_corrupted = (valid_pixels == 0) or (coverage_pct < 0.1) or (mean_val > 25.0) or (min_val < -65.0) or (max_val > 30.0)
 
-                    comp_log = (
-                        f"     ✓ [{pol} ({req_level.upper()}) S1 COMPOSITE ALREADY EXISTS - SKIPPED] Window '{w_label}' ({w_start} to {w_end}) "
-                        f"verified on NAS -> '{out_filename}' ({stats['file_size_mb']:.1f} MB, Valid Coverage: {stats['coverage_pct']:.1f}%)."
-                    )
-                    logger.info(comp_log)
-                    append_request_log(db, request_id, comp_log)
-                    continue
+                    if not is_corrupted:
+                        stats = {
+                            "output_path": nas_out_path,
+                            "filename": out_filename,
+                            "file_size_mb": round(file_size_mb, 2),
+                            "valid_pixels": valid_pixels,
+                            "total_pixels": total_pixels,
+                            "coverage_pct": round(coverage_pct, 2),
+                            "mean_value": round(mean_val, 4),
+                            "min_value": round(min_val, 4),
+                            "max_value": round(max_val, 4),
+                            "input_scenes_count": len(input_rasters),
+                            "window": win,
+                            "index": pol,
+                            "district": district_name
+                        }
+                        composite_results.append(stats)
+
+                        comp_log = (
+                            f"     ✓ [{pol} (MEAN) S1 COMPOSITE ALREADY EXISTS - SKIPPED] Window '{w_label}' ({w_start} to {w_end}) "
+                            f"verified on NAS -> '{out_filename}' ({stats['file_size_mb']:.1f} MB, Valid Coverage: {stats['coverage_pct']:.1f}%, Mean dB: {stats['mean_value']:.2f})."
+                        )
+                        logger.info(comp_log)
+                        append_request_log(db, request_id, comp_log)
+                        continue
+                    else:
+                        logger.warning(f"Existing S1 composite '{nas_out_path}' has corrupted or empty values (valid_pixels={valid_pixels}, mean={mean_val:.2f}, min={min_val:.2f}, max={max_val:.2f}). Rebuilding cleanly with mean backscatter.")
+                        try: os.remove(win_safe_path(nas_out_path))
+                        except Exception: pass
                 except Exception as ex_read_err:
-                    logger.warning(f"Could not read existing S1 composite '{existing_path}': {ex_read_err}. Re-building composite.")
+                    logger.warning(f"Could not read existing S1 composite '{nas_out_path}': {ex_read_err}. Re-building composite.")
 
             stats = create_temporal_composite_raster(
                 input_raster_paths=input_rasters,
                 output_path=nas_out_path,
                 district_geom=geom_dict,
                 target_crs="EPSG:4326",
-                method=req_level
+                method="mean"
             )
 
             if stats:
-                try:
-                    shutil.copy2(nas_out_path, local_out_path)
-                except Exception:
-                    pass
-
                 stats["window"] = win
                 stats["index"] = pol
                 stats["district"] = district_name
-                stats["local_delivery_path"] = local_out_path
                 composite_results.append(stats)
 
                 comp_log = (
@@ -883,7 +914,7 @@ def run_sentinel1_compositing(
     summary_msg = (
         f"\n==============================================================================\n"
         f"  SENTINEL-1 TEMPORAL COMPOSITING FINISHED FOR '{district_name}': {len(composite_results)} Polarized GeoTIFFs created.\n"
-        f"  Location: '{nas_composite_dir}' and '{local_delivery_dir}'.\n"
+        f"  Location: '{nas_composite_dir}'.\n"
         f"=============================================================================="
     )
     logger.info(summary_msg)
