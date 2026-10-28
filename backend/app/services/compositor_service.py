@@ -5,20 +5,21 @@ SDAP Temporal Compositing & District Mosaicing Service (SRS 8.4 & 8.5)
 Location: backend/app/services/compositor_service.py
 
 Description:
-    Performs temporal compositing across user-requested time intervals:
-      - 'weekly': 7-day windows (Days 1-7, 8-14, 15-21, 22-28, 29-end)
-      - 'fortnightly': 15-day windows (Days 1-15, 16-end of month)
-      - 'monthly': Complete calendar months (Day 1 to last day of month)
-
-    Algorithm:
-      1. Slices date range into discrete composite windows.
-      2. For each window and index (NDVI, LSWI):
-         - Collects all cloud-masked GeoTIFFs across all acquisition days & tiles.
-         - Reprojects all rasters to unified target CRS (EPSG:4326) to eliminate UTM shift.
-         - Merges/Stacks using Maximum Value Composite (MVC / nanmax) to pick the cleanest,
-           greenest cloud-free pixel across all days in the window.
-         - Clips the merged composite to the district polygon boundary from PostgreSQL.
-         - Writes LZW-compressed single GeoTIFF deliverable to NAS and local delivery archive.
+    Performs dedicated temporal compositing for:
+      - Sentinel-1 SAR:
+          * Polarizations: Strictly VV and VH backscatter in dB.
+          * Windows: Strictly 12-day cycles for fortnightly (matching SAR repeat orbit).
+          * Processed files ONLY: Only calibrated GeoTIFFs (VV_Orb_tnr_cal_Tc_db.tiff
+            and VH_Orb_tnr_cal_Tc_db.tiff). Raw measurement files are strictly rejected.
+          * Output: Composite_VV_<level>_fortnightly_<district>_<start>_<end>.tif
+                    Composite_VH_<level>_fortnightly_<district>_<start>_<end>.tif
+      - Sentinel-2 Optical:
+          * Indices: Strictly NDVI and LSWI (or requested optical indices).
+          * Windows: 15-day windows for fortnightly (optical cloud-clearing).
+          * Processed files ONLY: Only computed cloud-masked index rasters (NDVI.tif, LSWI.tif).
+            Raw L2A bands (B02, B03, B04, B08, SCL, TCI) are strictly rejected.
+          * Output: Composite_NDVI_<level>_<interval>_<district>_<start>_<end>.tif
+                    Composite_LSWI_<level>_<interval>_<district>_<start>_<end>.tif
 =============================================================================
 """
 
@@ -28,6 +29,7 @@ import calendar
 import tempfile
 import shutil
 import logging
+import re
 from datetime import datetime, date, timedelta
 from typing import List, Dict, Any, Tuple, Optional
 
@@ -50,7 +52,7 @@ logger = logging.getLogger("sdap.compositor")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 1. Date Window Generator
+# 1. Date Window Generator (12-Day for S1 Fortnightly, 15-Day for S2)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def generate_composite_windows(start_date: str, end_date: str, interval: str, satellite: Optional[str] = None) -> List[Dict[str, Any]]:
@@ -58,15 +60,17 @@ def generate_composite_windows(start_date: str, end_date: str, interval: str, sa
     Slices a date range into discrete composite windows based on the requested interval.
     
     Intervals supported:
-      - 'weekly' (7-day intervals)
-      - 'fortnightly' / 'biweekly' (12-day intervals for Sentinel-1 repeat cycle; 15-day intervals for Sentinel-2)
+      - 'weekly' (7-day discrete windows)
+      - 'fortnightly' / 'biweekly':
+          * Sentinel-1: Strictly 12-day windows (matching SAR repeat cycle)
+          * Sentinel-2: Strictly 15-day windows (optical bi-weekly)
       - 'monthly' (full calendar months)
+      - 'none' (full date range)
     """
     if not interval or interval.lower() in ("none", "null", "false", "0"):
         return []
 
     interval_lower = interval.lower().strip()
-    
     start_dt = datetime.strptime(start_date.split("T")[0], "%Y-%m-%d").date()
     end_dt = datetime.strptime(end_date.split("T")[0], "%Y-%m-%d").date()
 
@@ -93,7 +97,7 @@ def generate_composite_windows(start_date: str, end_date: str, interval: str, sa
 
     elif interval_lower in ("fortnightly", "biweekly", "15-day", "15day", "fortnight", "12-day", "12day"):
         is_s1_only = bool(satellite and "Sentinel-1" in satellite and "Sentinel-2" not in satellite)
-        # Sentinel-1 repeat cycle is 12 days; Sentinel-2 is 15 days
+        # Sentinel-1 orbit repeat cycle is strictly 12 days; Sentinel-2 is 15 days
         span_days = 11 if is_s1_only else 14
         cur = start_dt
         w_idx = 1
@@ -142,7 +146,6 @@ def generate_composite_windows(start_date: str, end_date: str, interval: str, sa
                 cur_year += 1
 
     else:
-        # Default fallback: treat entire date range as one composite window
         windows.append({
             "type": interval_lower,
             "index": 1,
@@ -156,10 +159,167 @@ def generate_composite_windows(start_date: str, end_date: str, interval: str, sa
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 2. Find Index Rasters within Window
+# 2. Sentinel-1 Processed Raster Finder (PROCESSED FILES ONLY)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def find_index_rasters_for_window(
+def find_sentinel1_processed_rasters(
+    db: Session,
+    district_name: str,
+    window_start: str,
+    window_end: str,
+    polarization: str,
+    request_id: Optional[int] = None,
+    district_bbox: Optional[Tuple[float, float, float, float]] = None
+) -> List[str]:
+    """
+    Finds verified Sentinel-1 PROCESSED (calibrated) GeoTIFFs strictly for the requested polarization:
+      - VV: 'VV_Orb_tnr_cal_Tc_db.tiff' (or .tif)
+      - VH: 'VH_Orb_tnr_cal_Tc_db.tiff' (or .tif)
+      
+    STRICT PROCESSED-ONLY GUARANTEE:
+      - NEVER accepts uncalibrated raw measurement files (iw-vv, s1a-iw-grd-vv-...).
+      - If a scene has only raw measurement files and was not calibrated, it is STRICTLY EXCLUDED.
+      - Strictly verifies raster existence, size (> 1024 bytes), and district boundary overlap.
+    """
+    pol = polarization.upper().strip()
+    if pol not in ("VV", "VH"):
+        return []
+
+    w_start_dt = datetime.strptime(window_start, "%Y-%m-%d").date()
+    w_end_dt = datetime.strptime(window_end, "%Y-%m-%d").date()
+    clean_d = district_name.split(",")[0].strip().lower()
+
+    target_cal_name = f"{pol}_Orb_tnr_cal_Tc_db"
+
+    candidate_scene_ids = set()
+    if request_id:
+        pjs = db.query(ProcessJobModel.scene_id).filter(
+            ProcessJobModel.request_id == request_id,
+            ProcessJobModel.scene_id.isnot(None)
+        ).all()
+        for pj in pjs:
+            if pj[0]:
+                candidate_scene_ids.add(pj[0])
+
+    if not candidate_scene_ids:
+        pj_query = db.query(ProcessJobModel.scene_id).join(
+            RequestModel, ProcessJobModel.request_id == RequestModel.id
+        ).filter(
+            ProcessJobModel.scene_id.isnot(None),
+            func.lower(RequestModel.district) == clean_d
+        )
+        for r in pj_query.distinct().all():
+            if r[0]:
+                candidate_scene_ids.add(r[0])
+
+    # 1. Query BandFileModel records
+    bf_query = db.query(BandFileModel).filter(BandFileModel.verified == 1)
+    if candidate_scene_ids:
+        bf_query = bf_query.filter(BandFileModel.scene_id.in_(candidate_scene_ids))
+
+    scene_to_raster: Dict[str, str] = {}
+    seen_paths = set()
+
+    for row in bf_query.all():
+        try:
+            s_date = None
+            if row.sensing_date:
+                s_date = datetime.strptime(str(row.sensing_date).split(" ")[0], "%Y-%m-%d").date()
+            if not s_date or not (w_start_dt <= s_date <= w_end_dt):
+                continue
+
+            resolved, exists = resolve_tif_path(row.path)
+            if not exists or not os.path.exists(resolved):
+                continue
+
+            parent_dir = os.path.dirname(resolved)
+            scene_root = os.path.dirname(parent_dir) if os.path.basename(parent_dir).lower() == "measurement" else parent_dir
+
+            # PROCESSED CHECK: Find the calibrated file strictly
+            cal_cand = None
+            for ext in (".tiff", ".tif", ".TIFF", ".TIF"):
+                check_p = os.path.join(scene_root, f"{target_cal_name}{ext}")
+                if os.path.isfile(check_p) and os.path.getsize(check_p) > 1024:
+                    cal_cand = check_p
+                    break
+
+            if not cal_cand:
+                res_base = os.path.basename(resolved).lower()
+                if res_base.startswith(target_cal_name.lower()) and os.path.getsize(resolved) > 1024:
+                    cal_cand = resolved
+
+            # If no processed calibrated file exists, REJECT THIS SCENE!
+            if not cal_cand:
+                continue
+
+            # Verify spatial overlap against district boundary polygon / bbox
+            if district_bbox and not is_raster_overlapping_district(cal_cand, district_bbox):
+                continue
+
+            sc_id = row.scene_id or os.path.basename(scene_root)
+            scene_to_raster[sc_id] = cal_cand
+            seen_paths.add(cal_cand)
+        except Exception:
+            continue
+
+    # 2. Disk fallback search on NAS if DB records were missing or incomplete
+    if not scene_to_raster:
+        search_dirs = [
+            os.path.join(settings.RAW_ARCHIVE_DIR, "Sentinel-1", "S1_SAR", district_name),
+            os.path.join(settings.RAW_ARCHIVE_DIR, "Sentinel-1", "S1_SAR", clean_d.capitalize()),
+            os.path.join(settings.RAW_ARCHIVE_DIR, "Sentinel-1", "S1_SAR"),
+            os.path.join(settings.RAW_ARCHIVE_DIR, "S1_SAR", district_name),
+            os.path.join(settings.RAW_ARCHIVE_DIR, "S1_SAR")
+        ]
+        for s_dir in search_dirs:
+            if not os.path.exists(s_dir):
+                continue
+            for root, _, files in os.walk(s_dir):
+                for fn in files:
+                    fn_u = fn.upper()
+                    # PROCESSED CHECK: strictly match target_cal_name
+                    if fn_u.startswith(target_cal_name.upper()) and (fn_u.endswith(".TIFF") or fn_u.endswith(".TIF")):
+                        full_p = os.path.join(root, fn)
+                        if full_p in seen_paths or not (os.path.isfile(full_p) and os.path.getsize(full_p) > 1024):
+                            continue
+                        date_match = None
+                        m_scene = re.search(r"(\d{8})T", full_p.replace("\\", "/"))
+                        if m_scene:
+                            try:
+                                d_str = m_scene.group(1)
+                                date_match = date(int(d_str[:4]), int(d_str[4:6]), int(d_str[6:8]))
+                            except ValueError:
+                                pass
+                        if not date_match:
+                            m = re.search(r"(\d{4})(\d{2})(\d{2})", root.replace("\\", "/"))
+                            if m:
+                                try:
+                                    date_match = date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+                                except ValueError:
+                                    pass
+                        if not date_match:
+                            m2 = re.search(r"(\d{4})-(\d{2})-(\d{2})", fn)
+                            if m2:
+                                try:
+                                    date_match = date(int(m2.group(1)), int(m2.group(2)), int(m2.group(3)))
+                                except ValueError:
+                                    pass
+
+                        if date_match and (w_start_dt <= date_match <= w_end_dt):
+                            if district_bbox and not is_raster_overlapping_district(full_p, district_bbox):
+                                continue
+                            sc_key = os.path.basename(root)
+                            scene_to_raster[sc_key] = full_p
+                            seen_paths.add(full_p)
+
+    return list(scene_to_raster.values())
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 3. Sentinel-2 Processed Raster Finder (PROCESSED FILES ONLY)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def find_sentinel2_processed_rasters(
     db: Session,
     district_name: str,
     window_start: str,
@@ -169,44 +329,40 @@ def find_index_rasters_for_window(
     district_bbox: Optional[Tuple[float, float, float, float]] = None
 ) -> List[str]:
     """
-    Finds all verified spectral index GeoTIFFs (e.g. NDVI, LSWI) downloaded or computed
-    for tiles covering district_name within the specified window dates.
-    Strictly verifies spatial overlap so out-of-district tiles are never included.
+    Finds verified Sentinel-2 PROCESSED spectral index GeoTIFFs strictly:
+      - 'NDVI.tif' / 'NDVI.tiff' / 'NDVI_<district>.tif'
+      - 'LSWI.tif' / 'LSWI.tiff' / 'LSWI_<district>.tif'
+      
+    STRICT PROCESSED-ONLY GUARANTEE:
+      - NEVER accepts raw L2A band files (B02, B03, B04, B08, SCL, TCI).
+      - Strictly verifies raster existence, size (> 1024 bytes), and district boundary overlap.
     """
     idx_clean = index_name.upper().strip()
-    clean_d = district_name.split(",")[0].strip().lower()
-
     w_start_dt = datetime.strptime(window_start, "%Y-%m-%d").date()
     w_end_dt = datetime.strptime(window_end, "%Y-%m-%d").date()
+    clean_d = district_name.split(",")[0].strip().lower()
 
     candidate_scene_ids = set()
-
-    # 1. Collect candidate scenes from the specific request if provided
     if request_id:
         pjs = db.query(ProcessJobModel.scene_id).filter(
             ProcessJobModel.request_id == request_id,
-            ProcessJobModel.stage == "DOWNLOAD",
-            ProcessJobModel.status == "COMPLETED"
+            ProcessJobModel.scene_id.isnot(None)
         ).all()
         for pj in pjs:
             if pj[0]:
                 candidate_scene_ids.add(pj[0])
 
-    # 2. Collect candidate tiles mapped to this district
     tiles_rows = db.execute(
         text("SELECT DISTINCT tile_id FROM district_tiles_mapping WHERE LOWER(district_name) = :d"),
         {"d": clean_d}
     ).fetchall()
     district_tiles = set(r[0] for r in tiles_rows if r[0] and r[0] != "S1_SAR")
 
-    # If no scenes from request, query completed jobs for this district or scenes matching district tiles
     if not candidate_scene_ids:
         pj_query = db.query(ProcessJobModel.scene_id).join(
             RequestModel, ProcessJobModel.request_id == RequestModel.id
         ).filter(
             ProcessJobModel.scene_id.isnot(None),
-            ProcessJobModel.stage == "DOWNLOAD",
-            ProcessJobModel.status == "COMPLETED",
             func.lower(RequestModel.district) == clean_d
         )
         for r in pj_query.distinct().all():
@@ -222,8 +378,8 @@ def find_index_rasters_for_window(
                 if r[0]:
                     candidate_scene_ids.add(r[0])
 
-    # 3. Query BandFileModel records matching index_name and sensing_date
-    band_names_query = [
+    # 1. Query BandFileModel records strictly matching processed index names
+    valid_band_names = [
         idx_clean,
         f"{idx_clean}.tif",
         f"{idx_clean}.tiff",
@@ -232,10 +388,9 @@ def find_index_rasters_for_window(
     ]
 
     bf_query = db.query(BandFileModel).filter(
-        func.upper(BandFileModel.band).in_([b.upper() for b in band_names_query]),
-        BandFileModel.verified == 1
+        BandFileModel.verified == 1,
+        func.upper(BandFileModel.band).in_([b.upper() for b in valid_band_names])
     )
-
     if candidate_scene_ids:
         bf_query = bf_query.filter(BandFileModel.scene_id.in_(candidate_scene_ids))
 
@@ -244,21 +399,32 @@ def find_index_rasters_for_window(
 
     for row in bf_query.all():
         try:
-            s_date = datetime.strptime(str(row.sensing_date).split(" ")[0], "%Y-%m-%d").date()
-            if w_start_dt <= s_date <= w_end_dt:
-                resolved, exists = resolve_tif_path(row.path)
-                if exists and resolved not in seen_paths:
-                    # Spatial overlap check against district_bbox
-                    if district_bbox and not is_raster_overlapping_district(resolved, district_bbox):
-                        continue
-                    raster_paths.append(resolved)
-                    seen_paths.add(resolved)
+            s_date = None
+            if row.sensing_date:
+                s_date = datetime.strptime(str(row.sensing_date).split(" ")[0], "%Y-%m-%d").date()
+            if not s_date or not (w_start_dt <= s_date <= w_end_dt):
+                continue
+
+            resolved, exists = resolve_tif_path(row.path)
+            if not exists or not os.path.exists(resolved):
+                continue
+
+            # Ensure it is strictly an index file and NOT a raw band
+            fn_base = os.path.basename(resolved).upper()
+            if not (fn_base.startswith(idx_clean) or fn_base in (f"{idx_clean}.TIF", f"{idx_clean}.TIFF")):
+                continue
+
+            if district_bbox and not is_raster_overlapping_district(resolved, district_bbox):
+                continue
+
+            if resolved not in seen_paths and os.path.getsize(resolved) > 1024:
+                raster_paths.append(resolved)
+                seen_paths.add(resolved)
         except Exception:
             continue
 
-    # 4. Fallback: Check NAS storage ONLY under the specific district tile folders
+    # 2. Fallback: Check NAS storage under specific district tiles
     if not raster_paths and district_tiles:
-        import re
         for tile in district_tiles:
             tile_dir = os.path.join(settings.RAW_ARCHIVE_DIR, tile)
             if not os.path.exists(tile_dir):
@@ -268,7 +434,7 @@ def find_index_rasters_for_window(
                     fn_u = fn.upper()
                     if fn_u in (f"{idx_clean}.TIF", f"{idx_clean}.TIFF") or fn_u.startswith(f"{idx_clean}_"):
                         full_p = os.path.join(root, fn)
-                        if full_p in seen_paths:
+                        if full_p in seen_paths or not (os.path.isfile(full_p) and os.path.getsize(full_p) > 1024):
                             continue
                         date_match = None
                         m = re.search(r"(\d{4})(\d{2})(\d{2})", root.replace("\\", "/"))
@@ -284,6 +450,7 @@ def find_index_rasters_for_window(
                                     date_match = date(int(m2.group(1)), int(m2.group(2)), int(m2.group(3)))
                                 except ValueError:
                                     pass
+
                         if date_match and (w_start_dt <= date_match <= w_end_dt):
                             if district_bbox and not is_raster_overlapping_district(full_p, district_bbox):
                                 continue
@@ -293,8 +460,41 @@ def find_index_rasters_for_window(
     return raster_paths
 
 
+def find_index_rasters_for_window(
+    db: Session,
+    district_name: str,
+    window_start: str,
+    window_end: str,
+    index_name: str,
+    request_id: Optional[int] = None,
+    district_bbox: Optional[Tuple[float, float, float, float]] = None
+) -> List[str]:
+    """Compatibility wrapper that routes to dedicated S1 or S2 processed raster finders."""
+    idx_clean = index_name.upper().strip()
+    if idx_clean in ("VV", "VH"):
+        return find_sentinel1_processed_rasters(
+            db=db,
+            district_name=district_name,
+            window_start=window_start,
+            window_end=window_end,
+            polarization=idx_clean,
+            request_id=request_id,
+            district_bbox=district_bbox
+        )
+    else:
+        return find_sentinel2_processed_rasters(
+            db=db,
+            district_name=district_name,
+            window_start=window_start,
+            window_end=window_end,
+            index_name=idx_clean,
+            request_id=request_id,
+            district_bbox=district_bbox
+        )
+
+
 # ─────────────────────────────────────────────────────────────────────────────
-# 3. Maximum Value Compositing (MVC) & District Masking Engine
+# 4. Maximum / Min / Mean Compositing Engine
 # ─────────────────────────────────────────────────────────────────────────────
 
 def create_temporal_composite_raster(
@@ -308,18 +508,6 @@ def create_temporal_composite_raster(
     """
     Computes a single seamless cloud-masked Composite GeoTIFF
     from a list of multi-day index rasters across one or more tiles.
-    
-    Supported methods:
-      - 'max': Maximum Value Composite (MVC / nanmax)
-      - 'min': Minimum Value Composite (nanmin)
-      - 'mean': Average Value Composite (pixel-wise sum / count)
-      
-    Memory & Performance Guarantees:
-
-      - Uses district-bounded grid (EPSG:4326) directly to prevent memory explosion.
-      - Employs window-slice reprojection per tile to bound peak RAM.
-      - Applies district administrative boundary mask directly.
-      - Produces tiled, DEFLATE/LZW-compressed GeoTIFF with predictor 3.
     """
     valid_inputs = [p for p in input_raster_paths if p and os.path.exists(p) and os.path.getsize(p) > 1024]
     if not valid_inputs:
@@ -350,7 +538,7 @@ def create_temporal_composite_raster(
     height = max(1, int(np.ceil((maxy - miny) / resolution_deg)))
 
     # Memory Safeguard: Cap canvas size to prevent memory allocation spikes (< 180 MB per float32 layer)
-    max_pixels = 45_000_000  # ~6700 x 6700 pixels (~180 MB float32)
+    max_pixels = 45_000_000
     if (width * height) > max_pixels:
         scale_factor = np.sqrt((width * height) / float(max_pixels))
         resolution_deg *= scale_factor
@@ -370,7 +558,7 @@ def create_temporal_composite_raster(
             invert=True
         )
 
-    # 3. Canvas Arrays (Strictly bounded to district)
+    # 3. Canvas Arrays
     if method_clean == "mean":
         sum_arr = np.zeros((height, width), dtype="float32")
         count_arr = np.zeros((height, width), dtype="uint16")
@@ -516,62 +704,49 @@ def create_temporal_composite_raster(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 4. Master Composite Pipeline Execution
+# 5. Dedicated Sentinel-1 SAR Compositing Pipeline
 # ─────────────────────────────────────────────────────────────────────────────
 
-def run_temporal_compositing_for_request(
+def run_sentinel1_compositing(
     db: Session,
-    request_id: int,
-    composite_interval: Optional[str] = None,
-    level: Optional[str] = None
+    req: RequestModel,
+    interval: str,
+    req_level: str
 ) -> List[Dict[str, Any]]:
     """
-    Executes Stage 4 Temporal Compositing for a given processing request.
-    Generates single merged composite GeoTIFF files for all days in each interval window
-    for every requested spectral index (NDVI, LSWI) aggregated using the specified level ('max', 'min', 'mean').
+    Executes Temporal Compositing dedicated for Sentinel-1 SAR.
+    
+    Guarantees:
+      - Fortnightly uses strictly 12-day windows (matching SAR repeat orbit cycle).
+      - Strictly computes composites for backscatter polarizations 'VV' and 'VH'.
+      - Strictly inputs PROCESSED calibrated files (VV_Orb_tnr_cal_Tc_db.tiff and VH_Orb_tnr_cal_Tc_db.tiff).
+      - Output format: Composite_VV_<level>_fortnightly_<district>_<start>_<end>.tif
+                       Composite_VH_<level>_fortnightly_<district>_<start>_<end>.tif
     """
-    req = db.query(RequestModel).filter(RequestModel.id == request_id).first()
-    if not req:
-        logger.error(f"Request #{request_id} not found for compositing.")
-        return []
+    from app.db.scripts.download_district_tiles import append_request_log
 
-    interval = composite_interval or req.composite_interval or "none"
-    if not interval or interval.lower() in ("none", "null", "false"):
-        logger.info(f"Request #{request_id} composite interval is '{interval}' (no compositing requested).")
-        return []
-
-    req_level = (level or getattr(req, "level", "max") or "max").lower().strip()
-    if req_level not in ("max", "min", "mean"):
-        req_level = "max"
-
+    request_id = req.id
     district_name = req.district or req.state or "Region"
     start_str = req.start_date.strftime("%Y-%m-%d")
     end_str = req.end_date.strftime("%Y-%m-%d")
-    req_indices = req.indices if isinstance(req.indices, list) and req.indices else ["NDVI", "LSWI"]
 
-    # Only optical indices (NDVI, LSWI, etc.) support cloud-masked temporal compositing
-    spectral_indices = [idx for idx in req_indices if idx.upper() not in ("VV", "VH", "VV/VH", "SAR")]
-    if not spectral_indices:
-        spectral_indices = ["NDVI", "LSWI"]
-
-    # 1. Compute discrete composite windows (e.g. weekly 7-day, fortnightly 15-day, monthly)
-    windows = generate_composite_windows(start_str, end_str, interval, satellite=getattr(req, "satellite", None))
+    # 1. Generate strictly 12-day windows for fortnightly (or 7-day for weekly, full calendar month for monthly)
+    windows = generate_composite_windows(start_str, end_str, interval, satellite="Sentinel-1")
     if not windows:
-        logger.info(f"No composite windows generated for interval '{interval}' between {start_str} and {end_str}.")
+        logger.info(f"No composite windows generated for S1 interval '{interval}' between {start_str} and {end_str}.")
         return []
 
-    from app.db.scripts.download_district_tiles import append_request_log
-
+    cycle_desc = "12-DAY ORBIT CYCLES" if interval.lower() in ("fortnightly", "biweekly") else f"{interval.upper()} WINDOWS"
     header_msg = (
         f"\n==============================================================================\n"
-        f"  [STAGE 4/4] TEMPORAL COMPOSITING & DISTRICT MOSAICING (Interval: '{interval.upper()}', Level: '{req_level.upper()}')\n"
-        f"  District: {district_name} | Date Windows ({len(windows)}): {', '.join([w['label'] for w in windows])}\n"
+        f"  [STAGE 4/4] SENTINEL-1 SAR TEMPORAL COMPOSITING ({interval.upper()} - {cycle_desc}, LEVEL: '{req_level.upper()}')\n"
+        f"  District: {district_name} | Polarizations: ['VV', 'VH'] | Date Windows ({len(windows)}): {', '.join([w['label'] for w in windows])}\n"
         f"=============================================================================="
     )
     logger.info(header_msg)
     append_request_log(db, request_id, header_msg)
 
-    # 2. Fetch District Geometry from PostgreSQL
+    # 2. Fetch District Geometry
     geom_dict, state_name = get_district_geometry_from_db(db, district_name)
     district_bbox = None
     if geom_dict:
@@ -588,7 +763,200 @@ def run_temporal_compositing_for_request(
     composite_results = []
     year_str = start_str[0:4]
 
-    # Destination directories on NAS and delivery archive
+    nas_composite_dir = os.path.join(settings.RAW_ARCHIVE_DIR, "Composites", district_name, year_str, interval.lower())
+    local_delivery_dir = os.path.join(settings.DELIVERY_DIR, f"request_{request_id}")
+
+    os.makedirs(nas_composite_dir, exist_ok=True)
+    os.makedirs(local_delivery_dir, exist_ok=True)
+
+    polarizations = ["VV", "VH"]
+
+    for win in windows:
+        w_start = win["start_date"]
+        w_end = win["end_date"]
+        w_label = win["label"]
+
+        append_request_log(db, request_id, f"\n  ▶ Processing S1 Window '{w_label}' ({w_start} to {w_end}, {win['days_count']} days)...")
+
+        for pol in polarizations:
+            # STRICT: Find PROCESSED calibrated files only (VV_Orb_tnr_cal_Tc_db / VH_Orb_tnr_cal_Tc_db)
+            input_rasters = find_sentinel1_processed_rasters(
+                db=db,
+                district_name=district_name,
+                window_start=w_start,
+                window_end=w_end,
+                polarization=pol,
+                request_id=request_id,
+                district_bbox=district_bbox
+            )
+
+            if not input_rasters:
+                warn_msg = f"     ⚠ WARN: No calibrated {pol} processed rasters ({pol}_Orb_tnr_cal_Tc_db) available for window {w_start} to {w_end}."
+                logger.warning(warn_msg)
+                append_request_log(db, request_id, warn_msg, level="WARNING")
+                continue
+
+            out_filename = f"Composite_{pol}_{req_level}_{interval.lower()}_{district_name}_{w_start.replace('-', '')}_{w_end.replace('-', '')}.tif"
+            nas_out_path = os.path.join(nas_composite_dir, out_filename)
+            local_out_path = os.path.join(local_delivery_dir, out_filename)
+
+            nas_ok, _, _ = verify_raster(nas_out_path)
+            local_ok, _, _ = verify_raster(local_out_path)
+
+            if nas_ok or local_ok:
+                existing_path = nas_out_path if nas_ok else local_out_path
+                if nas_ok and not local_ok:
+                    try: shutil.copy2(nas_out_path, local_out_path)
+                    except Exception: pass
+                elif local_ok and not nas_ok:
+                    try: shutil.copy2(local_out_path, nas_out_path)
+                    except Exception: pass
+
+                try:
+                    with rasterio.open(win_safe_path(existing_path)) as src:
+                        arr = src.read(1)
+                        valid_mask = ~np.isnan(arr)
+                        valid_pixels = int(np.count_nonzero(valid_mask))
+                        total_pixels = arr.size
+                        coverage_pct = float(valid_pixels / total_pixels * 100.0) if total_pixels > 0 else 0.0
+                        mean_val = float(np.nanmean(arr[valid_mask])) if valid_pixels > 0 else 0.0
+                        min_val = float(np.nanmin(arr[valid_mask])) if valid_pixels > 0 else 0.0
+                        max_val = float(np.nanmax(arr[valid_mask])) if valid_pixels > 0 else 0.0
+                        file_size_mb = os.path.getsize(existing_path) / (1024 * 1024)
+
+                    stats = {
+                        "output_path": nas_out_path,
+                        "filename": out_filename,
+                        "file_size_mb": round(file_size_mb, 2),
+                        "valid_pixels": valid_pixels,
+                        "total_pixels": total_pixels,
+                        "coverage_pct": round(coverage_pct, 2),
+                        "mean_value": round(mean_val, 4),
+                        "min_value": round(min_val, 4),
+                        "max_value": round(max_val, 4),
+                        "input_scenes_count": len(input_rasters),
+                        "window": win,
+                        "index": pol,
+                        "district": district_name,
+                        "local_delivery_path": local_out_path
+                    }
+                    composite_results.append(stats)
+
+                    comp_log = (
+                        f"     ✓ [{pol} ({req_level.upper()}) S1 COMPOSITE ALREADY EXISTS - SKIPPED] Window '{w_label}' ({w_start} to {w_end}) "
+                        f"verified on NAS -> '{out_filename}' ({stats['file_size_mb']:.1f} MB, Valid Coverage: {stats['coverage_pct']:.1f}%)."
+                    )
+                    logger.info(comp_log)
+                    append_request_log(db, request_id, comp_log)
+                    continue
+                except Exception as ex_read_err:
+                    logger.warning(f"Could not read existing S1 composite '{existing_path}': {ex_read_err}. Re-building composite.")
+
+            stats = create_temporal_composite_raster(
+                input_raster_paths=input_rasters,
+                output_path=nas_out_path,
+                district_geom=geom_dict,
+                target_crs="EPSG:4326",
+                method=req_level
+            )
+
+            if stats:
+                try:
+                    shutil.copy2(nas_out_path, local_out_path)
+                except Exception:
+                    pass
+
+                stats["window"] = win
+                stats["index"] = pol
+                stats["district"] = district_name
+                stats["local_delivery_path"] = local_out_path
+                composite_results.append(stats)
+
+                comp_log = (
+                    f"     ✓ [{pol} ({req_level.upper()}) S1 TEMPORAL COMPOSITE CREATED] Window '{w_label}' ({w_start} to {w_end}) "
+                    f"merged from {stats['input_scenes_count']} calibrated scene days -> Saved '{out_filename}' "
+                    f"({stats['file_size_mb']:.1f} MB, Coverage: {stats['coverage_pct']:.1f}%, Mean dB: {stats['mean_value']:.2f})."
+                )
+                logger.info(comp_log)
+                append_request_log(db, request_id, comp_log)
+
+    summary_msg = (
+        f"\n==============================================================================\n"
+        f"  SENTINEL-1 TEMPORAL COMPOSITING FINISHED FOR '{district_name}': {len(composite_results)} Polarized GeoTIFFs created.\n"
+        f"  Location: '{nas_composite_dir}' and '{local_delivery_dir}'.\n"
+        f"=============================================================================="
+    )
+    logger.info(summary_msg)
+    append_request_log(db, request_id, summary_msg)
+
+    return composite_results
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 6. Dedicated Sentinel-2 Optical Compositing Pipeline
+# ─────────────────────────────────────────────────────────────────────────────
+
+def run_sentinel2_compositing(
+    db: Session,
+    req: RequestModel,
+    interval: str,
+    req_level: str
+) -> List[Dict[str, Any]]:
+    """
+    Executes Temporal Compositing dedicated for Sentinel-2 Optical.
+    
+    Guarantees:
+      - Fortnightly uses strictly 15-day windows (Days 1-15, 16-30).
+      - Strictly computes composites for optical spectral indices (NDVI, LSWI).
+      - Strictly inputs PROCESSED cloud-masked index rasters (NDVI.tif, LSWI.tif).
+        Raw L2A bands (B02, B03, B04, B08, SCL, TCI) are strictly rejected.
+      - Output format: Composite_NDVI_<level>_<interval>_<district>_<start>_<end>.tif
+                       Composite_LSWI_<level>_<interval>_<district>_<start>_<end>.tif
+    """
+    from app.db.scripts.download_district_tiles import append_request_log
+
+    request_id = req.id
+    district_name = req.district or req.state or "Region"
+    start_str = req.start_date.strftime("%Y-%m-%d")
+    end_str = req.end_date.strftime("%Y-%m-%d")
+
+    # 1. Generate strictly 15-day windows for fortnightly (or 7-day for weekly, full calendar month for monthly)
+    windows = generate_composite_windows(start_str, end_str, interval, satellite="Sentinel-2")
+    if not windows:
+        logger.info(f"No composite windows generated for S2 interval '{interval}' between {start_str} and {end_str}.")
+        return []
+
+    req_indices = req.indices if isinstance(req.indices, list) and req.indices else ["NDVI", "LSWI"]
+    spectral_indices = [idx for idx in req_indices if idx.upper() not in ("VV", "VH", "VV/VH", "SAR")]
+    if not spectral_indices:
+        spectral_indices = ["NDVI", "LSWI"]
+
+    header_msg = (
+        f"\n==============================================================================\n"
+        f"  [STAGE 4/4] SENTINEL-2 OPTICAL TEMPORAL COMPOSITING ({interval.upper()} - 15-DAY WINDOWS, LEVEL: '{req_level.upper()}')\n"
+        f"  District: {district_name} | Indices: {spectral_indices} | Date Windows ({len(windows)}): {', '.join([w['label'] for w in windows])}\n"
+        f"=============================================================================="
+    )
+    logger.info(header_msg)
+    append_request_log(db, request_id, header_msg)
+
+    # 2. Fetch District Geometry
+    geom_dict, state_name = get_district_geometry_from_db(db, district_name)
+    district_bbox = None
+    if geom_dict:
+        try:
+            d_poly = shape(geom_dict if not isinstance(geom_dict, str) else json.loads(geom_dict))
+            district_bbox = d_poly.bounds
+            append_request_log(db, request_id, f"  • District boundary polygon loaded for '{district_name}' ({state_name or 'Auto'}).")
+        except Exception as e:
+            logger.warning(f"Error parsing district polygon: {e}")
+            append_request_log(db, request_id, f"  • District boundary polygon loaded for '{district_name}' ({state_name or 'Auto'}).")
+    else:
+        append_request_log(db, request_id, f"  • Note: District geometry not in DB; creating unclipped full-extent composite.")
+
+    composite_results = []
+    year_str = start_str[0:4]
+
     nas_composite_dir = os.path.join(settings.RAW_ARCHIVE_DIR, "Composites", district_name, year_str, interval.lower())
     local_delivery_dir = os.path.join(settings.DELIVERY_DIR, f"request_{request_id}")
 
@@ -600,13 +968,13 @@ def run_temporal_compositing_for_request(
         w_end = win["end_date"]
         w_label = win["label"]
 
-        append_request_log(db, request_id, f"\n  ▶ Processing Window '{w_label}' ({w_start} to {w_end}, {win['days_count']} days)...")
+        append_request_log(db, request_id, f"\n  ▶ Processing S2 Window '{w_label}' ({w_start} to {w_end}, {win['days_count']} days)...")
 
         for idx_name in spectral_indices:
             idx_clean = idx_name.upper().strip()
-            
-            # Find all scene rasters for this window and index (strictly matching district)
-            input_rasters = find_index_rasters_for_window(
+
+            # STRICT: Find PROCESSED cloud-masked index rasters only (NDVI.tif, LSWI.tif)
+            input_rasters = find_sentinel2_processed_rasters(
                 db=db,
                 district_name=district_name,
                 window_start=w_start,
@@ -617,7 +985,7 @@ def run_temporal_compositing_for_request(
             )
 
             if not input_rasters:
-                warn_msg = f"     ⚠ WARN: No {idx_clean} rasters available for window {w_start} to {w_end}."
+                warn_msg = f"     ⚠ WARN: No {idx_clean} processed rasters ({idx_clean}.tif) available for window {w_start} to {w_end}."
                 logger.warning(warn_msg)
                 append_request_log(db, request_id, warn_msg, level="WARNING")
                 continue
@@ -660,24 +1028,23 @@ def run_temporal_compositing_for_request(
                         "mean_value": round(mean_val, 4),
                         "min_value": round(min_val, 4),
                         "max_value": round(max_val, 4),
-                        "input_scenes_count": len(input_rasters)
+                        "input_scenes_count": len(input_rasters),
+                        "window": win,
+                        "index": idx_clean,
+                        "district": district_name,
+                        "local_delivery_path": local_out_path
                     }
-
-                    stats["window"] = win
-                    stats["index"] = idx_clean
-                    stats["district"] = district_name
-                    stats["local_delivery_path"] = local_out_path
                     composite_results.append(stats)
 
                     comp_log = (
-                        f"     ✓ [{idx_clean} ({req_level.upper()}) COMPOSITE ALREADY EXISTS - SKIPPED] Window '{w_label}' ({w_start} to {w_end}) "
+                        f"     ✓ [{idx_clean} ({req_level.upper()}) S2 COMPOSITE ALREADY EXISTS - SKIPPED] Window '{w_label}' ({w_start} to {w_end}) "
                         f"verified on NAS -> '{out_filename}' ({stats['file_size_mb']:.1f} MB, Clear Coverage: {stats['coverage_pct']:.1f}%)."
                     )
                     logger.info(comp_log)
                     append_request_log(db, request_id, comp_log)
                     continue
                 except Exception as ex_read_err:
-                    logger.warning(f"Could not read existing composite '{existing_path}': {ex_read_err}. Re-building composite.")
+                    logger.warning(f"Could not read existing S2 composite '{existing_path}': {ex_read_err}. Re-building composite.")
 
             stats = create_temporal_composite_raster(
                 input_raster_paths=input_rasters,
@@ -688,7 +1055,6 @@ def run_temporal_compositing_for_request(
             )
 
             if stats:
-                # Also place copy into local request delivery folder for direct single-click downloads
                 try:
                     shutil.copy2(nas_out_path, local_out_path)
                 except Exception:
@@ -701,7 +1067,7 @@ def run_temporal_compositing_for_request(
                 composite_results.append(stats)
 
                 comp_log = (
-                    f"     ✓ [{idx_clean} ({req_level.upper()}) TEMPORAL COMPOSITE CREATED] Window '{w_label}' ({w_start} to {w_end}) "
+                    f"     ✓ [{idx_clean} ({req_level.upper()}) S2 TEMPORAL COMPOSITE CREATED] Window '{w_label}' ({w_start} to {w_end}) "
                     f"merged from {stats['input_scenes_count']} scene days -> Saved '{out_filename}' "
                     f"({stats['file_size_mb']:.1f} MB, Clear Coverage: {stats['coverage_pct']:.1f}%, Mean: {stats['mean_value']:.4f})."
                 )
@@ -710,7 +1076,7 @@ def run_temporal_compositing_for_request(
 
     summary_msg = (
         f"\n==============================================================================\n"
-        f"  TEMPORAL COMPOSITING FINISHED FOR '{district_name}': {len(composite_results)} Composite GeoTIFFs created.\n"
+        f"  SENTINEL-2 TEMPORAL COMPOSITING FINISHED FOR '{district_name}': {len(composite_results)} Composite GeoTIFFs created.\n"
         f"  Location: '{nas_composite_dir}' and '{local_delivery_dir}'.\n"
         f"=============================================================================="
     )
@@ -718,3 +1084,54 @@ def run_temporal_compositing_for_request(
     append_request_log(db, request_id, summary_msg)
 
     return composite_results
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 7. Master Composite Pipeline Execution Dispatcher
+# ─────────────────────────────────────────────────────────────────────────────
+
+def run_temporal_compositing_for_request(
+    db: Session,
+    request_id: int,
+    composite_interval: Optional[str] = None,
+    level: Optional[str] = None
+) -> List[Dict[str, Any]]:
+    """
+    Master Dispatcher for Stage 4 Temporal Compositing.
+    Inspects user request and executes the dedicated satellite pipeline:
+      - Sentinel-1: run_sentinel1_compositing() [12-day fortnightly, strictly VV and VH backscatter in dB, processed calibrated rasters only]
+      - Sentinel-2: run_sentinel2_compositing() [15-day fortnightly, strictly NDVI and LSWI optical indices, processed cloud-masked rasters only]
+    """
+    req = db.query(RequestModel).filter(RequestModel.id == request_id).first()
+    if not req:
+        logger.error(f"Request #{request_id} not found for compositing.")
+        return []
+
+    interval = composite_interval or req.composite_interval or "none"
+    if not interval or interval.lower() in ("none", "null", "false"):
+        logger.info(f"Request #{request_id} composite interval is '{interval}' (no compositing requested).")
+        return []
+
+    req_level = (level or getattr(req, "level", "max") or "max").lower().strip()
+    if req_level not in ("max", "min", "mean"):
+        req_level = "max"
+
+    req_satellite = (getattr(req, "satellite", None) or "").strip()
+    is_s1 = bool("Sentinel-1" in req_satellite and "Sentinel-2" not in req_satellite)
+
+    if is_s1:
+        # Dedicated Sentinel-1 SAR Compositing
+        return run_sentinel1_compositing(
+            db=db,
+            req=req,
+            interval=interval,
+            req_level=req_level
+        )
+    else:
+        # Dedicated Sentinel-2 Optical Compositing
+        return run_sentinel2_compositing(
+            db=db,
+            req=req,
+            interval=interval,
+            req_level=req_level
+        )

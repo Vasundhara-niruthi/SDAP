@@ -24,6 +24,36 @@ async def lifespan(app: FastAPI):
         # Create tables if they do not exist
         Base.metadata.create_all(bind=engine)
         logger.info("PostgreSQL Database tables created/verified successfully.")
+
+        # Ensure default admin account exists and has valid credentials
+        try:
+            from app.db import SessionLocal
+            from app.db.models.sdap_models import UserModel
+            from app.core.security import hash_password, verify_password
+            import os
+            with SessionLocal() as db_session:
+                admin_email = os.getenv("DEFAULT_ADMIN_EMAIL", "admin@sdap.niruthi.in").strip().lower()
+                admin_pass = os.getenv("DEFAULT_ADMIN_PASSWORD", "admin123")
+                admin_name = os.getenv("DEFAULT_ADMIN_NAME", "SDAP System Administrator")
+                admin = db_session.query(UserModel).filter(UserModel.email.ilike(admin_email)).first()
+                if not admin:
+                    db_session.add(UserModel(
+                        email=admin_email,
+                        full_name=admin_name,
+                        hashed_password=hash_password(admin_pass),
+                        role="ADMIN",
+                        is_active=True
+                    ))
+                    db_session.commit()
+                    logger.info(f"Default admin user created: {admin_email}")
+                else:
+                    if not verify_password(admin_pass, admin.hashed_password) or not admin.is_active:
+                        admin.hashed_password = hash_password(admin_pass)
+                        admin.is_active = True
+                        db_session.commit()
+                        logger.info(f"Default admin user credentials verified/updated: {admin_email}")
+        except Exception as admin_err:
+            logger.warning(f"Admin seeding check deferred or failed: {admin_err}")
         
     except Exception as e:
         logger.warning(f"Database table initialization deferred or failed: {e}")

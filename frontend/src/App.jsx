@@ -3315,8 +3315,8 @@ export default function App() {
           else if (fn.includes('NDRE')) discoveredIndicesSet.add('NDRE');
           else if (fn.includes('NDWI')) discoveredIndicesSet.add('NDWI');
           else if (fn.includes('EVI')) discoveredIndicesSet.add('EVI');
-          else if (fn.includes('_VV_')) discoveredIndicesSet.add('VV');
-          else if (fn.includes('_VH_')) discoveredIndicesSet.add('VH');
+          else if (fn.includes('_VV_') || fn.startsWith('COMPOSITE_VV_')) discoveredIndicesSet.add('VV');
+          else if (fn.includes('_VH_') || fn.startsWith('COMPOSITE_VH_')) discoveredIndicesSet.add('VH');
         }
       });
 
@@ -3330,13 +3330,13 @@ export default function App() {
       if (discoveredIndicesSet.size === 0) {
         const satStr = (selectedReq?.satellite || '').toLowerCase();
         const hasS1Sensor = satStr.includes('sentinel-1') || satStr.includes('s1');
-        const hasS2Sensor = satStr.includes('sentinel-2') || satStr.includes('s2') || !hasS1Sensor;
-        if (hasS2Sensor) {
+        const hasS2Sensor = satStr.includes('sentinel-2') || satStr.includes('s2');
+        if (hasS1Sensor && !hasS2Sensor) {
+          discoveredIndicesSet.add('VV');
+          discoveredIndicesSet.add('VH');
+        } else {
           discoveredIndicesSet.add('NDVI');
           discoveredIndicesSet.add('LSWI');
-        }
-        if (hasS1Sensor) {
-          discoveredIndicesSet.add('VV_VH');
         }
       }
 
@@ -3431,6 +3431,8 @@ export default function App() {
                   if (uFn.includes('LSWI')) fileIdx = 'LSWI';
                   else if (uFn.includes('NDVI')) fileIdx = 'NDVI';
                   else if (uFn.includes('VV_VH') || uFn.includes('VV/VH')) fileIdx = 'VV_VH';
+                  else if (uFn.includes('_VV_') || uFn.startsWith('COMPOSITE_VV_')) fileIdx = 'VV';
+                  else if (uFn.includes('_VH_') || uFn.startsWith('COMPOSITE_VH_')) fileIdx = 'VH';
                   else fileIdx = 'Composite';
                 }
                 compositeFiles.push({

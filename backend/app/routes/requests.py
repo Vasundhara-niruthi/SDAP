@@ -633,7 +633,19 @@ def get_request_composites(
                         if full_p not in seen:
                             seen.add(full_p)
                             size_mb = os.path.getsize(full_p) / (1024 * 1024)
-                            idx_type = "LSWI" if "LSWI" in f.upper() else ("NDVI" if "NDVI" in f.upper() else "INDEX")
+                            f_u = f.upper()
+                            if "VV_VH" in f_u:
+                                idx_type = "VV_VH"
+                            elif "_VV_" in f_u or f_u.startswith("COMPOSITE_VV_"):
+                                idx_type = "VV"
+                            elif "_VH_" in f_u or f_u.startswith("COMPOSITE_VH_"):
+                                idx_type = "VH"
+                            elif "LSWI" in f_u:
+                                idx_type = "LSWI"
+                            elif "NDVI" in f_u:
+                                idx_type = "NDVI"
+                            else:
+                                idx_type = "INDEX"
                             inferred_interval = interval if interval != "none" else ("weekly" if "weekly" in f.lower() else ("fortnightly" if "fortnightly" in f.lower() else ("monthly" if "monthly" in f.lower() else "none")))
                             composites.append({
                                 "filename": f,
