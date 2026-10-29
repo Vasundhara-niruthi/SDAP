@@ -337,6 +337,33 @@ def estimate_request(
     )
 
 
+@router.get("/daily-quota", summary="Get remaining request quota for the current user today")
+def get_daily_quota(
+    db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_user)
+):
+    """
+    Returns today's request usage and remaining quota for the logged-in user (limit: 3 requests/day).
+    """
+    from datetime import datetime
+    today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+    count = db.query(RequestModel).filter(
+        RequestModel.user_id == current_user.id,
+        RequestModel.created_at >= today_start
+    ).count()
+    max_limit = 3
+    is_admin = (current_user.role or "").strip().upper() == "ADMIN"
+    remaining = max(0, max_limit - count) if not is_admin else 999
+    return {
+        "user_id": current_user.id,
+        "is_admin": is_admin,
+        "daily_limit": max_limit if not is_admin else 999,
+        "used_today": count,
+        "remaining_today": remaining,
+        "limit_reached": (count >= max_limit and not is_admin)
+    }
+
+
 @router.post("/", response_model=RequestResponse, status_code=status.HTTP_201_CREATED, summary="Submit Satellite Processing Request (M1)")
 def create_request(
     req_in: RequestCreate,
@@ -349,6 +376,25 @@ def create_request(
     Associates the request with the logged-in user, estimates storage dynamically,
     applies SRS 8.3 acceptance rules, and triggers pipeline execution for ACCEPTED jobs.
     """
+    # ── Daily Request Rate Limit: Max 3 requests per user per calendar day ──
+    from datetime import datetime
+    today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+    user_daily_requests_count = db.query(RequestModel).filter(
+        RequestModel.user_id == current_user.id,
+        RequestModel.created_at >= today_start
+    ).count()
+
+    MAX_DAILY_REQUESTS = 3
+    is_admin = (current_user.role or "").strip().upper() == "ADMIN"
+    if user_daily_requests_count >= MAX_DAILY_REQUESTS and not is_admin:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=(
+                f"Daily request limit reached: A user can submit a maximum of {MAX_DAILY_REQUESTS} requests per day. "
+                f"You have already submitted {user_daily_requests_count} request(s) today. Please try again tomorrow."
+            )
+        )
+
     est = estimate_request_storage(req_in, db)
 
     if est["will_be_rejected"]:
@@ -617,45 +663,66 @@ def get_request_composites(
 
     search_dirs = [
         os.path.join(settings.RAW_ARCHIVE_DIR, "Composites", district_name, year_str, interval.lower()),
-        os.path.join(settings.RAW_ARCHIVE_DIR, "Composites", district_name),
+        os.path.join(settings.RAW_ARCHIVE_DIR, "Composites", district_name, interval.lower()),
         os.path.join(settings.DELIVERY_DIR, f"request_{request_id}")
     ]
 
     composites = []
     seen = set()
 
+    def _add_comp_file(f: str, full_p: str):
+        if full_p in seen:
+            return
+        seen.add(full_p)
+        try:
+            size_mb = os.path.getsize(full_p) / (1024 * 1024)
+        except Exception:
+            size_mb = 0.0
+        f_u = f.upper()
+        if "VV_VH" in f_u:
+            idx_type = "VV_VH"
+        elif "_VV_" in f_u or f_u.startswith("COMPOSITE_VV_"):
+            idx_type = "VV"
+        elif "_VH_" in f_u or f_u.startswith("COMPOSITE_VH_"):
+            idx_type = "VH"
+        elif "LSWI" in f_u:
+            idx_type = "LSWI"
+        elif "NDVI" in f_u:
+            idx_type = "NDVI"
+        else:
+            idx_type = "INDEX"
+        inferred_interval = interval if interval != "none" else ("weekly" if "weekly" in f.lower() else ("fortnightly" if "fortnightly" in f.lower() else ("monthly" if "monthly" in f.lower() else "none")))
+        composites.append({
+            "filename": f,
+            "path": full_p,
+            "size_mb": round(size_mb, 2),
+            "composite_interval": inferred_interval,
+            "district": district_name,
+            "index": idx_type,
+            "download_url": f"/api/v1/requests/{request_id}/composites/download?filename={f}"
+        })
+
     for s_dir in search_dirs:
-        if os.path.exists(s_dir):
-            for root, _, files in os.walk(s_dir):
-                for f in files:
-                    if f.endswith(".tif") or f.endswith(".tiff"):
-                        full_p = os.path.join(root, f)
-                        if full_p not in seen:
-                            seen.add(full_p)
-                            size_mb = os.path.getsize(full_p) / (1024 * 1024)
-                            f_u = f.upper()
-                            if "VV_VH" in f_u:
-                                idx_type = "VV_VH"
-                            elif "_VV_" in f_u or f_u.startswith("COMPOSITE_VV_"):
-                                idx_type = "VV"
-                            elif "_VH_" in f_u or f_u.startswith("COMPOSITE_VH_"):
-                                idx_type = "VH"
-                            elif "LSWI" in f_u:
-                                idx_type = "LSWI"
-                            elif "NDVI" in f_u:
-                                idx_type = "NDVI"
-                            else:
-                                idx_type = "INDEX"
-                            inferred_interval = interval if interval != "none" else ("weekly" if "weekly" in f.lower() else ("fortnightly" if "fortnightly" in f.lower() else ("monthly" if "monthly" in f.lower() else "none")))
-                            composites.append({
-                                "filename": f,
-                                "path": full_p,
-                                "size_mb": round(size_mb, 2),
-                                "composite_interval": inferred_interval,
-                                "district": district_name,
-                                "index": idx_type,
-                                "download_url": f"/api/v1/requests/{request_id}/composites/download?filename={f}"
-                            })
+        if os.path.isdir(s_dir):
+            try:
+                for entry in os.scandir(s_dir):
+                    if entry.is_file() and (entry.name.lower().endswith(".tif") or entry.name.lower().endswith(".tiff")):
+                        _add_comp_file(entry.name, entry.path)
+            except Exception:
+                pass
+
+    if not composites:
+        parent_dir = os.path.join(settings.RAW_ARCHIVE_DIR, "Composites", district_name)
+        if os.path.isdir(parent_dir):
+            try:
+                for root, dirs, files in os.walk(parent_dir):
+                    if "stack" in root.lower():
+                        continue
+                    for f in files:
+                        if f.lower().endswith((".tif", ".tiff")):
+                            _add_comp_file(f, os.path.join(root, f))
+            except Exception:
+                pass
 
     return {
         "request_id": request_id,
@@ -663,6 +730,63 @@ def get_request_composites(
         "composite_interval": interval,
         "total_composites": len(composites),
         "composites": composites
+    }
+
+
+@router.get("/{request_id}/stack-logs", summary="Get layer stacking execution jobs and logs for a request")
+def get_request_stack_logs(
+    request_id: int,
+    db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_user)
+):
+    """
+    Retrieves all layer stacking jobs, live statuses, progress percentages,
+    and execution logs for a specific user request.
+    """
+    from app.services.stacker_service import STACK_JOBS, STACK_JOBS_LOCK
+    from app.models import LayerStackJobModel
+
+    jobs = db.query(LayerStackJobModel).filter(
+        LayerStackJobModel.request_id == request_id
+    ).order_by(LayerStackJobModel.id.desc()).all()
+
+    results = []
+    for j in jobs:
+        live_job = None
+        with STACK_JOBS_LOCK:
+            live_job = STACK_JOBS.get(j.task_id)
+
+        status = live_job["status"] if live_job else j.status
+        progress = live_job["progress"] if live_job else j.progress
+        step = live_job["step"] if live_job else j.step
+        logs = live_job["logs"] if live_job and live_job.get("logs") else (j.logs_json or [])
+        exec_logs = (live_job.get("execution_logs") if live_job else None) or j.execution_logs or ""
+
+        results.append({
+            "task_id": j.task_id,
+            "request_id": j.request_id,
+            "status": status,
+            "progress": progress,
+            "step": step,
+            "district": j.district,
+            "state": j.state,
+            "season": j.season,
+            "layers": j.layers or [],
+            "filename": j.filename,
+            "output_path": j.output_path,
+            "file_size_mb": j.file_size_mb,
+            "total_bands": j.total_bands,
+            "created_at": j.created_at.isoformat() if j.created_at else None,
+            "updated_at": j.updated_at.isoformat() if j.updated_at else None,
+            "error": live_job.get("error") if live_job else j.error,
+            "logs": logs,
+            "execution_logs": exec_logs
+        })
+
+    return {
+        "request_id": request_id,
+        "total_jobs": len(results),
+        "jobs": results
     }
 
 

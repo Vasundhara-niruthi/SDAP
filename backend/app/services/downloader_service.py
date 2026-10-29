@@ -5,6 +5,7 @@ SDAP Step 4 Downloader & Raster Integrity Service
 Implements failure-safe atomic downloading, rasterio verification, and radiometry check.
 """
 import os
+import re
 import json
 import time
 import logging
@@ -21,6 +22,8 @@ from sqlalchemy import text
 
 from app.core.config import settings
 from app.models.sdap_models import (
+    RequestModel,
+    ProcessJobModel,
     SceneModel,
     BandFileModel,
     TileSceneMetadataModel,
@@ -76,36 +79,36 @@ def resolve_s3_band_path(
     band_name: str
 ) -> tuple[str, str]:
     """
-    Resolve Sentinel-1 IW/SM measurement TIFF paths.
+    Resolves S3 object key and local filename for a band based on S3 bucket structure.
+    Handles both Sentinel-1 SAR (VV, VH) and Sentinel-2 optical bands (B01-B12, B8A, TCI, SCL).
     Returns (S3 object key, local filename).
     """
- 
-    clean_band = os.path.splitext(
-        os.path.basename(band_name)
-    )[0].upper()
- 
-    if clean_band not in {"VV", "VH"}:
-        raise ValueError(
-            f"Unsupported Sentinel-1 band: {band_name}"
-        )
- 
+    clean_band = os.path.splitext(os.path.basename(band_name))[0].upper()
     prefix_clean = prefix.rstrip("/")
- 
-    # Select filename according to the S3 product structure.
-    if "/IW/" in f"/{prefix_clean}/":
-        s3_filename = f"iw-{clean_band.lower()}.tiff"
-    elif "/S1/" in f"/{prefix_clean}/":
-        s3_filename = f"s1-{clean_band.lower()}.tiff"
+
+    # 1. Sentinel-1 SAR products (VV, VH)
+    if prefix.startswith("GRD/") or prefix.lower().startswith("s1_sar/") or prefix.lower().startswith("sentinel-1/") or clean_band in ("VV", "VH", "IW-VV", "IW-VH"):
+        pol = "VH" if "VH" in clean_band else "VV"
+        if "/IW/" in f"/{prefix_clean}/":
+            s3_filename = f"iw-{pol.lower()}.tiff"
+        elif "/S1/" in f"/{prefix_clean}/":
+            s3_filename = f"s1-{pol.lower()}.tiff"
+        else:
+            s3_filename = f"iw-{pol.lower()}.tiff"
+
+        s3_key = f"{prefix_clean}/measurement/{s3_filename}"
+        return s3_key, f"{pol}.tiff"
+
+    # 2. Sentinel-2 L2A COGs (sentinel-cogs bucket)
+    if clean_band in ("B08A", "B8A"):
+        cog_name = "B8A.tif"
+    elif clean_band in ("TCI", "VISUAL"):
+        cog_name = "TCI.tif"
     else:
-        raise ValueError(
-            f"Cannot identify Sentinel-1 mode from prefix: {prefix}"
-        )
- 
-    s3_key = (
-        f"{prefix_clean}/measurement/{s3_filename}"
-    )
- 
-    return s3_key, f"{clean_band}.tiff"
+        cog_name = f"{clean_band}.tif"
+
+    s3_key = f"{prefix_clean}/{cog_name}"
+    return s3_key, cog_name
 
 
 _RASTER_BOUNDS_CACHE: Dict[str, Optional[Tuple[float, float, float, float]]] = {}
@@ -672,7 +675,8 @@ def download_complete_s1_scene(
     scene_archive_dir: str,
     staging_dir: str,
     user_id: int = None,
-    request_id: int = None
+    request_id: int = None,
+    silent_band_logs: bool = False
 ) -> tuple[bool, list[dict], str]:
     """
     Downloads the complete Sentinel-1 (S1_SAR) product structure from AWS S3 (sentinel-s1-l1c)
@@ -803,7 +807,7 @@ def download_complete_s1_scene(
         f"{len(s3_items)} files ({total_mb:.1f} MB) across annotation/, measurement/, preview/, support/..."
     )
     logger.info(start_msg)
-    if request_id:
+    if request_id and not silent_band_logs:
         try:
             from app.db.scripts.download_district_tiles import append_request_log
             append_request_log(db, request_id, start_msg)
@@ -903,7 +907,7 @@ def download_complete_s1_scene(
                     pass
 
             # Log individual band completion
-            if rel.lower().endswith((".tif", ".tiff")) and request_id:
+            if rel.lower().endswith((".tif", ".tiff")) and request_id and not silent_band_logs:
                 try:
                     from app.db.scripts.download_district_tiles import append_request_log
                     sz_mb = sz / (1024 * 1024)
@@ -1145,7 +1149,8 @@ def download_and_verify_scene(
     bands: list[str] = None,
     user_id: int = None,
     request_id: int = None,
-    district_name: Optional[str] = None
+    district_name: Optional[str] = None,
+    silent_band_logs: bool = False
 ) -> tuple[bool, list[dict], str]:
     """
     Fetch required bands for a scene, verify each raster, and record.
@@ -1239,7 +1244,8 @@ def download_and_verify_scene(
             scene_archive_dir=scene_archive_dir,
             staging_dir=staging_dir,
             user_id=user_id,
-            request_id=request_id
+            request_id=request_id,
+            silent_band_logs=silent_band_logs
         )
 
     # ─────────────────────────────────────────────────────────────
@@ -1355,7 +1361,7 @@ def download_and_verify_scene(
             os.makedirs(scene_archive_dir, exist_ok=True)
             safe_move_file(staged_path, target_path)
 
-            if request_id and db:
+            if request_id and db and not silent_band_logs:
                 try:
                     mb = size / (1024 * 1024)
                     b_msg = f"     ↳ Band '{local_filename}' ({mb:.1f} MB) downloaded & verified on NAS."
@@ -1727,7 +1733,6 @@ def get_downloaded_tifs_for_request(db: Session, request_id: int) -> dict:
     # only if no process job records are found
     scene_ids_from_logs = set()
     if not scene_ids_from_jobs and req.execution_logs:
-        import re
         for m in re.finditer(r"(?:Scene:?\s*|Processing\s+(?:Sentinel-1\s+Scene:\s*)?)['\"]([A-Za-z0-9_]+)['\"]", req.execution_logs):
             scene_ids_from_logs.add(m.group(1))
 
@@ -1944,7 +1949,6 @@ def get_downloaded_tifs_for_request(db: Session, request_id: int) -> dict:
     # 3b. Check if any matched scenes exist on NAS storage but have missing records in BandFileModel
     unindexed_scenes = matched_scene_ids - scenes_indexed
     if unindexed_scenes:
-        import re
         for sc_id in unindexed_scenes:
             sc_obj = db.query(SceneModel).filter(SceneModel.scene_id == sc_id).first()
             arch_p = sc_obj.archive_path if sc_obj else None
@@ -2066,6 +2070,89 @@ def get_downloaded_tifs_for_request(db: Session, request_id: int) -> dict:
                                     db.commit()
                         except Exception:
                             db.rollback()
+
+    req_interval = (req.composite_interval or "none").lower().strip()
+    if req_interval in ("fortnightly", "weekly", "monthly"):
+        district_name = req.district or req.state or "Region"
+        clean_d = district_name.strip()
+        year_str = req.start_date.strftime("%Y") if req.start_date else "2026"
+        specific_dirs = [
+            os.path.join(settings.RAW_ARCHIVE_DIR, "Composites", clean_d, year_str, req_interval),
+            os.path.join(settings.RAW_ARCHIVE_DIR, "Composites", clean_d.capitalize(), year_str, req_interval),
+            os.path.join(settings.RAW_ARCHIVE_DIR, "Composites", clean_d, req_interval),
+        ]
+        composite_tifs = []
+        comp_seen = set()
+
+        def _scan_composite_dir(target_dir: str):
+            if not os.path.isdir(target_dir):
+                return
+            try:
+                for entry in os.scandir(target_dir):
+                    if entry.is_file() and entry.name.lower().endswith((".tif", ".tiff")):
+                        fn = entry.name
+                        if fn in comp_seen:
+                            continue
+                        if req_interval not in target_dir.lower() and req_interval not in fn.lower():
+                            continue
+                        comp_seen.add(fn)
+                        full_cp = entry.path
+                        try:
+                            sz = entry.stat().st_size
+                        except Exception:
+                            sz = 0
+                        fn_u = fn.upper()
+                        if "VV_VH" in fn_u:
+                            b_type = "VV_VH"
+                        elif "_VV_" in fn_u or fn_u.startswith("COMPOSITE_VV_"):
+                            b_type = "VV"
+                        elif "_VH_" in fn_u or fn_u.startswith("COMPOSITE_VH_"):
+                            b_type = "VH"
+                        elif "LSWI" in fn_u:
+                            b_type = "LSWI"
+                        elif "NDVI" in fn_u:
+                            b_type = "NDVI"
+                        else:
+                            b_type = "INDEX"
+
+                        m_dt = re.search(r"(\d{8})_(\d{8})", fn)
+                        dt_val = f"{m_dt.group(1)}_{m_dt.group(2)}" if m_dt else start_str
+
+                        composite_tifs.append({
+                            "scene_id": f"Composite_{req_interval}_{dt_val}",
+                            "tile": clean_d,
+                            "sensing_date": dt_val,
+                            "satellite": req.satellite or "Composite",
+                            "band": b_type,
+                            "filename": fn,
+                            "path": full_cp,
+                            "is_calibrated": True,
+                            "is_composite": True,
+                            "size_bytes": sz,
+                            "exists_on_disk": True
+                        })
+            except Exception as e_scan:
+                logger.warning(f"Error scanning composite directory {target_dir}: {e_scan}")
+
+        # Scan specific interval directories first for instant <10ms lookup
+        for sdir in specific_dirs:
+            _scan_composite_dir(sdir)
+
+        # Only if specific subdirectories had no composite files, do a shallow scan of parent Composites/clean_d
+        if not composite_tifs:
+            parent_d = os.path.join(settings.RAW_ARCHIVE_DIR, "Composites", clean_d)
+            if os.path.isdir(parent_d):
+                try:
+                    for entry in os.scandir(parent_d):
+                        if entry.is_dir() and "stack" not in entry.name.lower():
+                            _scan_composite_dir(entry.path)
+                except Exception:
+                    pass
+
+        if composite_tifs:
+            tif_files = composite_tifs
+            tif_paths = [ct["path"] for ct in composite_tifs]
+            total_size = sum(ct["size_bytes"] for ct in composite_tifs)
 
     return {
         "request_id": req.id,
@@ -2518,7 +2605,6 @@ def search_downloaded_tifs_by_region(
             req_q = req_q.filter(func.lower(RequestModel.state) == clean_s)
         for r_obj in req_q.all():
             if r_obj.execution_logs:
-                import re
                 for m in re.finditer(r"(?:Scene:?\s*|Processing\s+(?:Sentinel-1\s+Scene:\s*)?)['\"]([A-Za-z0-9_]+)['\"]", r_obj.execution_logs):
                     allowed_scene_ids.add(m.group(1))
                 for m in re.finditer(r"\b(S1[A-C0-9]_[0-9A-Za-z_]+)\b", r_obj.execution_logs):
@@ -2787,7 +2873,6 @@ def search_downloaded_tifs_by_region(
             for b in (band or "").split(",")
             if b.strip() and b.strip().upper() != "ALL"
         ] if band and band.upper() != "ALL" else []
-        import re
         search_dirs = []
         if district and district.strip():
             search_dirs.append(os.path.join(settings.RAW_ARCHIVE_DIR, "Composites", district.strip()))
@@ -2917,7 +3002,6 @@ def search_downloaded_tifs_by_region(
         seen_disk_paths = set(os.path.normpath(p).lower() for p in tif_paths)
         seen_scene_bands = set((f.get("scene_id"), f.get("band")) for f in tif_files)
         valid_scene_ids = set(s.scene_id for s in matched_scenes) if matched_scenes else None
-        import re
 
         for s1_root in s1_roots:
             try:

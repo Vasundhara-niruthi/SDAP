@@ -207,18 +207,3 @@ def get_work_breakdown(
         "work_breakdown": migration_mgr.get_user_work_breakdown()
     }
 
-
-@router.get("/analytics/daily-storage", summary="Get Daily Request & Physical Storage Analytics (Admin Only)")
-def get_daily_storage_analytics_endpoint(
-    start_date: Optional[str] = None,
-    end_date: Optional[str] = None,
-    db: Session = Depends(get_db),
-    admin: UserModel = Depends(get_current_admin)
-):
-    """
-    Admin-only endpoint to retrieve daily request and physical storage occupancy metrics,
-    cumulative totals, and request breakdown over time.
-    """
-    from app.services.analytics_service import get_daily_storage_analytics
-    return get_daily_storage_analytics(db=db, start_date=start_date, end_date=end_date)
-

@@ -55,6 +55,7 @@ def create_layer_stack(
     """
     try:
         force_recreate = bool(getattr(payload, "force_recreate", False))
+        comp_interval = getattr(payload, "composite_interval", None)
         if not force_recreate:
             matches = find_matching_layer_stacks_on_nas(
                 district=payload.district,
@@ -62,7 +63,8 @@ def create_layer_stack(
                 season=payload.season or "Kharif",
                 start_date=payload.start_date,
                 end_date=payload.end_date,
-                layers=payload.layers
+                layers=payload.layers,
+                composite_interval=comp_interval
             )
             if matches:
                 top_m = matches[0]
@@ -124,7 +126,8 @@ def create_layer_stack(
             selected_files_by_band=getattr(payload, "selected_files_by_band", None),
             force_recreate=force_recreate,
             request_id=payload.request_id,
-            user_id=current_user.id if current_user else None
+            user_id=current_user.id if current_user else None,
+            composite_interval=comp_interval
         )
         return {
             "status": "RUNNING",
@@ -179,12 +182,35 @@ def get_latest_layer_stack_task(
 @router.get("/layer-stack/jobs", summary="List layer stacking jobs history directly from PostgreSQL")
 def get_layer_stack_jobs(
     district: Optional[str] = Query(None, description="Filter by district"),
+    request_id: Optional[int] = Query(None, description="Filter by request ID"),
     limit: int = Query(20, ge=1, le=100),
+    include_logs: bool = Query(False, description="Whether to include full logs"),
     db: Session = Depends(get_db),
     current_user: UserModel = Depends(get_current_user)
 ):
     """Lists history of layer stacking executions with their logs and outputs."""
-    return list_db_stack_jobs(district=district, limit=limit, db=db)
+    return list_db_stack_jobs(
+        district=district,
+        request_id=request_id,
+        limit=limit,
+        include_logs=include_logs,
+        db=db
+    )
+
+
+@router.get("/layer-stack/by-request/{request_id}", summary="Get all layer stacking jobs and logs for a specific request")
+def get_layer_stack_jobs_by_request(
+    request_id: int,
+    db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_user)
+):
+    """Returns all layer stacking jobs and real-time execution logs for a request."""
+    jobs = list_db_stack_jobs(request_id=request_id, limit=50, include_logs=True, db=db)
+    return {
+        "request_id": request_id,
+        "total_jobs": len(jobs),
+        "jobs": jobs
+    }
 
 
 @router.get("/layer-stack/download", summary="Download a generated layer-stacked GeoTIFF")

@@ -700,10 +700,26 @@ def create_temporal_composite_raster(
             write_arr = np.where(np.isnan(accumulated), -999.0, accumulated).astype("float32")
             dst.write(write_arr, 1)
             dst.set_band_description(1, method_clean.upper())
+            tag_dict = {"DESCRIPTION": f"{method_clean.upper()} Temporal Composite", "METHOD": method_clean}
+            valid_mask = (~np.isnan(accumulated)) & (accumulated != -999.0) & (accumulated > -990.0) & (accumulated < 1e30)
+            valid_vals = accumulated[valid_mask]
+            if len(valid_vals) > 0:
+                tag_dict.update({
+                    "STATISTICS_MINIMUM": f"{float(valid_vals.min()):.4f}",
+                    "STATISTICS_MAXIMUM": f"{float(valid_vals.max()):.4f}",
+                    "STATISTICS_MEAN": f"{float(valid_vals.mean()):.4f}",
+                    "STATISTICS_STDDEV": f"{float(valid_vals.std()):.4f}",
+                    "STATISTICS_VALID_PERCENT": f"{(len(valid_vals) / accumulated.size) * 100:.2f}"
+                })
             try:
-                dst.update_tags(1, DESCRIPTION=f"{method_clean.upper()} Temporal Composite", METHOD=method_clean)
+                dst.update_tags(1, **tag_dict)
             except Exception:
                 pass
+            try:
+                dst.build_overviews([2, 4, 8, 16], Resampling.average)
+                dst.update_tags(ns="rio_overview", resampling="average")
+            except Exception as ov_err:
+                logger.debug(f"Overview pyramid note: {ov_err}")
 
         temp_target = output_path + ".tmp"
         shutil.copy2(temp_file, temp_target)

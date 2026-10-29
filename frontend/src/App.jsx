@@ -6,7 +6,7 @@ import {
   Calendar, MapPin, Sliders, Shield, Users, Check, ChevronRight, ChevronDown, Info,
   HelpCircle, X, Download, Play, Terminal, Eye, EyeOff, KeyRound, ArrowLeft, Square, Table,
   Layers, ArrowUp, ArrowDown, TrendingUp, BarChart3, Filter, Trash2,
-  Minimize2, Maximize2, Package
+  Minimize2, Maximize2, Package, Copy
 } from 'lucide-react';
 
 const API_BASE = '/api/v1';
@@ -147,14 +147,6 @@ export default function App() {
   const [newAdminFullName, setNewAdminFullName] = useState('');
   const [newAdminRole, setNewAdminRole] = useState('USER');
   const [adminUserMsg, setAdminUserMsg] = useState(null);
-
-  // Daily Storage Analytics (Admin Only)
-  const [dailyStorageData, setDailyStorageData] = useState(null);
-  const [loadingDailyStorage, setLoadingDailyStorage] = useState(false);
-  const [dailyStorageFilter, setDailyStorageFilter] = useState('ALL'); // 'ALL' | '7D' | '30D' | 'CUSTOM'
-  const [dailyStartDate, setDailyStartDate] = useState('');
-  const [dailyEndDate, setDailyEndDate] = useState('');
-  const [expandedDailyDate, setExpandedDailyDate] = useState(null);
 
   // ---------------------------------------------------------------------------
   // 7. Data Retrieval & Export State & Handlers
@@ -588,6 +580,21 @@ export default function App() {
 
   // Layer Stacking Real-time execution tracking & live log states
   const [stackTaskId, setStackTaskId] = useState('');
+  const [activeStackTasks, setActiveStackTasks] = useState(() => {
+    try {
+      return JSON.parse(localStorage.getItem('sdap_active_stack_tasks') || '{}');
+    } catch (e) {
+      return {};
+    }
+  });
+  const [requestLogTab, setRequestLogTab] = useState('pipeline'); // 'pipeline' | 'stacking'
+  const [reqStackJobs, setReqStackJobs] = useState([]);
+  const [selectedReqStackJobIndex, setSelectedReqStackJobIndex] = useState(0);
+  const [loadingReqStackLogs, setLoadingReqStackLogs] = useState(false);
+  const [dailyQuota, setDailyQuota] = useState(null);
+  const [reqStackLogViewMode, setReqStackLogViewMode] = useState('table'); // 'table' | 'raw'
+  const [reqStackLogFilter, setReqStackLogFilter] = useState('all'); // 'all' | 'info' | 'success' | 'warnings' | 'errors'
+  const [reqStackLogSearchQuery, setReqStackLogSearchQuery] = useState('');
   const [stackProgress, setStackProgress] = useState(0);
   const [stackStep, setStackStep] = useState('');
   const [stackLogs, setStackLogs] = useState([]);
@@ -630,9 +637,24 @@ export default function App() {
 
     setLoadingStackReqFiles(true);
     try {
-      // 1. Fetch district requests from backend to ensure both admin & regular users discover jobs
+      // 1. Fast request resolution: if specificRequestId is provided, resolve directly from state or single request GET
       let candidateRequests = [...requests];
-      if (distVal) {
+      let matchingReq = null;
+
+      if (specificRequestId) {
+        matchingReq = requests.find(r => String(r.id) === String(specificRequestId)) || null;
+        if (!matchingReq) {
+          try {
+            const reqRes = await axios.get(`${API_BASE}/requests/${specificRequestId}`, { headers: getAuthHeader() });
+            if (reqRes.data) {
+              matchingReq = reqRes.data;
+              candidateRequests = [matchingReq, ...candidateRequests];
+            }
+          } catch (e) {
+            console.warn('Could not fetch specific request details:', e);
+          }
+        }
+      } else if (distVal) {
         try {
           const distReqsRes = await axios.get(`${API_BASE}/requests/by-district/${encodeURIComponent(distVal)}`, { headers: getAuthHeader() });
           if (Array.isArray(distReqsRes.data) && distReqsRes.data.length > 0) {
@@ -641,23 +663,6 @@ export default function App() {
           }
         } catch (e) {
           // fallback to local candidateRequests
-        }
-      }
-
-      // If a specificRequestId is provided, prioritize it directly
-      let matchingReq = null;
-      if (specificRequestId) {
-        matchingReq = candidateRequests.find(r => String(r.id) === String(specificRequestId)) || null;
-        if (!matchingReq) {
-          try {
-            const reqRes = await axios.get(`${API_BASE}/requests/${specificRequestId}`, { headers: getAuthHeader() });
-            if (reqRes.data) {
-              matchingReq = reqRes.data;
-              candidateRequests.unshift(matchingReq);
-            }
-          } catch (e) {
-            console.warn('Could not fetch specific request details:', e);
-          }
         }
       }
 
@@ -716,22 +721,20 @@ export default function App() {
           if (matchingReq.end_date && !endVal) setStackEndDate(matchingReq.end_date.split('T')[0]);
         }
 
-        // Query candidate requests for tifs
+        // Query candidate requests for tifs in parallel using Promise.all
         const allTifsMap = new Map();
-        for (const r of reqsToTry) {
-          try {
-            const res = await axios.get(`${API_BASE}/requests/${r.id}/tifs`, { headers: getAuthHeader() });
-            const list = res.data?.tifs || [];
-            list.forEach(t => {
-              const k = (t.path || `${t.scene_id}_${t.band}`).toLowerCase();
-              if (!allTifsMap.has(k)) {
-                allTifsMap.set(k, t);
-              }
-            });
-          } catch (e) {
-            console.warn('Could not fetch request tifs directly:', e);
+        const tifsPromises = reqsToTry.map(r =>
+          axios.get(`${API_BASE}/requests/${r.id}/tifs`, { headers: getAuthHeader() })
+            .then(res => res.data?.tifs || [])
+            .catch(() => [])
+        );
+        const tifsArrays = await Promise.all(tifsPromises);
+        tifsArrays.flat().forEach(t => {
+          const k = (t.path || `${t.scene_id}_${t.band}`).toLowerCase();
+          if (!allTifsMap.has(k)) {
+            allTifsMap.set(k, t);
           }
-        }
+        });
         tifs = Array.from(allTifsMap.values());
       }
 
@@ -848,15 +851,19 @@ export default function App() {
         }
       });
 
-      // Also try fetching composites for matched requests (skip optical composites for pure Sentinel-1 requests)
+      // Also try fetching composites for matched requests in parallel (skip optical composites for pure Sentinel-1 requests)
       const isPureS1 = matchingReq && matchingReq.satellite && matchingReq.satellite.toLowerCase().includes('sentinel-1') && !matchingReq.satellite.toLowerCase().includes('sentinel-2');
       if (!isPureS1) {
         const candidateReqs = (typeof reqsToTry !== 'undefined' && reqsToTry.length > 0) ? reqsToTry : (matchingReq ? [matchingReq] : []);
-        for (const reqItem of candidateReqs) {
-          if (reqItem.satellite && reqItem.satellite.toLowerCase().includes('sentinel-1') && !reqItem.satellite.toLowerCase().includes('sentinel-2')) continue;
-          try {
-            const compRes = await axios.get(`${API_BASE}/requests/${reqItem.id}/composites`, { headers: getAuthHeader() });
-          const comps = compRes.data?.composites || compRes.data || [];
+        const eligibleReqs = candidateReqs.filter(r => !(r.satellite && r.satellite.toLowerCase().includes('sentinel-1') && !r.satellite.toLowerCase().includes('sentinel-2')));
+        const compResults = await Promise.all(
+          eligibleReqs.map(reqItem =>
+            axios.get(`${API_BASE}/requests/${reqItem.id}/composites`, { headers: getAuthHeader() })
+              .then(res => ({ reqItem, comps: res.data?.composites || res.data || [] }))
+              .catch(() => ({ reqItem, comps: [] }))
+          )
+        );
+        for (const { reqItem, comps } of compResults) {
           comps.forEach(c => {
             let b = c.index;
             if (!b && c.filename) {
@@ -897,11 +904,8 @@ export default function App() {
               });
             }
           });
-        } catch (cErr) {
-          // ignore
         }
       }
-    }
 
       setStackDownloadedBandsData(grouped);
 
@@ -1201,6 +1205,7 @@ export default function App() {
     setStackArchiveSearch('');
   };
 
+
   const startStackPolling = useCallback((taskId, targetDistrict) => {
     if (stackPollIntervalRef.current) {
       clearInterval(stackPollIntervalRef.current);
@@ -1314,6 +1319,9 @@ export default function App() {
 
     try {
       const isForce = forceOverwrite === true;
+      const reqObj = requests.find(r => r.id === stackRequestId) || null;
+      const compInterval = (reqObj && reqObj.composite_interval) ? reqObj.composite_interval : 'none';
+
       const payload = {
         state: stackState || null,
         district: stackDistrict,
@@ -1325,7 +1333,8 @@ export default function App() {
         selected_files: selectedPaths.length > 0 ? selectedPaths : null,
         selected_files_by_band: Object.keys(selectedFilesByBand).length > 0 ? selectedFilesByBand : null,
         force_recreate: isForce,
-        request_id: stackRequestId || null
+        request_id: stackRequestId || null,
+        composite_interval: compInterval
       };
 
       const res = await axios.post(`${API_BASE}/requests/layer-stack`, payload, {
@@ -1361,11 +1370,39 @@ export default function App() {
       const taskId = res.data.task_id;
       setStackTaskId(taskId);
       setStackStep('TASK_STARTED');
-      localStorage.setItem('sdap_active_stack_task', JSON.stringify({
+      setStackLoading(true);
+
+      const newTaskObj = {
         taskId,
+        requestId: stackRequestId,
         district: stackDistrict,
-        season: stackSeason
-      }));
+        state: stackState,
+        season: stackSeason || 'Kharif',
+        layers: stackSelectedLayers,
+        status: 'RUNNING',
+        progress: 5,
+        step: 'TASK_STARTED',
+        logs: [
+          ...stackLogs,
+          {
+            timestamp: new Date().toLocaleTimeString(),
+            level: 'INFO',
+            message: `Task ${taskId} registered in database. Streaming live execution logs from NAS...`
+          }
+        ],
+        result: null,
+        error: null,
+        updatedAt: new Date().toISOString()
+      };
+
+      setActiveStackTasks(prev => {
+        const next = { ...prev, [taskId]: newTaskObj };
+        try {
+          localStorage.setItem('sdap_active_stack_tasks', JSON.stringify(next));
+        } catch (e) {}
+        return next;
+      });
+
       setStackLogs(prev => [
         ...prev,
         {
@@ -1434,6 +1471,16 @@ export default function App() {
           if (itemD && dClean && itemD !== dClean && !fn.startsWith(dClean) && !fn.includes(dClean) && !dClean.includes(itemD)) {
             return false;
           }
+        }
+
+        // Match composite interval (fortnightly vs individual scenes)
+        const reqObj = requests.find(r => r.id === stackRequestId) || null;
+        const compIntv = (reqObj && reqObj.composite_interval) ? reqObj.composite_interval.toLowerCase().trim() : 'none';
+        const fnLower = (item.filename || '').toLowerCase();
+        if (compIntv === 'fortnightly' || compIntv === 'weekly' || compIntv === 'monthly') {
+          if (!fnLower.includes(compIntv)) return false;
+        } else if (compIntv === 'none') {
+          if (fnLower.includes('fortnightly') || fnLower.includes('weekly') || fnLower.includes('monthly')) return false;
         }
 
         let itemBands = [];
@@ -1801,43 +1848,6 @@ export default function App() {
     }
   }, [token, currentUser]);
 
-  // Fetch Daily Storage Analytics (Admin Only)
-  const fetchDailyStorage = useCallback(async (start = dailyStartDate, end = dailyEndDate) => {
-    if (!token || currentUser?.role !== 'ADMIN') return;
-    setLoadingDailyStorage(true);
-    try {
-      const params = new URLSearchParams();
-      if (start) params.append('start_date', start);
-      if (end) params.append('end_date', end);
-      const qStr = params.toString();
-      const res = await axios.get(`${API_BASE}/users/analytics/daily-storage${qStr ? '?' + qStr : ''}`, { headers: getAuthHeader() });
-      setDailyStorageData(res.data);
-    } catch (err) {
-      console.error('Error loading daily storage analytics:', err);
-    } finally {
-      setLoadingDailyStorage(false);
-    }
-  }, [token, currentUser, dailyStartDate, dailyEndDate]);
-
-  const handleDailyStorageQuickFilter = (range) => {
-    setDailyStorageFilter(range);
-    let start = '';
-    let end = '';
-    const now = new Date();
-    if (range === '7D') {
-      const past = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
-      start = past.toISOString().split('T')[0];
-      end = now.toISOString().split('T')[0];
-    } else if (range === '30D') {
-      const past = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
-      start = past.toISOString().split('T')[0];
-      end = now.toISOString().split('T')[0];
-    }
-    setDailyStartDate(start);
-    setDailyEndDate(end);
-    fetchDailyStorage(start, end);
-  };
-
   // Fetch Specific User's Requests (Admin Only)
   const fetchUserRequests = useCallback(async (userId) => {
     if (!userId) return;
@@ -1861,7 +1871,477 @@ export default function App() {
     }
   };
 
+  const fetchRequestStackLogs = useCallback(async (reqId) => {
+    if (!reqId) return;
+    setLoadingReqStackLogs(true);
+    try {
+      const res = await axios.get(`${API_BASE}/requests/${reqId}/stack-logs`, {
+        headers: getAuthHeader()
+      });
+      const jobs = res.data?.jobs || [];
+      setReqStackJobs(jobs);
+      setSelectedReqStackJobIndex(0);
+    } catch (e) {
+      console.warn('Could not fetch request stack logs:', e);
+      setReqStackJobs([]);
+    } finally {
+      setLoadingReqStackLogs(false);
+    }
+  }, []);
+
+  const renderRequestStackingLogsSection = () => {
+    if (loadingReqStackLogs && reqStackJobs.length === 0) {
+      return (
+        <div style={{ padding: '3rem', textAlign: 'center', color: '#64748b' }}>
+          <RefreshCw size={24} className="spin" style={{ color: '#2563eb', marginBottom: '0.75rem' }} />
+          <p style={{ margin: 0, fontWeight: 600, fontSize: '0.9rem' }}>Loading layer stacking logs and history...</p>
+        </div>
+      );
+    }
+
+    if (reqStackJobs.length === 0) {
+      return (
+        <div style={{ padding: '3rem 2rem', textAlign: 'center', backgroundColor: '#fffbeb', borderRadius: '0.5rem', border: '1px dashed #fde68a', margin: '1rem' }}>
+          <Layers size={36} color="#d97706" style={{ marginBottom: '0.75rem' }} />
+          <h4 style={{ margin: '0 0 0.5rem 0', fontSize: '1.05rem', color: '#92400e', fontWeight: 700 }}>
+            No Layer Stacking runs recorded yet for Request #{selectedReqForLogs?.id}
+          </h4>
+          <p style={{ margin: '0 0 1.25rem 0', fontSize: '0.82rem', color: '#78350f', maxWidth: '520px', marginLeft: 'auto', marginRight: 'auto', lineHeight: 1.5 }}>
+            All candidate satellite scenes and calibrated bands are verified on NAS storage. You can launch Layer Stacking Studio to assemble a multi-band GeoTIFF deliverable now.
+          </p>
+          <button
+            onClick={() => {
+              const req = selectedReqForLogs;
+              closeLogsModal();
+              setActiveTab('layer_stacking');
+              setStackRequestId(req.id);
+              setStackState(req.state || '');
+              setStackDistrict(req.district || '');
+              setStackSeason(req.season || 'Kharif');
+              const sDate = req.start_date ? req.start_date.split('T')[0] : '2026-06-01';
+              const eDate = req.end_date ? req.end_date.split('T')[0] : '2026-10-31';
+              setStackStartDate(sDate);
+              setStackEndDate(eDate);
+              hasAutoLoadedStackRef.current = true;
+              loadBandsAndScenesForRegion(req.state, req.district, req.season, sDate, eDate, req.id);
+            }}
+            style={{
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: '0.4rem',
+              padding: '0.5rem 1rem',
+              borderRadius: '0.375rem',
+              border: '1px solid #d97706',
+              backgroundColor: '#fef3c7',
+              color: '#92400e',
+              fontSize: '0.82rem',
+              fontWeight: 700,
+              cursor: 'pointer'
+            }}
+          >
+            <Layers size={14} /> Launch Layer Stacking Studio Now
+          </button>
+        </div>
+      );
+    }
+
+    const activeJob = reqStackJobs[selectedReqStackJobIndex] || reqStackJobs[0];
+    const isRunning = activeJob.status === 'RUNNING';
+    const isSuccess = activeJob.status === 'SUCCESS';
+
+    let logsToDisplay = [];
+    if (Array.isArray(activeJob.logs) && activeJob.logs.length > 0) {
+      logsToDisplay = activeJob.logs;
+    } else if (activeJob.execution_logs) {
+      logsToDisplay = activeJob.execution_logs.split('\n').filter(Boolean).map(l => {
+        const m = l.match(/\[(.*?)\]\s*\[(.*?)\]\s*(.*)/);
+        if (m) {
+          return { timestamp: m[1], level: m[2], message: m[3] };
+        }
+        return { timestamp: '', level: 'INFO', message: l };
+      });
+    }
+
+    if (reqStackLogFilter !== 'all') {
+      logsToDisplay = logsToDisplay.filter(item => {
+        const lvl = (item.level || '').toUpperCase();
+        if (reqStackLogFilter === 'info') return lvl === 'INFO';
+        if (reqStackLogFilter === 'success') return lvl === 'SUCCESS';
+        if (reqStackLogFilter === 'warnings') return lvl === 'WARNING' || lvl === 'WARN';
+        if (reqStackLogFilter === 'errors') return lvl === 'ERROR' || lvl === 'FATAL';
+        return true;
+      });
+    }
+
+    if (reqStackLogSearchQuery.trim()) {
+      const q = reqStackLogSearchQuery.toLowerCase().trim();
+      logsToDisplay = logsToDisplay.filter(item =>
+        (item.message || '').toLowerCase().includes(q) ||
+        (item.timestamp || '').toLowerCase().includes(q) ||
+        (item.level || '').toLowerCase().includes(q)
+      );
+    }
+
+    return (
+      <div style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
+        {reqStackJobs.length > 1 && (
+          <div style={{
+            display: 'flex',
+            alignItems: 'center',
+            gap: '0.45rem',
+            padding: '0.5rem 0',
+            marginBottom: '0.75rem',
+            overflowX: 'auto',
+            borderBottom: '1px solid #e2e8f0'
+          }}>
+            <span style={{ fontSize: '0.73rem', fontWeight: 700, color: '#64748b', whiteSpace: 'nowrap' }}>
+              Select Run ({reqStackJobs.length}):
+            </span>
+            {reqStackJobs.map((j, idx) => {
+              const selected = idx === selectedReqStackJobIndex;
+              const jRunning = j.status === 'RUNNING';
+              const jSuccess = j.status === 'SUCCESS';
+              return (
+                <button
+                  key={j.task_id || idx}
+                  onClick={() => setSelectedReqStackJobIndex(idx)}
+                  style={{
+                    display: 'inline-flex',
+                    alignItems: 'center',
+                    gap: '0.35rem',
+                    padding: '0.25rem 0.65rem',
+                    borderRadius: '9999px',
+                    border: selected ? '2px solid #2563eb' : '1px solid #cbd5e1',
+                    backgroundColor: selected ? '#eff6ff' : '#ffffff',
+                    color: selected ? '#1d4ed8' : '#334155',
+                    fontSize: '0.73rem',
+                    fontWeight: selected ? 700 : 500,
+                    cursor: 'pointer',
+                    whiteSpace: 'nowrap'
+                  }}
+                >
+                  <span style={{ width: 6, height: 6, borderRadius: '50%', backgroundColor: jRunning ? '#3b82f6' : (jSuccess ? '#10b981' : '#ef4444') }} />
+                  <span>Run #{reqStackJobs.length - idx}</span>
+                  <span style={{ opacity: 0.7 }}>({j.created_at ? j.created_at.split('T')[0] : ''})</span>
+                  <span style={{ fontWeight: 700 }}>{jRunning ? `${j.progress || 0}%` : (jSuccess ? '✓' : '✗')}</span>
+                </button>
+              );
+            })}
+          </div>
+        )}
+
+        <div style={{
+          backgroundColor: '#f8fafc',
+          border: '1px solid #e2e8f0',
+          borderRadius: '0.5rem',
+          padding: '0.75rem 1rem',
+          marginBottom: '0.85rem'
+        }}>
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: '0.5rem', marginBottom: '0.4rem' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+              <span style={{
+                padding: '0.2rem 0.6rem',
+                borderRadius: '0.25rem',
+                fontSize: '0.74rem',
+                fontWeight: 700,
+                textTransform: 'uppercase',
+                backgroundColor: isSuccess ? '#ecfdf5' : (isRunning ? '#eff6ff' : '#fef2f2'),
+                color: isSuccess ? '#047857' : (isRunning ? '#1d4ed8' : '#b91c1c'),
+                border: isSuccess ? '1px solid #a7f3d0' : (isRunning ? '1px solid #bfdbfe' : '1px solid #fecaca')
+              }}>
+                {isRunning ? `RUNNING (${activeJob.progress || 0}%)` : (isSuccess ? 'COMPLETED' : 'FAILED')}
+              </span>
+              <span style={{ fontSize: '0.78rem', color: '#475569', fontWeight: 600 }}>
+                Step: <code style={{ color: '#0f172a' }}>{activeJob.step || 'INITIALIZING'}</code>
+              </span>
+              <span style={{ fontSize: '0.75rem', color: '#64748b' }}>
+                Task: <code style={{ color: '#2563eb' }}>{activeJob.task_id}</code>
+              </span>
+            </div>
+
+            <div style={{ display: 'flex', alignItems: 'center', gap: '0.45rem' }}>
+              {activeJob.output_path && (
+                <button
+                  onClick={() => handleDownloadStackedTif(activeJob.output_path, activeJob.filename)}
+                  style={{
+                    display: 'inline-flex',
+                    alignItems: 'center',
+                    gap: '0.3rem',
+                    padding: '0.3rem 0.65rem',
+                    borderRadius: '0.375rem',
+                    border: '1px solid #86efac',
+                    backgroundColor: '#f0fdf4',
+                    color: '#166534',
+                    fontSize: '0.74rem',
+                    fontWeight: 700,
+                    cursor: 'pointer'
+                  }}
+                  title="Download final multi-band layer stack GeoTIFF"
+                >
+                  <Download size={12} /> Download Stack ({activeJob.file_size_mb || 0} MB)
+                </button>
+              )}
+              <button
+                onClick={() => {
+                  const req = selectedReqForLogs;
+                  closeLogsModal();
+                  setActiveTab('layer_stacking');
+                  setStackTaskId(activeJob.task_id);
+                  setStackRequestId(req.id);
+                  setStackDistrict(req.district || '');
+                  setStackState(req.state || '');
+                  setStackSeason(req.season || 'Kharif');
+                }}
+                style={{
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  gap: '0.3rem',
+                  padding: '0.3rem 0.65rem',
+                  borderRadius: '0.375rem',
+                  border: '1px solid #bfdbfe',
+                  backgroundColor: '#eff6ff',
+                  color: '#1d4ed8',
+                  fontSize: '0.74rem',
+                  fontWeight: 600,
+                  cursor: 'pointer'
+                }}
+              >
+                <Layers size={12} /> Open in Stack Studio
+              </button>
+            </div>
+          </div>
+
+          {isRunning && (
+            <div style={{ width: '100%', height: '5px', backgroundColor: '#e2e8f0', borderRadius: '9999px', overflow: 'hidden', margin: '0.5rem 0' }}>
+              <div style={{
+                height: '100%',
+                width: `${activeJob.progress || 5}%`,
+                backgroundColor: '#2563eb',
+                transition: 'width 0.3s ease'
+              }} />
+            </div>
+          )}
+
+          <div style={{ display: 'flex', alignItems: 'center', gap: '0.85rem', flexWrap: 'wrap', fontSize: '0.74rem', color: '#64748b', marginTop: '0.35rem' }}>
+            <span><strong>District:</strong> {activeJob.district} ({activeJob.season || 'Kharif'})</span>
+            <span><strong>Layers:</strong> {Array.isArray(activeJob.layers) ? activeJob.layers.join(', ') : (activeJob.layers || 'All')}</span>
+            {activeJob.filename && <span><strong>Output:</strong> <code>{activeJob.filename}</code></span>}
+            {activeJob.total_bands && <span><strong>Bands:</strong> {activeJob.total_bands}</span>}
+            {activeJob.created_at && <span><strong>Executed:</strong> {new Date(activeJob.created_at).toLocaleString()}</span>}
+          </div>
+        </div>
+
+        <div style={{
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'space-between',
+          flexWrap: 'wrap',
+          gap: '0.5rem',
+          padding: '0.4rem 0.6rem',
+          backgroundColor: '#f1f5f9',
+          borderRadius: '0.375rem',
+          marginBottom: '0.65rem'
+        }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+            <div style={{ display: 'inline-flex', backgroundColor: '#ffffff', borderRadius: '0.25rem', padding: '2px', border: '1px solid #cbd5e1' }}>
+              <button
+                onClick={() => setReqStackLogViewMode('table')}
+                style={{
+                  padding: '0.25rem 0.6rem',
+                  borderRadius: '0.2rem',
+                  border: 'none',
+                  backgroundColor: reqStackLogViewMode === 'table' ? '#2563eb' : 'transparent',
+                  color: reqStackLogViewMode === 'table' ? '#ffffff' : '#475569',
+                  fontSize: '0.72rem',
+                  fontWeight: 600,
+                  cursor: 'pointer'
+                }}
+              >
+                Table View
+              </button>
+              <button
+                onClick={() => setReqStackLogViewMode('raw')}
+                style={{
+                  padding: '0.25rem 0.6rem',
+                  borderRadius: '0.2rem',
+                  border: 'none',
+                  backgroundColor: reqStackLogViewMode === 'raw' ? '#2563eb' : 'transparent',
+                  color: reqStackLogViewMode === 'raw' ? '#ffffff' : '#475569',
+                  fontSize: '0.72rem',
+                  fontWeight: 600,
+                  cursor: 'pointer'
+                }}
+              >
+                Terminal View
+              </button>
+            </div>
+
+            <div style={{ display: 'flex', alignItems: 'center', gap: '0.25rem' }}>
+              {['all', 'info', 'success', 'warnings', 'errors'].map(fKey => (
+                <button
+                  key={fKey}
+                  onClick={() => setReqStackLogFilter(fKey)}
+                  style={{
+                    padding: '0.2rem 0.5rem',
+                    borderRadius: '0.25rem',
+                    border: '1px solid',
+                    borderColor: reqStackLogFilter === fKey ? '#93c5fd' : '#e2e8f0',
+                    backgroundColor: reqStackLogFilter === fKey ? '#eff6ff' : '#ffffff',
+                    color: reqStackLogFilter === fKey ? '#1d4ed8' : '#64748b',
+                    fontSize: '0.7rem',
+                    fontWeight: reqStackLogFilter === fKey ? 700 : 500,
+                    textTransform: 'capitalize',
+                    cursor: 'pointer'
+                  }}
+                >
+                  {fKey}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+            <input
+              type="text"
+              placeholder="Search stacking logs..."
+              value={reqStackLogSearchQuery}
+              onChange={(e) => setReqStackLogSearchQuery(e.target.value)}
+              style={{
+                padding: '0.25rem 0.5rem',
+                fontSize: '0.73rem',
+                borderRadius: '0.25rem',
+                border: '1px solid #cbd5e1',
+                width: '180px',
+                outline: 'none'
+              }}
+            />
+            <button
+              onClick={() => {
+                const text = logsToDisplay.map(l => `[${l.timestamp}] [${l.level || 'INFO'}] ${l.message}`).join('\n');
+                navigator.clipboard.writeText(text);
+                alert('Layer stacking execution logs copied to clipboard!');
+              }}
+              style={{
+                display: 'inline-flex',
+                alignItems: 'center',
+                gap: '0.25rem',
+                padding: '0.25rem 0.55rem',
+                borderRadius: '0.25rem',
+                border: '1px solid #cbd5e1',
+                backgroundColor: '#ffffff',
+                color: '#334155',
+                fontSize: '0.72rem',
+                fontWeight: 600,
+                cursor: 'pointer'
+              }}
+              title="Copy all stacking logs to clipboard"
+            >
+              <Copy size={11} /> Copy
+            </button>
+          </div>
+        </div>
+
+        {reqStackLogViewMode === 'raw' ? (
+          <div className="log-terminal" style={{
+            flex: 1,
+            maxHeight: '450px',
+            overflowY: 'auto',
+            backgroundColor: '#f8fafc',
+            border: '1px solid #e2e8f0',
+            color: '#0f172a',
+            fontFamily: 'monospace',
+            fontSize: '0.75rem',
+            padding: '0.85rem 1rem',
+            borderRadius: '0.375rem',
+            lineHeight: 1.6
+          }}>
+            {logsToDisplay.length === 0 ? (
+              <div style={{ color: '#94a3b8' }}>No logs match the current search or severity filter.</div>
+            ) : (
+              logsToDisplay.map((log, idx) => {
+                const lvl = (log.level || 'INFO').toUpperCase();
+                const color = lvl === 'ERROR' || lvl === 'FATAL' ? '#f87171' :
+                              lvl === 'WARNING' || lvl === 'WARN' ? '#fbbf24' :
+                              lvl === 'SUCCESS' ? '#4ade80' : '#60a5fa';
+                return (
+                  <div key={idx} style={{ display: 'flex', gap: '0.5rem' }}>
+                    <span style={{ color: '#64748b', userSelect: 'none' }}>[{log.timestamp || '--:--:--'}]</span>
+                    <span style={{ color, fontWeight: 700, width: '70px' }}>[{lvl}]</span>
+                    <span style={{ color: '#0f172a', whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>{log.message}</span>
+                  </div>
+                );
+              })
+            )}
+          </div>
+        ) : (
+          <div style={{ flex: 1, maxHeight: '450px', overflowY: 'auto', border: '1px solid #e2e8f0', borderRadius: '0.375rem' }}>
+            <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.75rem', textAlign: 'left' }}>
+              <thead>
+                <tr style={{ backgroundColor: '#f8fafc', borderBottom: '1px solid #e2e8f0', color: '#475569', position: 'sticky', top: 0, zIndex: 1 }}>
+                  <th style={{ padding: '0.4rem 0.6rem', width: '90px' }}>Time</th>
+                  <th style={{ padding: '0.4rem 0.6rem', width: '85px' }}>Severity</th>
+                  <th style={{ padding: '0.4rem 0.6rem' }}>Execution Log Message</th>
+                </tr>
+              </thead>
+              <tbody>
+                {logsToDisplay.length === 0 ? (
+                  <tr>
+                    <td colSpan={3} style={{ padding: '2rem', textAlign: 'center', color: '#94a3b8' }}>
+                      No logs match the selected filter.
+                    </td>
+                  </tr>
+                ) : (
+                  logsToDisplay.map((log, idx) => {
+                    const lvl = (log.level || 'INFO').toUpperCase();
+                    const bg = lvl === 'ERROR' || lvl === 'FATAL' ? '#fef2f2' :
+                               lvl === 'WARNING' || lvl === 'WARN' ? '#fffbeb' :
+                               lvl === 'SUCCESS' ? '#f0fdf4' : '#ffffff';
+                    const badgeColor = lvl === 'ERROR' || lvl === 'FATAL' ? '#dc2626' :
+                                       lvl === 'WARNING' || lvl === 'WARN' ? '#d97706' :
+                                       lvl === 'SUCCESS' ? '#16a34a' : '#2563eb';
+                    return (
+                      <tr key={idx} style={{ backgroundColor: bg, borderBottom: '1px solid #f1f5f9' }}>
+                        <td style={{ padding: '0.35rem 0.6rem', color: '#64748b', fontFamily: 'monospace' }}>{log.timestamp || '—'}</td>
+                        <td style={{ padding: '0.35rem 0.6rem' }}>
+                          <span style={{
+                            padding: '0.1rem 0.35rem',
+                            borderRadius: '0.2rem',
+                            fontSize: '0.68rem',
+                            fontWeight: 700,
+                            color: badgeColor,
+                            backgroundColor: '#ffffff',
+                            border: `1px solid ${badgeColor}40`
+                          }}>
+                            {lvl}
+                          </span>
+                        </td>
+                        <td style={{ padding: '0.35rem 0.6rem', color: '#1e293b', wordBreak: 'break-word', fontFamily: 'monospace' }}>{log.message}</td>
+                      </tr>
+                    );
+                  })
+                )}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+    );
+  };
+
+  const openRequestStackLogs = (req) => {
+    selectedReqIdRef.current = req.id;
+    setSelectedReqForLogs(req);
+    setRequestLogTab('stacking');
+    setIsLogsModalOpen(true);
+    fetchRequestStackLogs(req.id);
+  };
+
   const openLogsModal = (req) => {
+    selectedReqIdRef.current = req.id;
+    setSelectedReqForLogs(req);
+    setRequestLogTab('pipeline');
+    setIsLogsModalOpen(true);
+    fetchRequestStackLogs(req.id);
     selectedReqIdRef.current = req.id;
     setSelectedReqForLogs(req);
     setIsLogsModalOpen(true);
@@ -1891,6 +2371,9 @@ export default function App() {
   const closeLogsModal = () => {
     selectedReqIdRef.current = null;
     setIsLogsModalOpen(false);
+    setRequestLogTab('pipeline');
+    setReqStackJobs([]);
+    setSelectedReqStackJobIndex(0);
     setSelectedReqForLogs(null);
     setLogsModalTifs([]);
     setLogsModalComposites([]);
@@ -1910,13 +2393,11 @@ export default function App() {
   // Initial / tab-switch fetch for admin data
   useEffect(() => {
     if (token && currentUser?.role === 'ADMIN') {
-      if (activeTab === 'admin') {
-        fetchDailyStorage();
-      } else if (activeTab === 'users') {
+      if (activeTab === 'users') {
         fetchAdminData();
       }
     }
-  }, [token, currentUser, activeTab, fetchAdminData, fetchDailyStorage]);
+  }, [token, currentUser, activeTab, fetchAdminData]);
 
   // Smart polling: poll requests & active log modal continuously in real-time (1s when modal open, 2.5s otherwise)
   useEffect(() => {
@@ -2012,6 +2493,94 @@ export default function App() {
     }
   }, [token, startStackPolling, stackDistrict, stackSeason]);
 
+  // Concurrent background polling for all active running stacking tasks
+  useEffect(() => {
+    const runningTaskIds = Object.keys(activeStackTasks).filter(
+      tid => activeStackTasks[tid]?.status === 'RUNNING'
+    );
+
+    if (runningTaskIds.length === 0) return;
+
+    const intervalId = setInterval(async () => {
+      const updates = await Promise.all(
+        runningTaskIds.map(async (tid) => {
+          try {
+            const res = await axios.get(`${API_BASE}/requests/layer-stack/status/${tid}`, {
+              headers: getAuthHeader()
+            });
+            return { tid, data: res.data };
+          } catch (e) {
+            return { tid, error: e };
+          }
+        })
+      );
+
+      setActiveStackTasks(prev => {
+        let changed = false;
+        const next = { ...prev };
+        for (const { tid, data } of updates) {
+          if (!data || !next[tid]) continue;
+          changed = true;
+          const prevItem = next[tid];
+          next[tid] = {
+            ...prevItem,
+            status: data.status,
+            progress: data.progress !== undefined ? data.progress : prevItem.progress,
+            step: data.step || prevItem.step,
+            logs: data.logs && Array.isArray(data.logs) ? data.logs : prevItem.logs,
+            result: data.result || prevItem.result,
+            error: data.error || prevItem.error,
+            updatedAt: new Date().toISOString()
+          };
+
+          if (tid === stackTaskId) {
+            if (data.progress !== undefined) setStackProgress(data.progress);
+            if (data.step) setStackStep(data.step);
+            if (data.logs && Array.isArray(data.logs)) setStackLogs(data.logs);
+            if (data.status === 'SUCCESS') {
+              setStackLoading(false);
+              setStackResult(data.result);
+              setStackNotice({
+                type: 'success',
+                text: `✓ Layer stack completed successfully: "${data.result?.filename}" (${data.result?.file_size_mb} MB, ${data.result?.total_bands} bands)`
+              });
+              fetchRequests();
+              if (data.district || stackDistrict) fetchStackHistory(data.district || stackDistrict);
+            } else if (data.status === 'FAILED') {
+              setStackLoading(false);
+              setStackNotice({
+                type: 'error',
+                text: `⚠️ Layer stacking failed: ${data.error || 'Execution failed.'}`
+              });
+            }
+          }
+        }
+        if (changed) {
+          try {
+            localStorage.setItem('sdap_active_stack_tasks', JSON.stringify(next));
+          } catch (e) {}
+        }
+        return changed ? next : prev;
+      });
+    }, 1500);
+
+    return () => clearInterval(intervalId);
+  }, [activeStackTasks, stackTaskId, stackDistrict, fetchRequests, fetchStackHistory]);
+
+  // Live poll for stacking logs inside Request Logs Modal when viewing stacking tab
+  useEffect(() => {
+    if (!isLogsModalOpen || requestLogTab !== 'stacking' || !selectedReqForLogs?.id) return;
+    const hasRunning = reqStackJobs.some(j => j.status === 'RUNNING');
+    if (!hasRunning) return;
+
+    const modalPoll = setInterval(() => {
+      fetchRequestStackLogs(selectedReqForLogs.id);
+    }, 1500);
+
+    return () => clearInterval(modalPoll);
+  }, [isLogsModalOpen, requestLogTab, selectedReqForLogs?.id, reqStackJobs, fetchRequestStackLogs]);
+
+
   // ---------------------------------------------------------------------------
   // Dynamic Storage & Step-Based Duration Estimation Logic (SRS 8.3 Algorithm)
   // Calculates estimated time dynamically based on active pipeline steps (2 to 4 steps).
@@ -2051,20 +2620,41 @@ export default function App() {
 
     const totalMB = totalGB * 1024;
 
+    // ── Multi-Request & Server Queue Load Factor ──
+    // When there are multiple concurrent or queued requests in the system,
+    // network bandwidth, CPU cores, and ESA SNAP sequential processing locks are shared,
+    // which proportionally scales the realistic end-to-end execution duration.
+    const activePipelineRequests = (requests || []).filter(r => {
+      const st = (r.status || '').toUpperCase();
+      return st === 'RUNNING' || st === 'PROCESSING' || st === 'QUEUED' || st === 'PENDING' || st === 'IN_PROGRESS';
+    });
+    const queueCount = activePipelineRequests.length;
+
+    // Multi-request load scaling factors:
+    // With 1 active request ahead: ~1.45x S3 download duration, ~1.55x index/SAR compute duration.
+    const queueBandwidthFactor = 1.0 + (queueCount * 0.45);   // S3 download speed contention
+    const queueComputeFactor = 1.0 + (queueCount * 0.55);     // CPU & SNAP sequential lock queue
+    const queueCompositeFactor = 1.0 + (queueCount * 0.35);   // Compositing I/O contention
+    const queueDiscoveryFactor = 1.0 + (queueCount * 0.15);   // Scene discovery / DB queue
+
     // ── Step-by-Step Pipeline Duration Calculation (All in consistent minutes) ──
     // Using whole minutes (mins) for every step and the total prevents sec/mins unit confusion
     // and guarantees Step 1 + Step 2 + Step 3 + Step 4 === Overall Estimated Duration.
 
     // Step 1: Scene Discovery, Metadata Indexing & NAS Gap Verification (Always runs)
-    const step1Mins = Math.max(1, Math.round((45 + (tileCount * 8) + (months * 10)) / 60));
+    const baseStep1 = (45 + (tileCount * 8) + (months * 10)) / 60;
+    const step1Mins = Math.max(1, Math.round(baseStep1 * queueDiscoveryFactor));
 
-    // Step 2: Raw Band Acquisition / AWS S3 Download (~12 MB/s pipeline transfer; Always runs)
-    const step2Mins = Math.max(1, Math.round((totalMB / 12.0) / 60));
+    // Step 2: Raw Band Acquisition / AWS S3 Download (~12 MB/s baseline pipeline transfer; Always runs)
+    const baseStep2 = (totalMB / 12.0) / 60;
+    const step2Mins = Math.max(1, Math.round(baseStep2 * queueBandwidthFactor));
 
     // Step 3: Spectral & SAR Index Calculation (Runs only if indices are selected)
     const hasStep3 = Array.isArray(selectedIndices) && selectedIndices.length > 0;
+    const perSceneComputeSec = (isS1 && !isS2) ? 6.5 : 4.5;
+    const baseStep3 = hasStep3 ? (scenesEstimate * selectedIndices.length * perSceneComputeSec) / 60 : 0;
     const step3Mins = hasStep3
-      ? Math.max(1, Math.round((scenesEstimate * selectedIndices.length * 4.5) / 60))
+      ? Math.max(1, Math.round(baseStep3 * queueComputeFactor))
       : 0;
 
     // Step 4: Temporal Compositing & District Clipping (Runs only if compositeInterval !== 'none')
@@ -2077,8 +2667,9 @@ export default function App() {
 
     const levelFactor = level === 'mean' ? 1.25 : 1.0;
     const activeLayersForComp = Math.max(1, selectedIndices.length);
+    const baseStep4 = hasStep4 ? (compositeWindows * activeLayersForComp * tileCount * 6.0 * levelFactor) / 60 : 0;
     const step4Mins = hasStep4
-      ? Math.max(1, Math.round((compositeWindows * activeLayersForComp * tileCount * 6.0 * levelFactor) / 60))
+      ? Math.max(1, Math.round(baseStep4 * queueCompositeFactor))
       : 0;
 
     const activeStepsList = [
@@ -2111,6 +2702,7 @@ export default function App() {
       totalSeconds,
       activeStepsCount,
       totalPipelineSteps: 4,
+      queueCount,
       stepBreakdown: activeStepsList.map(s => ({
         ...s,
         durationText: formatStepMins(s.mins)
@@ -2141,8 +2733,31 @@ export default function App() {
   const formDateError = startDateError || dateSanityError || dateSpanError;
 
   // First click: show confirmation modal (SRS 8.3 — show estimate before confirming)
+  const fetchDailyQuota = useCallback(async () => {
+    const currentToken = token || localStorage.getItem('sdap_token');
+    if (!currentToken) return;
+    try {
+      const res = await axios.get(`${API_BASE}/requests/daily-quota`, { headers: getAuthHeader() });
+      if (res.data) setDailyQuota(res.data);
+    } catch (e) {
+      console.warn('Could not fetch daily quota:', e);
+    }
+  }, [token]);
+
+  // Sync daily quota when entering new_request tab or on login
+  useEffect(() => {
+    if (token) fetchDailyQuota();
+  }, [token, activeTab, fetchDailyQuota]);
+
   const handleShowConfirm = (e) => {
     e.preventDefault();
+    if (dailyQuota && !dailyQuota.is_admin && dailyQuota.remaining_today <= 0) {
+      setReqFormMessage({
+        type: 'error',
+        text: 'Daily request limit reached: A single user can submit at most 3 requests per day. You have already submitted 3 requests today. Please try again tomorrow.'
+      });
+      return;
+    }
     if (formDateError) {
       setReqFormMessage({ type: 'error', text: formDateError });
       return;
@@ -2204,6 +2819,7 @@ export default function App() {
       setReqTitle('');
       setConfirmPayload(null);
       fetchRequests();
+      fetchDailyQuota();
       setTimeout(() => {
         setActiveTab('requests');
         setReqFormMessage(null);
@@ -2257,7 +2873,7 @@ export default function App() {
     try {
       await axios.patch(`${API_BASE}/requests/${reqId}/status?status_value=${newStatus}`, {}, { headers: getAuthHeader() });
       fetchRequests();
-      if (activeTab === 'admin') fetchAdminData();
+      if (activeTab === 'users') fetchAdminData();
     } catch (err) {
       alert(formatApiError(err, 'Error updating request status.'));
     }
@@ -3657,7 +4273,7 @@ export default function App() {
             {sc.satellite}
           </td>
           <td style={{ padding: '0.65rem 1rem' }}>
-            <div style={{ color: '#0f172a', fontFamily: 'monospace', fontSize: '0.76rem', fontWeight: 600 }}>
+            <div style={{ color: '#0f172a', fontFamily: 'monospace', fontSize: '0.74rem', fontWeight: 600, wordBreak: 'break-all', overflowWrap: 'anywhere' }}>
               {cleanFolderName(sc.folder)}
             </div>
           </td>
@@ -3736,7 +4352,7 @@ export default function App() {
             {sc.satellite}
           </td>
           <td style={{ padding: '0.65rem 1rem' }}>
-            <div style={{ color: '#0f172a', fontFamily: 'monospace', fontSize: '0.76rem', fontWeight: 600 }}>
+            <div style={{ color: '#0f172a', fontFamily: 'monospace', fontSize: '0.74rem', fontWeight: 600, wordBreak: 'break-all', overflowWrap: 'anywhere' }}>
               {cleanFolderName(sc.folder)}
             </div>
             {sc.warning && (
@@ -3877,7 +4493,7 @@ export default function App() {
               {sc.satellite}
             </td>
             <td style={{ padding: '0.65rem 1rem' }}>
-              <div style={{ color: '#0f172a', fontFamily: 'monospace', fontSize: '0.76rem', fontWeight: 700 }}>
+              <div style={{ color: '#0f172a', fontFamily: 'monospace', fontSize: '0.74rem', fontWeight: 700, wordBreak: 'break-all', overflowWrap: 'anywhere' }}>
                 {cleanFolderName(sc.folder)}
               </div>
               <div style={{ marginTop: '0.35rem', display: 'flex', flexWrap: 'wrap', gap: '0.25rem', alignItems: 'center' }}>
@@ -3963,7 +4579,7 @@ export default function App() {
             {sc.satellite}
           </td>
           <td style={{ padding: '0.65rem 1rem' }}>
-            <div style={{ color: '#0f172a', fontFamily: 'monospace', fontSize: '0.76rem', fontWeight: 600 }}>
+            <div style={{ color: '#0f172a', fontFamily: 'monospace', fontSize: '0.74rem', fontWeight: 600, wordBreak: 'break-all', overflowWrap: 'anywhere' }}>
               {cleanFolderName(sc.folder)}
             </div>
           </td>
@@ -4062,10 +4678,12 @@ export default function App() {
                   alignItems: 'center',
                   justifyContent: 'space-between',
                   gap: '0.5rem',
-                  width: 'fit-content'
+                  maxWidth: '100%',
+                  wordBreak: 'break-all',
+                  overflowWrap: 'anywhere'
                 }}>
-                  <span style={{ display: 'inline-flex', alignItems: 'center', gap: '0.35rem' }}>
-                    <FileText size={11} color="#64748b" />
+                  <span style={{ display: 'inline-flex', alignItems: 'center', gap: '0.35rem', wordBreak: 'break-all', overflowWrap: 'anywhere' }}>
+                    <FileText size={11} color="#64748b" style={{ flexShrink: 0 }} />
                     {cf.name}
                   </span>
                   {cf.size && (
@@ -4689,23 +5307,24 @@ export default function App() {
           </div>
         </div>
 
-        {/* 4. Table Structure: Exactly matching user reference (Date, Tile, Satellite, Folder, Status, Bands / Details) */}
+        {/* 4. Table Structure: Auto-fitting with fixed layout and responsive fields */}
         <div style={{
           backgroundColor: '#ffffff',
           border: '1px solid #e2e8f0',
           borderRadius: '0.5rem',
           boxShadow: '0 1px 3px rgba(0, 0, 0, 0.04)',
-          overflowX: 'auto'
+          overflowX: 'hidden',
+          width: '100%'
         }}>
-          <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.8rem', textAlign: 'left' }}>
+          <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.78rem', textAlign: 'left', tableLayout: 'fixed' }}>
             <thead>
               <tr style={{ backgroundColor: '#f8fafc', borderBottom: '1px solid #e2e8f0' }}>
-                <th style={{ padding: '0.75rem 1rem', width: '115px', fontWeight: 700, color: '#475569', whiteSpace: 'nowrap' }}>Date</th>
-                <th style={{ padding: '0.75rem 1rem', width: '85px', fontWeight: 700, color: '#475569', whiteSpace: 'nowrap' }}>Tile</th>
-                <th style={{ padding: '0.75rem 1rem', width: '90px', fontWeight: 700, color: '#475569', whiteSpace: 'nowrap' }}>Satellite</th>
-                <th style={{ padding: '0.75rem 1rem', width: '280px', fontWeight: 700, color: '#475569' }}>Folder</th>
-                <th style={{ padding: '0.75rem 1rem', width: '145px', fontWeight: 700, color: '#475569', whiteSpace: 'nowrap' }}>Status</th>
-                <th style={{ padding: '0.75rem 1.25rem', fontWeight: 700, color: '#475569' }}>
+                <th style={{ padding: '0.65rem 0.75rem', width: '95px', fontWeight: 700, color: '#475569', whiteSpace: 'nowrap' }}>Date</th>
+                <th style={{ padding: '0.65rem 0.75rem', width: '75px', fontWeight: 700, color: '#475569', whiteSpace: 'nowrap' }}>Tile</th>
+                <th style={{ padding: '0.65rem 0.75rem', width: '75px', fontWeight: 700, color: '#475569', whiteSpace: 'nowrap' }}>Satellite</th>
+                <th style={{ padding: '0.65rem 0.75rem', width: '32%', fontWeight: 700, color: '#475569' }}>Folder</th>
+                <th style={{ padding: '0.65rem 0.75rem', width: '130px', fontWeight: 700, color: '#475569', whiteSpace: 'nowrap' }}>Status</th>
+                <th style={{ padding: '0.65rem 0.75rem', fontWeight: 700, color: '#475569' }}>
                   {activeStepFilter === 'warnings' ? 'Warning Details / Missing Bands' : 'Bands'}
                 </th>
               </tr>
@@ -5630,27 +6249,6 @@ export default function App() {
 
           {currentUser.role === 'ADMIN' && (
             <button
-              onClick={() => setActiveTab('admin')}
-              style={{
-                display: 'flex',
-                alignItems: 'center',
-                gap: '0.5rem',
-                padding: '0.65rem 1.25rem',
-                fontSize: '0.9rem',
-                fontWeight: 600,
-                border: 'none',
-                borderBottom: activeTab === 'admin' ? '2px solid #2563eb' : '2px solid transparent',
-                color: activeTab === 'admin' ? '#2563eb' : '#64748b',
-                backgroundColor: 'transparent',
-                cursor: 'pointer'
-              }}
-            >
-              <Shield size={16} /> Admin Storage & Feed
-            </button>
-          )}
-
-          {currentUser.role === 'ADMIN' && (
-            <button
               onClick={() => {
                 setActiveTab('users');
                 fetchAdminData();
@@ -5794,15 +6392,15 @@ export default function App() {
               <div style={{ overflowX: 'auto' }}>
                 <table style={{ width: '100%', borderCollapse: 'collapse', textAlign: 'left', fontSize: '0.85rem' }}>
                   <thead>
-                    <tr style={{ backgroundColor: '#f8fafc', borderBottom: '1px solid #e2e8f0', color: '#475569', fontWeight: 600 }}>
-                      <th style={{ padding: '0.85rem 1rem' }}>Req #</th>
-                      <th style={{ padding: '0.85rem 1rem' }}>Request Title</th>
-                      <th style={{ padding: '0.85rem 1rem' }}>Location</th>
-                      <th style={{ padding: '0.85rem 1rem' }}>Satellite & Indices</th>
-                      <th style={{ padding: '0.85rem 1rem' }}>Est. Storage</th>
-                      <th style={{ padding: '0.85rem 1rem' }}>Status</th>
-                      <th style={{ padding: '0.85rem 1rem' }}>Submitted At</th>
-                      <th style={{ padding: '0.85rem 1rem', textAlign: 'right' }}>Actions</th>
+                    <tr style={{ backgroundColor: '#f8fafc', borderBottom: '1px solid #e2e8f0', color: '#475569', fontWeight: 600, fontSize: '0.8rem' }}>
+                      <th style={{ padding: '0.65rem 0.6rem', width: '55px' }}>Req #</th>
+                      <th style={{ padding: '0.65rem 0.6rem', minWidth: '150px' }}>Request Title</th>
+                      <th style={{ padding: '0.65rem 0.6rem', minWidth: '110px' }}>Location</th>
+                      <th style={{ padding: '0.65rem 0.6rem', minWidth: '130px' }}>Satellite & Indices</th>
+                      <th style={{ padding: '0.65rem 0.6rem', width: '85px' }}>Storage</th>
+                      <th style={{ padding: '0.65rem 0.6rem', width: '105px' }}>Status</th>
+                      <th style={{ padding: '0.65rem 0.6rem', minWidth: '120px' }}>Submitted At</th>
+                      <th style={{ padding: '0.65rem 0.6rem', textAlign: 'right', minWidth: '180px' }}>Actions</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -5827,56 +6425,78 @@ export default function App() {
                           onMouseLeave={(e) => e.currentTarget.style.backgroundColor = '#ffffff'}
                           onClick={() => openLogsModal(req)}
                         >
-                          <td style={{ padding: '0.85rem 1rem', fontWeight: 700, color: '#2563eb' }}>#{req.id}</td>
-                          <td style={{ padding: '0.85rem 1rem', fontWeight: 600, color: '#0f172a' }}>
+                          <td style={{ padding: '0.65rem 0.6rem', fontWeight: 700, color: '#2563eb', fontSize: '0.82rem' }}>#{req.id}</td>
+                          <td style={{ padding: '0.65rem 0.6rem', fontWeight: 600, color: '#0f172a', fontSize: '0.82rem', wordBreak: 'break-word', overflowWrap: 'anywhere' }}>
                             {req.request_title}
                             {req.user_full_name && (
                               <div style={{ fontSize: '0.7rem', color: '#64748b', fontWeight: 400 }}>By: {req.user_full_name}</div>
                             )}
                           </td>
-                          <td style={{ padding: '0.85rem 1rem', color: '#334155' }}>
+                          <td style={{ padding: '0.65rem 0.6rem', color: '#334155', fontSize: '0.8rem', wordBreak: 'break-word' }}>
                             {req.district ? `${req.district}, ${req.state}` : req.state || 'All India'}
                           </td>
-                          <td style={{ padding: '0.85rem 1rem' }}>
-                            <span style={{ fontWeight: 600, color: '#1e293b' }}>{req.satellite}</span>
-                            <div style={{ fontSize: '0.72rem', color: '#64748b', display: 'flex', alignItems: 'center', gap: '0.35rem', flexWrap: 'wrap' }}>
+                          <td style={{ padding: '0.65rem 0.6rem' }}>
+                            <span style={{ fontWeight: 600, color: '#1e293b', fontSize: '0.8rem' }}>{req.satellite}</span>
+                            <div style={{ fontSize: '0.71rem', color: '#64748b', display: 'flex', alignItems: 'center', gap: '0.3rem', flexWrap: 'wrap' }}>
                               <span>{Array.isArray(req.indices) ? req.indices.join(', ') : req.indices}</span>
                               {req.level && (
-                                <span style={{ fontSize: '0.66rem', backgroundColor: '#e0f2fe', color: '#0369a1', padding: '0.05rem 0.35rem', borderRadius: '0.25rem', fontWeight: 700 }}>
+                                <span style={{ fontSize: '0.65rem', backgroundColor: '#e0f2fe', color: '#0369a1', padding: '0.05rem 0.3rem', borderRadius: '0.2rem', fontWeight: 700 }}>
                                   {req.level.toUpperCase()}
                                 </span>
                               )}
                             </div>
                           </td>
-                          <td style={{ padding: '0.85rem 1rem', fontWeight: 600, color: '#0f172a' }}>
+                          <td style={{ padding: '0.65rem 0.6rem', fontWeight: 600, color: '#0f172a', fontSize: '0.8rem', whiteSpace: 'nowrap' }}>
                             {req.storage_estimated_gb ? `${req.storage_estimated_gb} GB` : '—'}
                           </td>
-                          <td style={{ padding: '0.85rem 1rem' }}>
+                          <td style={{ padding: '0.65rem 0.6rem' }}>
                             {renderStatusBadge(req.status)}
                           </td>
-                          <td style={{ padding: '0.85rem 1rem', color: '#64748b', fontSize: '0.78rem' }}>
+                          <td style={{ padding: '0.65rem 0.6rem', color: '#64748b', fontSize: '0.75rem', whiteSpace: 'nowrap' }}>
                             {new Date(req.created_at).toLocaleString()}
                           </td>
-                          <td style={{ padding: '0.85rem 1rem', textAlign: 'right', whiteSpace: 'nowrap' }} onClick={(e) => e.stopPropagation()}>
-                            <div style={{ display: 'inline-flex', alignItems: 'center', justifyContent: 'flex-end', gap: '0.5rem', flexWrap: 'nowrap' }}>
+                          <td style={{ padding: '0.65rem 0.6rem', textAlign: 'right' }} onClick={(e) => e.stopPropagation()}>
+                            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'flex-end', gap: '0.35rem', flexWrap: 'wrap' }}>
                               <button
                                 onClick={() => openLogsModal(req)}
                                 style={{
                                   display: 'inline-flex',
                                   alignItems: 'center',
-                                  gap: '0.25rem',
-                                  padding: '0.35rem 0.6rem',
+                                  gap: '0.2rem',
+                                  padding: '0.28rem 0.55rem',
                                   borderRadius: '0.375rem',
                                   border: '1px solid #cbd5e1',
                                   backgroundColor: '#ffffff',
-                                  fontSize: '0.75rem',
+                                  fontSize: '0.72rem',
                                   fontWeight: 600,
                                   color: '#334155',
                                   whiteSpace: 'nowrap',
                                   cursor: 'pointer'
                                 }}
+                                title="View pipeline execution logs"
                               >
-                                <Terminal size={12} /> Logs
+                                <Terminal size={11} /> Logs
+                              </button>
+
+                              <button
+                                onClick={() => openRequestStackLogs(req)}
+                                style={{
+                                  display: 'inline-flex',
+                                  alignItems: 'center',
+                                  gap: '0.2rem',
+                                  padding: '0.28rem 0.55rem',
+                                  borderRadius: '0.375rem',
+                                  border: '1px solid #fed7aa',
+                                  backgroundColor: '#fff7ed',
+                                  fontSize: '0.72rem',
+                                  fontWeight: 600,
+                                  color: '#c2410c',
+                                  whiteSpace: 'nowrap',
+                                  cursor: 'pointer'
+                                }}
+                                title="Verify multi-band layer stacking execution logs for this request"
+                              >
+                                <Layers size={11} color="#ea580c" /> Stack Logs
                               </button>
 
                               {['COMPLETED', 'HELD', 'SUCCESS'].includes(req.status) && (
@@ -5896,12 +6516,12 @@ export default function App() {
                                           display: 'inline-flex',
                                           alignItems: 'center',
                                           justifyContent: 'center',
-                                          gap: '0.32rem',
-                                          padding: '0.32rem 0.65rem',
+                                          gap: '0.25rem',
+                                          padding: '0.24rem 0.5rem',
                                           borderRadius: '9999px',
                                           border: '1px solid #86efac',
                                           backgroundColor: '#f0fdf4',
-                                          fontSize: '0.72rem',
+                                          fontSize: '0.7rem',
                                           fontWeight: 700,
                                           color: '#166534',
                                           whiteSpace: 'nowrap',
@@ -5912,8 +6532,8 @@ export default function App() {
                                         }}
                                         title={`Click to view ${stackCount} stacked GeoTIFF file(s)`}
                                       >
-                                        <CheckCircle size={11} color="#16a34a" style={{ flexShrink: 0 }} />
-                                        <span>{stackCount} {stackCount === 1 ? 'time done' : 'times done'}</span>
+                                        <CheckCircle size={10} color="#16a34a" style={{ flexShrink: 0 }} />
+                                        <span>Stacked ({stackCount})</span>
                                       </button>
                                     ) : (
                                       <span
@@ -5921,26 +6541,23 @@ export default function App() {
                                           display: 'inline-flex',
                                           alignItems: 'center',
                                           justifyContent: 'center',
-                                          gap: '0.35rem',
-                                          padding: '0.25rem 0.7rem',
+                                          gap: '0.25rem',
+                                          padding: '0.24rem 0.45rem',
                                           borderRadius: '9999px',
                                           border: '1px solid #fed7aa',
                                           backgroundColor: '#fff7ed',
-                                          fontSize: '0.72rem',
+                                          fontSize: '0.7rem',
                                           fontWeight: 700,
                                           color: '#c2410c',
                                           whiteSpace: 'nowrap',
-                                          flexShrink: 0,
-                                          minWidth: 'max-content',
-                                          textAlign: 'center',
                                           lineHeight: 1.2,
                                           boxShadow: '0 1px 2px rgba(194, 65, 12, 0.05)',
                                           userSelect: 'none'
                                         }}
                                         title="Pipeline steps 1 to 4 completed, but layer stacking has not been performed yet for this request"
                                       >
-                                        <Layers size={11} color="#ea580c" style={{ flexShrink: 0 }} />
-                                        <span style={{ whiteSpace: 'nowrap' }}>Stacking: Not Done</span>
+                                        <Layers size={10} color="#ea580c" style={{ flexShrink: 0 }} />
+                                        <span>Unstacked</span>
                                       </span>
                                     );
                                   })()}
@@ -5964,19 +6581,19 @@ export default function App() {
                                     style={{
                                       display: 'inline-flex',
                                       alignItems: 'center',
-                                      gap: '0.25rem',
-                                      padding: '0.35rem 0.6rem',
+                                      gap: '0.2rem',
+                                      padding: '0.28rem 0.55rem',
                                       borderRadius: '0.375rem',
                                       border: '1px solid #bfdbfe',
                                       backgroundColor: '#eff6ff',
-                                      fontSize: '0.75rem',
+                                      fontSize: '0.72rem',
                                       fontWeight: 600,
                                       color: '#1d4ed8',
                                       cursor: 'pointer'
                                     }}
                                     title="Open Multi-Band Layer Stacking Studio for this request"
                                   >
-                                    <Layers size={12} /> Stacking
+                                    <Layers size={11} /> Stack
                                   </button>
                                 </>
                               )}
@@ -5989,18 +6606,18 @@ export default function App() {
                                   style={{
                                     display: 'inline-flex',
                                     alignItems: 'center',
-                                    gap: '0.25rem',
-                                    padding: '0.35rem 0.6rem',
+                                    gap: '0.2rem',
+                                    padding: '0.28rem 0.55rem',
                                     borderRadius: '0.375rem',
                                     border: '1px solid #ef4444',
                                     backgroundColor: '#fef2f2',
-                                    fontSize: '0.75rem',
+                                    fontSize: '0.72rem',
                                     fontWeight: 600,
                                     color: '#dc2626',
                                     cursor: 'pointer'
                                   }}
                                 >
-                                  <Square size={12} fill="#dc2626" />
+                                  <Square size={11} fill="#dc2626" />
                                   {stoppingId === req.id ? 'Stopping...' : 'Stop'}
                                 </button>
                               ) : (
@@ -6011,19 +6628,19 @@ export default function App() {
                                   style={{
                                     display: 'inline-flex',
                                     alignItems: 'center',
-                                    gap: '0.25rem',
-                                    padding: '0.35rem 0.6rem',
+                                    gap: '0.2rem',
+                                    padding: '0.28rem 0.55rem',
                                     borderRadius: '0.375rem',
                                     border: '1px solid #2563eb',
                                     backgroundColor: '#eff6ff',
-                                    fontSize: '0.75rem',
+                                    fontSize: '0.72rem',
                                     fontWeight: 600,
                                     color: '#2563eb',
                                     cursor: 'pointer'
                                   }}
                                 >
-                                  <Play size={12} className={rerunningId === req.id ? 'animate-spin' : ''} />
-                                  {rerunningId === req.id ? 'Retrying...' : 'Re-run'}
+                                  <RefreshCw size={11} className={rerunningId === req.id ? 'animate-spin' : ''} />
+                                  {rerunningId === req.id ? 'Queued...' : 'Re-run'}
                                 </button>
                               )}
                             </div>
@@ -6050,11 +6667,49 @@ export default function App() {
               padding: '2rem',
               boxShadow: '0 4px 6px -1px rgba(0,0,0,0.03)'
             }}>
-              <div style={{ marginBottom: '1.5rem', borderBottom: '1px solid #f1f5f9', pb: '1rem' }}>
+              <div style={{ marginBottom: '1.5rem', borderBottom: '1px solid #f1f5f9', paddingBottom: '1rem', display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: '0.75rem' }}>
                 <h2 style={{ fontSize: '1.25rem', fontWeight: 700, color: '#0f172a', margin: 0 }}>
-                  Submit Satellite Acquisition & Pipeline Request
+                  Submit Satellite Acquisition &amp; Pipeline Request
                 </h2>
+                {dailyQuota && (
+                  <div style={{
+                    display: 'inline-flex',
+                    alignItems: 'center',
+                    gap: '0.45rem',
+                    padding: '0.35rem 0.85rem',
+                    borderRadius: '9999px',
+                    fontSize: '0.78rem',
+                    fontWeight: 700,
+                    backgroundColor: dailyQuota.is_admin ? '#eff6ff' : (dailyQuota.remaining_today > 0 ? '#f0fdf4' : '#fef2f2'),
+                    color: dailyQuota.is_admin ? '#1d4ed8' : (dailyQuota.remaining_today > 0 ? '#166534' : '#b91c1c'),
+                    border: `1px solid ${dailyQuota.is_admin ? '#bfdbfe' : (dailyQuota.remaining_today > 0 ? '#bbf7d0' : '#fecaca')}`,
+                    boxShadow: '0 1px 2px rgba(0,0,0,0.03)'
+                  }}>
+                    <span>Daily Request Quota:</span>
+                    <span>{dailyQuota.is_admin ? 'Unlimited (Admin)' : `${dailyQuota.remaining_today} of ${dailyQuota.daily_limit} remaining today`}</span>
+                  </div>
+                )}
               </div>
+
+              {dailyQuota && !dailyQuota.is_admin && dailyQuota.remaining_today <= 0 && (
+                <div style={{
+                  padding: '0.85rem 1.15rem',
+                  borderRadius: '0.5rem',
+                  backgroundColor: '#fef2f2',
+                  border: '1px solid #fca5a5',
+                  color: '#991b1b',
+                  fontSize: '0.84rem',
+                  marginBottom: '1.25rem',
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: '0.6rem'
+                }}>
+                  <AlertTriangle size={18} color="#dc2626" style={{ flexShrink: 0 }} />
+                  <span>
+                    <strong>Daily Request Limit Reached:</strong> A single user can submit a maximum of 3 requests per day. You have reached your limit of 3 requests for today. Please try again tomorrow.
+                  </span>
+                </div>
+              )}
 
               {reqFormMessage && (
                 <div style={{
@@ -6099,8 +6754,6 @@ export default function App() {
                       style={{ width: '100%', padding: '0.6rem 0.75rem', borderRadius: '0.375rem', border: '1px solid #cbd5e1', fontSize: '0.875rem', backgroundColor: '#ffffff', outline: 'none' }}
                     >
                       <option value="Administrative Unit">Administrative Unit</option>
-                      <option value="Uploaded Boundary">Uploaded Boundary</option>
-                      <option value="BBox">Bounding Box (BBox)</option>
                     </select>
                   </div>
 
@@ -6393,6 +7046,19 @@ export default function App() {
                           }}>
                             {estResult.activeStepsCount}/{estResult.totalPipelineSteps} Steps Active
                           </span>
+                          {estResult.queueCount > 0 && (
+                            <span style={{
+                              padding: '0.1rem 0.45rem',
+                              borderRadius: '9999px',
+                              fontSize: '0.68rem',
+                              fontWeight: 700,
+                              backgroundColor: '#eff6ff',
+                              color: '#1d4ed8',
+                              border: '1px solid #bfdbfe'
+                            }}>
+                              +{estResult.queueCount} Active In Queue
+                            </span>
+                          )}
                         </div>
                         <div style={{ fontSize: '1.45rem', fontWeight: 800, color: '#92400e' }}>
                           {estResult.downloadTimeText}
@@ -6420,6 +7086,11 @@ export default function App() {
                             </span>
                           ))}
                         </div>
+                        {estResult.queueCount > 0 && (
+                          <div style={{ fontSize: '0.7rem', color: '#b45309', marginTop: '0.3rem', display: 'flex', alignItems: 'center', gap: '0.25rem' }}>
+                            ⚠ Duration adjusted for {estResult.queueCount} active request{estResult.queueCount > 1 ? 's' : ''} currently sharing server bandwidth & compute.
+                          </div>
+                        )}
                       </div>
                     </div>
 
@@ -6451,16 +7122,16 @@ export default function App() {
                 {/* Submit — opens confirmation modal */}
                 <button
                   type="submit"
-                  disabled={submittingReq || !!formDateError || willBeRejected}
+                  disabled={submittingReq || !!formDateError || willBeRejected || Boolean(dailyQuota && !dailyQuota.is_admin && dailyQuota.remaining_today <= 0)}
                   style={{
-                    backgroundColor: (submittingReq || formDateError || willBeRejected) ? '#94a3b8' : '#2563eb',
+                    backgroundColor: (submittingReq || formDateError || willBeRejected || (dailyQuota && !dailyQuota.is_admin && dailyQuota.remaining_today <= 0)) ? '#94a3b8' : '#2563eb',
                     color: '#ffffff',
                     fontWeight: 600,
                     fontSize: '0.95rem',
                     padding: '0.75rem',
                     border: 'none',
                     borderRadius: '0.375rem',
-                    cursor: (submittingReq || formDateError || willBeRejected) ? 'not-allowed' : 'pointer',
+                    cursor: (submittingReq || formDateError || willBeRejected || (dailyQuota && !dailyQuota.is_admin && dailyQuota.remaining_today <= 0)) ? 'not-allowed' : 'pointer',
                     display: 'flex',
                     alignItems: 'center',
                     justifyContent: 'center',
@@ -6525,640 +7196,6 @@ export default function App() {
                 </div>
               )}
 
-            </div>
-          </div>
-        )}
-
-        {/* ========================================================================= */}
-        {/* TAB 3: Admin Control & System Feed */}
-        {/* ========================================================================= */}
-        {activeTab === 'admin' && currentUser.role === 'ADMIN' && (
-          <div style={{ display: 'flex', flexDirection: 'column', gap: '1.5rem' }}>
-
-            {/* ========================================================================= */}
-            {/* Daily Storage Occupancy & Request Analytics (Admin Only) */}
-            {/* ========================================================================= */}
-            <div style={{
-              backgroundColor: '#ffffff',
-              borderRadius: '0.75rem',
-              border: '1px solid #e2e8f0',
-              padding: '1.5rem',
-              boxShadow: '0 1px 3px 0 rgba(0, 0, 0, 0.05)'
-            }}>
-              {/* Card Header & Controls */}
-              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '1.25rem', flexWrap: 'wrap', gap: '0.75rem' }}>
-                <div>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: '0.6rem' }}>
-                    <h3 style={{ fontSize: '1.15rem', fontWeight: 700, color: '#0f172a', margin: 0, display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-                      <HardDrive size={20} color="#2563eb" /> Daily Storage Occupancy & Request Tracking
-                    </h3>
-                    <span style={{
-                      display: 'inline-flex',
-                      alignItems: 'center',
-                      gap: '0.25rem',
-                      padding: '0.2rem 0.55rem',
-                      borderRadius: '9999px',
-                      fontSize: '0.72rem',
-                      fontWeight: 700,
-                      backgroundColor: '#eff6ff',
-                      color: '#1d4ed8',
-                      border: '1px solid #bfdbfe'
-                    }}>
-                      <Shield size={11} /> ADMIN RESTRICTED
-                    </span>
-                  </div>
-                  <p style={{ fontSize: '0.82rem', color: '#64748b', margin: '0.25rem 0 0 0' }}>
-                    Audit day-by-day storage allocations requested by users alongside physical raster data held on the NAS array.
-                  </p>
-                </div>
-
-                {/* Filter & Action Buttons */}
-                <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', flexWrap: 'wrap' }}>
-                  {/* Quick Filters */}
-                  <div style={{ display: 'flex', alignItems: 'center', backgroundColor: '#f1f5f9', borderRadius: '0.375rem', padding: '0.2rem' }}>
-                    <button
-                      type="button"
-                      onClick={() => handleDailyStorageQuickFilter('ALL')}
-                      style={{
-                        padding: '0.3rem 0.65rem',
-                        borderRadius: '0.25rem',
-                        border: 'none',
-                        fontSize: '0.78rem',
-                        fontWeight: 600,
-                        backgroundColor: dailyStorageFilter === 'ALL' ? '#ffffff' : 'transparent',
-                        color: dailyStorageFilter === 'ALL' ? '#0f172a' : '#64748b',
-                        boxShadow: dailyStorageFilter === 'ALL' ? '0 1px 2px rgba(0,0,0,0.06)' : 'none',
-                        cursor: 'pointer'
-                      }}
-                    >
-                      All Time
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => handleDailyStorageQuickFilter('7D')}
-                      style={{
-                        padding: '0.3rem 0.65rem',
-                        borderRadius: '0.25rem',
-                        border: 'none',
-                        fontSize: '0.78rem',
-                        fontWeight: 600,
-                        backgroundColor: dailyStorageFilter === '7D' ? '#ffffff' : 'transparent',
-                        color: dailyStorageFilter === '7D' ? '#0f172a' : '#64748b',
-                        boxShadow: dailyStorageFilter === '7D' ? '0 1px 2px rgba(0,0,0,0.06)' : 'none',
-                        cursor: 'pointer'
-                      }}
-                    >
-                      Last 7 Days
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => handleDailyStorageQuickFilter('30D')}
-                      style={{
-                        padding: '0.3rem 0.65rem',
-                        borderRadius: '0.25rem',
-                        border: 'none',
-                        fontSize: '0.78rem',
-                        fontWeight: 600,
-                        backgroundColor: dailyStorageFilter === '30D' ? '#ffffff' : 'transparent',
-                        color: dailyStorageFilter === '30D' ? '#0f172a' : '#64748b',
-                        boxShadow: dailyStorageFilter === '30D' ? '0 1px 2px rgba(0,0,0,0.06)' : 'none',
-                        cursor: 'pointer'
-                      }}
-                    >
-                      Last 30 Days
-                    </button>
-                  </div>
-
-                  {/* Date Pickers */}
-                  <div style={{ display: 'flex', alignItems: 'center', gap: '0.35rem', backgroundColor: '#f8fafc', padding: '0.25rem 0.5rem', borderRadius: '0.375rem', border: '1px solid #cbd5e1' }}>
-                    <Calendar size={13} color="#64748b" />
-                    <input
-                      type="date"
-                      value={dailyStartDate}
-                      onChange={(e) => {
-                        setDailyStartDate(e.target.value);
-                        setDailyStorageFilter('CUSTOM');
-                      }}
-                      title="Start Date"
-                      style={{ border: 'none', backgroundColor: 'transparent', fontSize: '0.78rem', color: '#334155', outline: 'none' }}
-                    />
-                    <span style={{ fontSize: '0.78rem', color: '#94a3b8' }}>to</span>
-                    <input
-                      type="date"
-                      value={dailyEndDate}
-                      onChange={(e) => {
-                        setDailyEndDate(e.target.value);
-                        setDailyStorageFilter('CUSTOM');
-                      }}
-                      title="End Date"
-                      style={{ border: 'none', backgroundColor: 'transparent', fontSize: '0.78rem', color: '#334155', outline: 'none' }}
-                    />
-                    <button
-                      type="button"
-                      onClick={() => fetchDailyStorage(dailyStartDate, dailyEndDate)}
-                      style={{
-                        padding: '0.2rem 0.45rem',
-                        borderRadius: '0.25rem',
-                        border: 'none',
-                        backgroundColor: '#2563eb',
-                        color: '#ffffff',
-                        fontSize: '0.75rem',
-                        fontWeight: 600,
-                        cursor: 'pointer'
-                      }}
-                    >
-                      Filter
-                    </button>
-                    {(dailyStartDate || dailyEndDate) && (
-                      <button
-                        type="button"
-                        onClick={() => {
-                          setDailyStartDate('');
-                          setDailyEndDate('');
-                          setDailyStorageFilter('ALL');
-                          fetchDailyStorage('', '');
-                        }}
-                        style={{
-                          padding: '0.2rem 0.35rem',
-                          borderRadius: '0.25rem',
-                          border: 'none',
-                          backgroundColor: '#e2e8f0',
-                          color: '#475569',
-                          fontSize: '0.75rem',
-                          cursor: 'pointer'
-                        }}
-                        title="Clear Date Filter"
-                      >
-                        <X size={12} />
-                      </button>
-                    )}
-                  </div>
-
-                  {/* Refresh Button */}
-                  <button
-                    type="button"
-                    onClick={() => fetchDailyStorage(dailyStartDate, dailyEndDate)}
-                    disabled={loadingDailyStorage}
-                    style={{
-                      display: 'inline-flex',
-                      alignItems: 'center',
-                      gap: '0.35rem',
-                      padding: '0.4rem 0.75rem',
-                      borderRadius: '0.375rem',
-                      border: '1px solid #cbd5e1',
-                      backgroundColor: '#ffffff',
-                      fontSize: '0.8rem',
-                      fontWeight: 600,
-                      color: '#334155',
-                      cursor: 'pointer'
-                    }}
-                  >
-                    <RefreshCw size={13} className={loadingDailyStorage ? 'animate-spin' : ''} />
-                    Refresh
-                  </button>
-                </div>
-              </div>
-
-              {/* KPI Summary Cards Grid */}
-              <div style={{
-                display: 'grid',
-                gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))',
-                gap: '1rem',
-                marginBottom: '1.5rem'
-              }}>
-                {/* Total Requested Storage */}
-                <div style={{
-                  padding: '1rem 1.15rem',
-                  borderRadius: '0.5rem',
-                  backgroundColor: '#f8fafc',
-                  border: '1px solid #e2e8f0',
-                  display: 'flex',
-                  alignItems: 'flex-start',
-                  justifyContent: 'space-between'
-                }}>
-                  <div>
-                    <div style={{ fontSize: '0.78rem', fontWeight: 600, color: '#64748b', textTransform: 'uppercase', letterSpacing: '0.04em' }}>
-                      Total Requested Storage
-                    </div>
-                    <div style={{ fontSize: '1.45rem', fontWeight: 700, color: '#1e293b', marginTop: '0.35rem' }}>
-                      {dailyStorageData?.summary?.total_request_storage_gb ?? '0.00'} <span style={{ fontSize: '0.9rem', fontWeight: 500, color: '#64748b' }}>GB</span>
-                    </div>
-                    <div style={{ fontSize: '0.75rem', color: '#64748b', marginTop: '0.25rem' }}>
-                      Across {dailyStorageData?.summary?.total_requests ?? 0} user requests
-                    </div>
-                  </div>
-                  <div style={{ padding: '0.6rem', borderRadius: '0.375rem', backgroundColor: '#eff6ff', color: '#2563eb' }}>
-                    <Database size={20} />
-                  </div>
-                </div>
-
-                {/* Physical Storage on NAS */}
-                <div style={{
-                  padding: '1rem 1.15rem',
-                  borderRadius: '0.5rem',
-                  backgroundColor: '#f0fdf4',
-                  border: '1px solid #bbf7d0',
-                  display: 'flex',
-                  alignItems: 'flex-start',
-                  justifyContent: 'space-between'
-                }}>
-                  <div>
-                    <div style={{ fontSize: '0.78rem', fontWeight: 600, color: '#166534', textTransform: 'uppercase', letterSpacing: '0.04em' }}>
-                      Physical Storage on NAS
-                    </div>
-                    <div style={{ fontSize: '1.45rem', fontWeight: 700, color: '#14532d', marginTop: '0.35rem' }}>
-                      {dailyStorageData?.summary?.total_physical_storage_gb ?? '0.00'} <span style={{ fontSize: '0.9rem', fontWeight: 500, color: '#166534' }}>GB</span>
-                    </div>
-                    <div style={{ fontSize: '0.75rem', color: '#166534', marginTop: '0.25rem' }}>
-                      {dailyStorageData?.summary?.total_files?.toLocaleString() ?? 0} verified raster band files
-                    </div>
-                  </div>
-                  <div style={{ padding: '0.6rem', borderRadius: '0.375rem', backgroundColor: '#dcfce7', color: '#16a34a' }}>
-                    <HardDrive size={20} />
-                  </div>
-                </div>
-
-                {/* Average Daily Storage */}
-                <div style={{
-                  padding: '1rem 1.15rem',
-                  borderRadius: '0.5rem',
-                  backgroundColor: '#fffbeb',
-                  border: '1px solid #fef3c7',
-                  display: 'flex',
-                  alignItems: 'flex-start',
-                  justifyContent: 'space-between'
-                }}>
-                  <div>
-                    <div style={{ fontSize: '0.78rem', fontWeight: 600, color: '#92400e', textTransform: 'uppercase', letterSpacing: '0.04em' }}>
-                      Average Daily Ingestion
-                    </div>
-                    <div style={{ fontSize: '1.45rem', fontWeight: 700, color: '#78350f', marginTop: '0.35rem' }}>
-                      {dailyStorageData?.summary?.avg_daily_storage_gb ?? '0.00'} <span style={{ fontSize: '0.9rem', fontWeight: 500, color: '#92400e' }}>GB / day</span>
-                    </div>
-                    <div style={{ fontSize: '0.75rem', color: '#92400e', marginTop: '0.25rem' }}>
-                      Across {dailyStorageData?.summary?.active_days_count ?? 0} active storage days
-                    </div>
-                  </div>
-                  <div style={{ padding: '0.6rem', borderRadius: '0.375rem', backgroundColor: '#fef3c7', color: '#d97706' }}>
-                    <TrendingUp size={20} />
-                  </div>
-                </div>
-
-                {/* Peak Ingestion Day */}
-                <div style={{
-                  padding: '1rem 1.15rem',
-                  borderRadius: '0.5rem',
-                  backgroundColor: '#f5f3ff',
-                  border: '1px solid #ddd6fe',
-                  display: 'flex',
-                  alignItems: 'flex-start',
-                  justifyContent: 'space-between'
-                }}>
-                  <div>
-                    <div style={{ fontSize: '0.78rem', fontWeight: 600, color: '#6b21a8', textTransform: 'uppercase', letterSpacing: '0.04em' }}>
-                      Peak Ingestion Day
-                    </div>
-                    <div style={{ fontSize: '1.45rem', fontWeight: 700, color: '#581c87', marginTop: '0.35rem' }}>
-                      {dailyStorageData?.summary?.peak_day ? `${dailyStorageData.summary.peak_day.storage_gb} GB` : '—'}
-                    </div>
-                    <div style={{ fontSize: '0.75rem', color: '#6b21a8', marginTop: '0.25rem' }}>
-                      {dailyStorageData?.summary?.peak_day ? `${dailyStorageData.summary.peak_day.date} (${dailyStorageData.summary.peak_day.request_count} reqs)` : 'No records yet'}
-                    </div>
-                  </div>
-                  <div style={{ padding: '0.6rem', borderRadius: '0.375rem', backgroundColor: '#ede9fe', color: '#7c3aed' }}>
-                    <Activity size={20} />
-                  </div>
-                </div>
-              </div>
-
-              {/* Visual Daily Storage Bar Chart */}
-              {dailyStorageData?.daily_timeline && dailyStorageData.daily_timeline.length > 0 && (() => {
-                const chronologicalTimeline = [...dailyStorageData.daily_timeline].sort((a, b) => a.date.localeCompare(b.date));
-                const maxDayValue = Math.max(
-                  ...chronologicalTimeline.map(d => Math.max(d.request_storage_gb || 0, d.physical_storage_gb || 0)),
-                  10
-                );
-
-                return (
-                  <div style={{
-                    backgroundColor: '#f8fafc',
-                    borderRadius: '0.5rem',
-                    border: '1px solid #e2e8f0',
-                    padding: '1.25rem',
-                    marginBottom: '1.5rem'
-                  }}>
-                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '1rem', flexWrap: 'wrap', gap: '0.5rem' }}>
-                      <div style={{ fontSize: '0.88rem', fontWeight: 700, color: '#1e293b', display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
-                        <BarChart3 size={16} color="#2563eb" /> Daily Ingestion Velocity Trend
-                      </div>
-                      <div style={{ display: 'flex', alignItems: 'center', gap: '1rem', fontSize: '0.78rem' }}>
-                        <span style={{ display: 'flex', alignItems: 'center', gap: '0.35rem', color: '#334155' }}>
-                          <span style={{ width: '10px', height: '10px', backgroundColor: '#3b82f6', borderRadius: '2px', display: 'inline-block' }}></span>
-                          Requested Storage (GB)
-                        </span>
-                        <span style={{ display: 'flex', alignItems: 'center', gap: '0.35rem', color: '#334155' }}>
-                          <span style={{ width: '10px', height: '10px', backgroundColor: '#10b981', borderRadius: '2px', display: 'inline-block' }}></span>
-                          Physical Downloaded (GB)
-                        </span>
-                      </div>
-                    </div>
-
-                    <div style={{
-                      display: 'flex',
-                      alignItems: 'flex-end',
-                      gap: '1rem',
-                      height: '140px',
-                      padding: '0.5rem 0.5rem 0.25rem 0.5rem',
-                      overflowX: 'auto',
-                      borderBottom: '1px solid #cbd5e1'
-                    }}>
-                      {chronologicalTimeline.map((day) => {
-                        const reqPct = Math.min(Math.round(((day.request_storage_gb || 0) / maxDayValue) * 100), 100);
-                        const physPct = Math.min(Math.round(((day.physical_storage_gb || 0) / maxDayValue) * 100), 100);
-                        const isExpanded = expandedDailyDate === day.date;
-
-                        return (
-                          <div
-                            key={day.date}
-                            onClick={() => setExpandedDailyDate(isExpanded ? null : day.date)}
-                            title={`Date: ${day.date}\nRequested: ${day.request_storage_gb} GB (${day.request_count} reqs)\nPhysical: ${day.physical_storage_gb} GB (${day.physical_files_count} files)`}
-                            style={{
-                              flex: '1',
-                              minWidth: '55px',
-                              maxWidth: '85px',
-                              height: '100%',
-                              display: 'flex',
-                              flexDirection: 'column',
-                              justifyContent: 'flex-end',
-                              alignItems: 'center',
-                              cursor: 'pointer',
-                              padding: '0.2rem',
-                              borderRadius: '0.375rem',
-                              backgroundColor: isExpanded ? '#eff6ff' : 'transparent',
-                              transition: 'all 0.15s ease'
-                            }}
-                          >
-                            <div style={{ display: 'flex', alignItems: 'flex-end', gap: '3px', height: '105px', width: '100%', justifyContent: 'center' }}>
-                              {/* Request GB bar */}
-                              <div style={{
-                                width: '40%',
-                                height: `${Math.max(reqPct, 4)}%`,
-                                backgroundColor: '#3b82f6',
-                                borderRadius: '3px 3px 0 0',
-                                transition: 'height 0.3s ease'
-                              }}></div>
-                              {/* Physical GB bar */}
-                              <div style={{
-                                width: '40%',
-                                height: `${Math.max(physPct, 4)}%`,
-                                backgroundColor: '#10b981',
-                                borderRadius: '3px 3px 0 0',
-                                transition: 'height 0.3s ease'
-                              }}></div>
-                            </div>
-                            <div style={{ fontSize: '0.7rem', fontWeight: 600, color: isExpanded ? '#2563eb' : '#64748b', marginTop: '0.4rem', whiteSpace: 'nowrap' }}>
-                              {day.date.slice(5)}
-                            </div>
-                          </div>
-                        );
-                      })}
-                    </div>
-                  </div>
-                );
-              })()}
-
-              {/* Daily Storage Ledger Table */}
-              <div style={{ overflowX: 'auto', border: '1px solid #e2e8f0', borderRadius: '0.5rem' }}>
-                <table style={{ width: '100%', borderCollapse: 'collapse', textAlign: 'left', fontSize: '0.85rem' }}>
-                  <thead>
-                    <tr style={{ backgroundColor: '#f8fafc', borderBottom: '1px solid #e2e8f0', color: '#475569', fontWeight: 600 }}>
-                      <th style={{ padding: '0.75rem 0.85rem' }}>Date</th>
-                      <th style={{ padding: '0.75rem 0.85rem' }}>Requests Submitted</th>
-                      <th style={{ padding: '0.75rem 0.85rem' }}>Daily Requested Storage</th>
-                      <th style={{ padding: '0.75rem 0.85rem' }}>Physical NAS Storage</th>
-                      <th style={{ padding: '0.75rem 0.85rem' }}>Cumulative Storage</th>
-                      <th style={{ padding: '0.75rem 0.85rem' }}>Satellites</th>
-                      <th style={{ padding: '0.75rem 0.85rem' }}>Target Districts</th>
-                      <th style={{ padding: '0.75rem 0.85rem', textAlign: 'right' }}>Actions</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {(!dailyStorageData?.daily_timeline || dailyStorageData.daily_timeline.length === 0) ? (
-                      <tr>
-                        <td colSpan={8} style={{ padding: '2rem', textAlign: 'center', color: '#64748b' }}>
-                          {loadingDailyStorage ? 'Loading daily storage data...' : 'No daily storage records found for selected period.'}
-                        </td>
-                      </tr>
-                    ) : (
-                      dailyStorageData.daily_timeline.map((day) => {
-                        const isExpanded = expandedDailyDate === day.date;
-
-                        return (
-                          <React.Fragment key={day.date}>
-                            <tr
-                              style={{
-                                borderBottom: '1px solid #e2e8f0',
-                                backgroundColor: isExpanded ? '#f8fafc' : '#ffffff',
-                                transition: 'background-color 0.15s ease'
-                              }}
-                            >
-                              <td style={{ padding: '0.75rem 0.85rem', fontWeight: 700, color: '#0f172a' }}>
-                                <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
-                                  <Calendar size={14} color="#64748b" />
-                                  <span>{day.date}</span>
-                                </div>
-                              </td>
-                              <td style={{ padding: '0.75rem 0.85rem' }}>
-                                {day.request_count > 0 ? (
-                                  <span style={{
-                                    padding: '0.2rem 0.55rem',
-                                    borderRadius: '9999px',
-                                    backgroundColor: '#eff6ff',
-                                    color: '#1d4ed8',
-                                    fontWeight: 600,
-                                    fontSize: '0.78rem'
-                                  }}>
-                                    {day.request_count} {day.request_count === 1 ? 'request' : 'requests'}
-                                  </span>
-                                ) : (
-                                  <span style={{ color: '#94a3b8', fontSize: '0.8rem' }}>0 (Download only)</span>
-                                )}
-                              </td>
-                              <td style={{ padding: '0.75rem 0.85rem', fontWeight: 700, color: '#2563eb' }}>
-                                {day.request_storage_gb > 0 ? `${day.request_storage_gb} GB` : '—'}
-                              </td>
-                              <td style={{ padding: '0.75rem 0.85rem', fontWeight: 600, color: '#059669' }}>
-                                {day.physical_storage_gb > 0 ? (
-                                  <span>{day.physical_storage_gb} GB <span style={{ fontSize: '0.72rem', color: '#64748b' }}>({day.physical_files_count} files)</span></span>
-                                ) : (
-                                  <span style={{ color: '#94a3b8' }}>—</span>
-                                )}
-                              </td>
-                              <td style={{ padding: '0.75rem 0.85rem', color: '#334155' }}>
-                                <div style={{ fontSize: '0.8rem', fontWeight: 600 }}>
-                                  Req: {day.cumulative_request_gb} GB
-                                </div>
-                                <div style={{ fontSize: '0.74rem', color: '#059669' }}>
-                                  NAS: {day.cumulative_physical_gb} GB
-                                </div>
-                              </td>
-                              <td style={{ padding: '0.75rem 0.85rem' }}>
-                                <div style={{ display: 'flex', gap: '0.25rem', flexWrap: 'wrap' }}>
-                                  {day.satellites && day.satellites.length > 0 ? (
-                                    day.satellites.map((sat) => (
-                                      <span
-                                        key={sat}
-                                        style={{
-                                          padding: '0.15rem 0.45rem',
-                                          borderRadius: '0.25rem',
-                                          fontSize: '0.72rem',
-                                          fontWeight: 600,
-                                          backgroundColor: '#e0e7ff',
-                                          color: '#3730a3'
-                                        }}
-                                      >
-                                        {sat}
-                                      </span>
-                                    ))
-                                  ) : (
-                                    <span style={{ color: '#94a3b8', fontSize: '0.75rem' }}>—</span>
-                                  )}
-                                </div>
-                              </td>
-                              <td style={{ padding: '0.75rem 0.85rem' }}>
-                                <div style={{ display: 'flex', gap: '0.25rem', flexWrap: 'wrap', maxWidth: '180px' }}>
-                                  {day.districts && day.districts.length > 0 ? (
-                                    day.districts.map((dst) => (
-                                      <span
-                                        key={dst}
-                                        style={{
-                                          padding: '0.15rem 0.4rem',
-                                          borderRadius: '0.25rem',
-                                          fontSize: '0.72rem',
-                                          backgroundColor: '#f1f5f9',
-                                          color: '#334155'
-                                        }}
-                                      >
-                                        {dst}
-                                      </span>
-                                    ))
-                                  ) : (
-                                    <span style={{ color: '#94a3b8', fontSize: '0.75rem' }}>—</span>
-                                  )}
-                                </div>
-                              </td>
-                              <td style={{ padding: '0.75rem 0.85rem', textAlign: 'right' }}>
-                                <button
-                                  type="button"
-                                  onClick={() => setExpandedDailyDate(isExpanded ? null : day.date)}
-                                  style={{
-                                    display: 'inline-flex',
-                                    alignItems: 'center',
-                                    gap: '0.25rem',
-                                    padding: '0.35rem 0.65rem',
-                                    borderRadius: '0.375rem',
-                                    border: '1px solid #cbd5e1',
-                                    backgroundColor: isExpanded ? '#2563eb' : '#ffffff',
-                                    color: isExpanded ? '#ffffff' : '#334155',
-                                    fontSize: '0.78rem',
-                                    fontWeight: 600,
-                                    cursor: 'pointer'
-                                  }}
-                                >
-                                  {isExpanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
-                                  {isExpanded ? 'Hide' : 'Details'}
-                                </button>
-                              </td>
-                            </tr>
-
-                            {/* Nested Requests View */}
-                            {isExpanded && (
-                              <tr style={{ backgroundColor: '#f8fafc' }}>
-                                <td colSpan={8} style={{ padding: '1rem 1.25rem', borderBottom: '2px solid #e2e8f0' }}>
-                                  <div style={{ backgroundColor: '#ffffff', border: '1px solid #cbd5e1', borderRadius: '0.5rem', padding: '1rem' }}>
-                                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '0.75rem' }}>
-                                      <h4 style={{ margin: 0, fontSize: '0.9rem', fontWeight: 700, color: '#0f172a' }}>
-                                        Requests Logged on {day.date} ({day.requests?.length || 0})
-                                      </h4>
-                                      <span style={{ fontSize: '0.78rem', color: '#64748b' }}>
-                                        Daily Allocated Storage: <strong style={{ color: '#2563eb' }}>{day.request_storage_gb} GB</strong>
-                                      </span>
-                                    </div>
-
-                                    {(!day.requests || day.requests.length === 0) ? (
-                                      <div style={{ padding: '1rem', textAlign: 'center', color: '#64748b', fontSize: '0.82rem' }}>
-                                        No new request records created on this date. File downloads processed were initiated from previous pipeline jobs.
-                                      </div>
-                                    ) : (
-                                      <div style={{ overflowX: 'auto' }}>
-                                        <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.8rem', textAlign: 'left' }}>
-                                          <thead>
-                                            <tr style={{ backgroundColor: '#f1f5f9', color: '#475569', borderBottom: '1px solid #e2e8f0' }}>
-                                              <th style={{ padding: '0.5rem 0.65rem' }}>ID</th>
-                                              <th style={{ padding: '0.5rem 0.65rem' }}>Title</th>
-                                              <th style={{ padding: '0.5rem 0.65rem' }}>User</th>
-                                              <th style={{ padding: '0.5rem 0.65rem' }}>Region</th>
-                                              <th style={{ padding: '0.5rem 0.65rem' }}>Satellite</th>
-                                              <th style={{ padding: '0.5rem 0.65rem' }}>Est. Storage</th>
-                                              <th style={{ padding: '0.5rem 0.65rem' }}>Status</th>
-                                              <th style={{ padding: '0.5rem 0.65rem', textAlign: 'right' }}>Logs</th>
-                                            </tr>
-                                          </thead>
-                                          <tbody>
-                                            {day.requests.map((r) => (
-                                              <tr key={r.id} style={{ borderBottom: '1px solid #f1f5f9' }}>
-                                                <td style={{ padding: '0.5rem 0.65rem', fontWeight: 700, color: '#2563eb' }}>#{r.id}</td>
-                                                <td style={{ padding: '0.5rem 0.65rem', fontWeight: 600, color: '#0f172a' }}>{r.title}</td>
-                                                <td style={{ padding: '0.5rem 0.65rem', color: '#334155' }}>
-                                                  <div>{r.user_name}</div>
-                                                  <div style={{ fontSize: '0.72rem', color: '#64748b' }}>{r.user_email}</div>
-                                                </td>
-                                                <td style={{ padding: '0.5rem 0.65rem', color: '#334155' }}>
-                                                  {r.district ? `${r.district}, ${r.state}` : r.state || 'All India'}
-                                                </td>
-                                                <td style={{ padding: '0.5rem 0.65rem', fontWeight: 600 }}>{r.satellite}</td>
-                                                <td style={{ padding: '0.5rem 0.65rem', fontWeight: 700, color: '#2563eb' }}>{r.storage_gb} GB</td>
-                                                <td style={{ padding: '0.5rem 0.65rem' }}>
-                                                  {renderStatusBadge(r.status)}
-                                                </td>
-                                                <td style={{ padding: '0.5rem 0.65rem', textAlign: 'right' }}>
-                                                  <button
-                                                    type="button"
-                                                    onClick={() => openLogsModal(r)}
-                                                    style={{
-                                                      display: 'inline-flex',
-                                                      alignItems: 'center',
-                                                      gap: '0.25rem',
-                                                      padding: '0.25rem 0.5rem',
-                                                      borderRadius: '0.25rem',
-                                                      border: '1px solid #cbd5e1',
-                                                      backgroundColor: '#ffffff',
-                                                      fontSize: '0.74rem',
-                                                      fontWeight: 600,
-                                                      color: '#334155',
-                                                      cursor: 'pointer'
-                                                    }}
-                                                  >
-                                                    <Terminal size={11} color="#2563eb" /> Logs
-                                                  </button>
-                                                </td>
-                                              </tr>
-                                            ))}
-                                          </tbody>
-                                        </table>
-                                      </div>
-                                    )}
-                                  </div>
-                                </td>
-                              </tr>
-                            )}
-                          </React.Fragment>
-                        );
-                      })
-                    )}
-                  </tbody>
-                </table>
-              </div>
             </div>
           </div>
         )}
@@ -7271,7 +7308,13 @@ export default function App() {
                     </tr>
                   </thead>
                   <tbody>
-                    {adminUsers.length === 0 ? (
+                    {loadingAdmin ? (
+                      <tr>
+                        <td colSpan={7} style={{ padding: '2rem', textAlign: 'center', color: '#64748b' }}>
+                          <RefreshCw size={16} className="animate-spin" style={{ display: 'inline', marginRight: '0.5rem' }} /> Loading users directory...
+                        </td>
+                      </tr>
+                    ) : adminUsers.length === 0 ? (
                       <tr>
                         <td colSpan={7} style={{ padding: '2rem', textAlign: 'center', color: '#64748b' }}>No users found in directory.</td>
                       </tr>
@@ -9693,6 +9736,72 @@ export default function App() {
                 display: 'flex',
                 flexDirection: 'column'
               }}>
+                {/* Active Concurrent Stacking Tasks Bar */}
+                {Object.keys(activeStackTasks).length > 0 && (
+                  <div style={{
+                    backgroundColor: '#f1f5f9',
+                    padding: '0.5rem 1.25rem',
+                    borderBottom: '1px solid #e2e8f0',
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: '0.5rem',
+                    flexWrap: 'wrap'
+                  }}>
+                    <span style={{ fontSize: '0.74rem', fontWeight: 700, color: '#475569', display: 'flex', alignItems: 'center', gap: '0.3rem' }}>
+                      <Layers size={13} color="#2563eb" /> Active Tasks ({Object.keys(activeStackTasks).length}):
+                    </span>
+                    {Object.values(activeStackTasks).map(task => {
+                      const isCurrent = task.taskId === stackTaskId;
+                      const isRunning = task.status === 'RUNNING';
+                      const isSuccess = task.status === 'SUCCESS';
+                      return (
+                        <button
+                          key={task.taskId}
+                          type="button"
+                          onClick={() => {
+                            setStackTaskId(task.taskId);
+                            if (task.district) setStackDistrict(task.district);
+                            if (task.state) setStackState(task.state);
+                            if (task.season) setStackSeason(task.season);
+                            setStackProgress(task.progress || 0);
+                            setStackStep(task.step || '');
+                            setStackLogs(task.logs || []);
+                            setStackResult(task.result || null);
+                            setStackLoading(isRunning);
+                          }}
+                          style={{
+                            display: 'inline-flex',
+                            alignItems: 'center',
+                            gap: '0.35rem',
+                            padding: '0.25rem 0.65rem',
+                            borderRadius: '9999px',
+                            border: isCurrent ? '2px solid #2563eb' : '1px solid #cbd5e1',
+                            backgroundColor: isCurrent ? '#eff6ff' : '#ffffff',
+                            color: isCurrent ? '#1d4ed8' : '#334155',
+                            fontSize: '0.74rem',
+                            fontWeight: isCurrent ? 700 : 500,
+                            cursor: 'pointer',
+                            transition: 'all 0.15s ease'
+                          }}
+                          title={`Click to view live execution logs for task ${task.taskId}`}
+                        >
+                          <span style={{
+                            width: 7,
+                            height: 7,
+                            borderRadius: '50%',
+                            backgroundColor: isRunning ? '#3b82f6' : (isSuccess ? '#10b981' : '#ef4444'),
+                            display: 'inline-block'
+                          }} />
+                          <span>{task.district || 'Task'}</span>
+                          {task.requestId && <span style={{ opacity: 0.7 }}>#{task.requestId}</span>}
+                          <span style={{ fontWeight: 700, color: isRunning ? '#2563eb' : (isSuccess ? '#059669' : '#dc2626') }}>
+                            {isRunning ? `${task.progress || 0}%` : (isSuccess ? '✓ Done' : 'Failed')}
+                          </span>
+                        </button>
+                      );
+                    })}
+                  </div>
+                )}
                 {/* Console Header */}
                 <div style={{
                   backgroundColor: '#f8fafc',
@@ -10324,8 +10433,8 @@ export default function App() {
             backgroundColor: '#ffffff',
             color: '#0f172a',
             border: '1px solid #e2e8f0',
-            width: '100%',
-            maxWidth: '1240px',
+            maxWidth: '1420px',
+            width: '96vw',
             height: '92vh',
             maxHeight: '94vh',
             display: 'flex',
@@ -10493,6 +10602,85 @@ export default function App() {
               </div>
             </div>
 
+            {/* Top-Level Log Category Tabs: Pipeline vs Stacking */}
+            <div style={{
+              display: 'flex',
+              alignItems: 'center',
+              gap: '0.5rem',
+              padding: '0.45rem 1.5rem 0 1.5rem',
+              backgroundColor: '#f1f5f9',
+              borderBottom: '1px solid #e2e8f0'
+            }}>
+              <button
+                type="button"
+                onClick={() => setRequestLogTab('pipeline')}
+                style={{
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  gap: '0.4rem',
+                  padding: '0.45rem 0.95rem',
+                  borderTopLeftRadius: '0.375rem',
+                  borderTopRightRadius: '0.375rem',
+                  border: '1px solid',
+                  borderColor: requestLogTab === 'pipeline' ? '#e2e8f0 #e2e8f0 #ffffff #e2e8f0' : 'transparent',
+                  backgroundColor: requestLogTab === 'pipeline' ? '#ffffff' : 'transparent',
+                  color: requestLogTab === 'pipeline' ? '#1d4ed8' : '#64748b',
+                  fontSize: '0.8rem',
+                  fontWeight: requestLogTab === 'pipeline' ? 700 : 500,
+                  cursor: 'pointer',
+                  marginBottom: requestLogTab === 'pipeline' ? '-1px' : '0',
+                  position: 'relative',
+                  zIndex: requestLogTab === 'pipeline' ? 2 : 1
+                }}
+              >
+                <Terminal size={14} /> Pipeline Acquisition &amp; Processing Logs
+              </button>
+
+              <button
+                type="button"
+                onClick={() => {
+                  setRequestLogTab('stacking');
+                  if (selectedReqForLogs?.id) fetchRequestStackLogs(selectedReqForLogs.id);
+                }}
+                style={{
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  gap: '0.4rem',
+                  padding: '0.45rem 0.95rem',
+                  borderTopLeftRadius: '0.375rem',
+                  borderTopRightRadius: '0.375rem',
+                  border: '1px solid',
+                  borderColor: requestLogTab === 'stacking' ? '#e2e8f0 #e2e8f0 #ffffff #e2e8f0' : 'transparent',
+                  backgroundColor: requestLogTab === 'stacking' ? '#ffffff' : 'transparent',
+                  color: requestLogTab === 'stacking' ? '#1d4ed8' : '#64748b',
+                  fontSize: '0.8rem',
+                  fontWeight: requestLogTab === 'stacking' ? 700 : 500,
+                  cursor: 'pointer',
+                  marginBottom: requestLogTab === 'stacking' ? '-1px' : '0',
+                  position: 'relative',
+                  zIndex: requestLogTab === 'stacking' ? 2 : 1
+                }}
+              >
+                <Layers size={14} color="#d97706" /> Multi-Band Layer Stacking Logs
+                {reqStackJobs.length > 0 && (
+                  <span style={{
+                    marginLeft: '0.35rem',
+                    padding: '0.1rem 0.45rem',
+                    borderRadius: '9999px',
+                    fontSize: '0.7rem',
+                    backgroundColor: reqStackJobs.some(j => j.status === 'RUNNING') ? '#eff6ff' : '#ecfdf5',
+                    color: reqStackJobs.some(j => j.status === 'RUNNING') ? '#1d4ed8' : '#047857',
+                    fontWeight: 700
+                  }}>
+                    {reqStackJobs.length} run{reqStackJobs.length > 1 ? 's' : ''}
+                    {reqStackJobs.some(j => j.status === 'RUNNING') && ' (Live)'}
+                  </span>
+                )}
+              </button>
+            </div>
+
+            {requestLogTab === 'pipeline' && (
+              <>
             {/* View Toolbar: Mode Switcher, Filters & Search */}
             <div style={{
               padding: '0.5rem 1.5rem',
@@ -10582,11 +10770,12 @@ export default function App() {
 
             {/* Modal Body: Switch between Table View and Raw Terminal View */}
             <div style={{
-              padding: '1rem 1.5rem',
+              padding: '1rem 1.25rem',
               backgroundColor: '#ffffff',
               flex: '1 1 auto',
               minHeight: 0,
               overflowY: 'auto',
+              overflowX: 'hidden',
               display: 'flex',
               flexDirection: 'column'
             }}>
@@ -10599,12 +10788,30 @@ export default function App() {
                   backgroundColor: '#f8fafc',
                   border: '1px solid #e2e8f0',
                   color: '#0f172a',
-                  padding: '1rem 1.25rem'
+                  padding: '1rem 1.25rem',
+                  overflowY: 'auto'
                 }}>
                   {renderLogContent(selectedReqForLogs.execution_logs)}
+                  <div ref={logsEndRef} />
                 </div>
               )}
             </div>
+              </>
+            )}
+
+            {requestLogTab === 'stacking' && (
+              <div style={{
+                padding: '1rem 1.5rem',
+                backgroundColor: '#ffffff',
+                flex: '1 1 auto',
+                minHeight: 0,
+                overflowY: 'auto',
+                display: 'flex',
+                flexDirection: 'column'
+              }}>
+                {renderRequestStackingLogsSection()}
+              </div>
+            )}
 
             {/* Modal Footer Controls */}
             <div style={{

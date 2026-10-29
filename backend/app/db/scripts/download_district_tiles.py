@@ -29,6 +29,7 @@ import sys
 import argparse
 import logging
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -619,90 +620,186 @@ def run_district_acquisition_pipeline(
         tile_downloaded_count = {t: 0 for t in tiles}
         held_scenes = []           # SceneModel objects that are complete (downloaded or NAS-cached)
 
-        for idx, sc in enumerate(missing_scenes, start=1):
-            pct = int((idx / len(missing_scenes)) * 100)
+        # ── Concurrent Background Prefetching Pipeline (3 simultaneous downloads) ──
+        MAX_PARALLEL_SCENES = 3
+        prefetch_pool = ThreadPoolExecutor(max_workers=MAX_PARALLEL_SCENES)
+        prefetch_futures = {}  # { scene_id: (future, sc_dict) }
+        next_prefetch_idx = [0]
 
-            if _is_request_stopped(db, request_id):
-                stop_log = f"\n[STOPPED] Execution cancelled by user at scene [{idx}/{len(missing_scenes)}]. Download halted cleanly."
-                logger.warning(stop_log)
-                append_request_log(db, request_id, stop_log, level="WARNING")
-                _update_job(db, dl_job, "STOPPED", error_log="Stopped by user")
-                return False
+        def _bg_download_scene(sc_item):
+            from app.core.database import SessionLocal
+            th_db = SessionLocal()
+            try:
+                s_id_bg = sc_item["scene_id"]
+                th_scene = th_db.query(SceneModel).filter(SceneModel.scene_id == s_id_bg).first()
+                if not th_scene:
+                    th_scene = SceneModel(
+                        scene_id=s_id_bg,
+                        tile=sc_item["tile"],
+                        sensing_date=sc_item["sensing_date"],
+                        satellite=sc_item["satellite"],
+                        folder=sc_item["folder"],
+                        prefix=sc_item["prefix"],
+                        status="PENDING"
+                    )
+                    th_db.add(th_scene)
+                    th_db.commit()
 
-            s_id = sc["scene_id"]
-            sc_tile = sc.get("tile", "")
-
-            # Create or retrieve SceneModel record (SRS M4 - archive record)
-            scene_obj = db.query(SceneModel).filter(SceneModel.scene_id == s_id).first()
-            if not scene_obj:
-                scene_obj = SceneModel(
-                    scene_id=s_id,
-                    tile=sc["tile"],
-                    sensing_date=sc["sensing_date"],
-                    satellite=sc["satellite"],
-                    folder=sc["folder"],
-                    prefix=sc["prefix"],
-                    status="PENDING"
+                ok_res, b_det, dl_txt = download_and_verify_scene(
+                    th_db,
+                    th_scene,
+                    user_id=user_id,
+                    request_id=request_id,
+                    district_name=district_name,
+                    silent_band_logs=True
                 )
-                db.add(scene_obj)
-                db.commit()
+                if ok_res and getattr(th_scene, "status", None) != "HELD":
+                    try:
+                        th_scene.status = "HELD"
+                        th_db.commit()
+                    except Exception:
+                        th_db.rollback()
+                return ok_res, b_det, dl_txt
+            except Exception as e_bg:
+                logger.error(f"Background prefetch error for {sc_item.get('scene_id')}: {e_bg}")
+                return False, [], str(e_bg)
+            finally:
+                th_db.close()
 
-            dl_msg = f"  [{idx}/{len(missing_scenes)} - {pct}%] Processing '{sc['folder']}' (Tile {sc_tile}, Date {sc['sensing_date']})..."
-            logger.info(dl_msg)
-            append_request_log(db, request_id, dl_msg)
+        def _replenish_prefetch_queue():
+            while len(prefetch_futures) < MAX_PARALLEL_SCENES and next_prefetch_idx[0] < len(missing_scenes):
+                c_sc = missing_scenes[next_prefetch_idx[0]]
+                next_prefetch_idx[0] += 1
+                c_id = c_sc["scene_id"]
+                if c_id in prefetch_futures:
+                    continue
+                c_dir = _resolve_scene_dir(c_sc, satellite, district_name=district_name)
+                c_cached, _, _ = _scene_cached_on_nas(c_dir, _is_s1(c_sc, satellite))
+                if c_cached:
+                    continue
+                fut = prefetch_pool.submit(_bg_download_scene, c_sc)
+                prefetch_futures[c_id] = (fut, c_sc)
 
-            # ---- FAST CHECK: is the scene already complete on NAS? ----
-            s_is_s1 = _is_s1(sc, satellite)
-            s_dir = _resolve_scene_dir(sc, satellite, district_name=district_name)
-            cached, _, problem = _scene_cached_on_nas(s_dir, s_is_s1)
+        # Kick off background prefetch streams immediately
+        _replenish_prefetch_queue()
 
-            if cached:
-                if getattr(scene_obj, "status", None) != "HELD":
+        try:
+            for idx, sc in enumerate(missing_scenes, start=1):
+                pct = int((idx / len(missing_scenes)) * 100)
+
+                if _is_request_stopped(db, request_id):
+                    stop_log = f"\n[STOPPED] Execution cancelled by user at scene [{idx}/{len(missing_scenes)}]. Download halted cleanly."
+                    logger.warning(stop_log)
+                    append_request_log(db, request_id, stop_log, level="WARNING")
+                    _update_job(db, dl_job, "STOPPED", error_log="Stopped by user")
+                    prefetch_pool.shutdown(wait=False, cancel_futures=True)
+                    return False
+
+                s_id = sc["scene_id"]
+                sc_tile = sc.get("tile", "")
+
+                # Create or retrieve SceneModel record (SRS M4 - archive record)
+                scene_obj = db.query(SceneModel).filter(SceneModel.scene_id == s_id).first()
+                if not scene_obj:
+                    scene_obj = SceneModel(
+                        scene_id=s_id,
+                        tile=sc["tile"],
+                        sensing_date=sc["sensing_date"],
+                        satellite=sc["satellite"],
+                        folder=sc["folder"],
+                        prefix=sc["prefix"],
+                        status="PENDING"
+                    )
+                    db.add(scene_obj)
+                    db.commit()
+
+                dl_msg = f"  [{idx}/{len(missing_scenes)} - {pct}%] Processing '{sc['folder']}' (Tile {sc_tile}, Date {sc['sensing_date']})..."
+                logger.info(dl_msg)
+                append_request_log(db, request_id, dl_msg)
+
+                # ---- FAST CHECK: is the scene already complete on NAS? ----
+                s_is_s1 = _is_s1(sc, satellite)
+                s_dir = _resolve_scene_dir(sc, satellite, district_name=district_name)
+                cached, _, problem = _scene_cached_on_nas(s_dir, s_is_s1)
+
+                if cached:
+                    if s_id in prefetch_futures:
+                        prefetch_futures.pop(s_id, None)
+
+                    if getattr(scene_obj, "status", None) != "HELD":
+                        try:
+                            scene_obj.status = "HELD"
+                            db.commit()
+                        except Exception as st_err:
+                            db.rollback()
+                            logger.warning(f"Could not mark scene {s_id} HELD: {st_err}")
+
+                    nas_cached_count += 1
+                    held_scenes.append(scene_obj)
+                    tile_downloaded_count[sc_tile] = tile_downloaded_count.get(sc_tile, 0) + 1
+                    _link_scene_to_request(db, request_id, s_id)
+                    _sync_cached_scene_band_files(db, scene_obj, s_dir)
+                    append_request_log(
+                        db, request_id,
+                        f"     ✓ [NAS VERIFIED - SKIPPED] '{sc['folder']}' already on NAS at '{s_dir}'. Skipping download."
+                    )
+                    _replenish_prefetch_queue()
+                    continue
+
+                if problem and os.path.isdir(s_dir):
+                    append_request_log(db, request_id, f"     • NAS copy incomplete ({problem}); downloading.")
+
+                # ---- Check if background prefetch stream was already fetching this scene ----
+                was_prefetched = False
+                if s_id in prefetch_futures:
+                    fut_entry, _ = prefetch_futures.pop(s_id)
+                    if fut_entry.done():
+                        ok, band_details, dl_log = fut_entry.result()
+                        was_prefetched = True
+                    else:
+                        bg_others = [f_info['folder'] for fid, (f_fut, f_info) in prefetch_futures.items() if not f_fut.done()]
+                        if bg_others:
+                            append_request_log(db, request_id, f"     ⚡ [PARALLEL STREAM] Finalizing active scene while downloading {len(bg_others)} upcoming scene(s) in background ({', '.join(bg_others[:2])})...")
+                        ok, band_details, dl_log = fut_entry.result()
+                else:
+                    bg_others = [f_info['folder'] for fid, (f_fut, f_info) in prefetch_futures.items() if not f_fut.done()]
+                    if bg_others:
+                        append_request_log(db, request_id, f"     ⚡ [PARALLEL STREAM] Downloading present scene while fetching {len(bg_others)} upcoming scene(s) in background ({', '.join(bg_others[:2])})...")
+                    ok, band_details, dl_log = download_and_verify_scene(db, scene_obj, user_id=user_id, request_id=request_id, district_name=district_name, silent_band_logs=False)
+
+                if ok:
+                    downloaded_count += 1
+                    held_scenes.append(scene_obj)
+                    tile_downloaded_count[sc_tile] = tile_downloaded_count.get(sc_tile, 0) + 1
+                    prefix_tag = "[BACKGROUND DOWNLOAD COMPLETE - READY] " if was_prefetched else ""
+                    append_request_log(db, request_id, f"     ✓ {prefix_tag}{dl_log}")
+                    _link_scene_to_request(db, request_id, s_id)
                     try:
                         scene_obj.status = "HELD"
                         db.commit()
-                    except Exception as st_err:
+                    except Exception:
                         db.rollback()
-                        logger.warning(f"Could not mark scene {s_id} HELD: {st_err}")
-
-                nas_cached_count += 1
-                held_scenes.append(scene_obj)
-                tile_downloaded_count[sc_tile] = tile_downloaded_count.get(sc_tile, 0) + 1
-                _link_scene_to_request(db, request_id, s_id)
-                _sync_cached_scene_band_files(db, scene_obj, s_dir)
-                append_request_log(
-                    db, request_id,
-                    f"     ✓ [NAS VERIFIED - SKIPPED] '{sc['folder']}' already on NAS at '{s_dir}'. Skipping download."
-                )
-                continue
-
-            if problem and os.path.isdir(s_dir):
-                append_request_log(db, request_id, f"     • NAS copy incomplete ({problem}); downloading.")
-
-            # ---- Not (fully) on NAS: download ----
-            ok, band_details, dl_log = download_and_verify_scene(db, scene_obj, user_id=user_id, request_id=request_id, district_name=district_name)
-            if ok:
-                downloaded_count += 1
-                held_scenes.append(scene_obj)
-                tile_downloaded_count[sc_tile] = tile_downloaded_count.get(sc_tile, 0) + 1
-                append_request_log(db, request_id, f"     ✓ {dl_log}")
-                _link_scene_to_request(db, request_id, s_id)
-            else:
-                failed_count += 1
-                failed_bands = [b['band'] for b in band_details if not b.get('ok')]
-                if dl_log and "[NAS_ERROR]" in dl_log:
-                    append_request_log(
-                        db, request_id,
-                        f"     ❌ {dl_log}",
-                        level="ERROR"
-                    )
                 else:
-                    detail_str = f"Incomplete bands: {failed_bands}" if failed_bands else (dl_log or "Download failed")
-                    append_request_log(
-                        db, request_id,
-                        f"     ⚠ WARN: Scene '{sc['scene_id']}' download failed ({detail_str}) - remains PENDING.",
-                        level="WARNING"
-                    )
+                    failed_count += 1
+                    failed_bands = [b['band'] for b in band_details if not b.get('ok')]
+                    if dl_log and "[NAS_ERROR]" in dl_log:
+                        append_request_log(
+                            db, request_id,
+                            f"     ❌ {dl_log}",
+                            level="ERROR"
+                        )
+                    else:
+                        detail_str = f"Incomplete bands: {failed_bands}" if failed_bands else (dl_log or "Download failed")
+                        append_request_log(
+                            db, request_id,
+                            f"     ⚠ WARN: Scene '{sc['scene_id']}' download failed ({detail_str}) - remains PENDING.",
+                            level="WARNING"
+                        )
+
+                # Replenish prefetch pipeline for subsequent scenes
+                _replenish_prefetch_queue()
+        finally:
+            prefetch_pool.shutdown(wait=False, cancel_futures=True)
 
         dl_summary = (
             f"  ✓ Stage 2 Complete: {downloaded_count} downloaded, {nas_cached_count} already on NAS "

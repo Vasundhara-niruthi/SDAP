@@ -138,6 +138,7 @@ class LayerStackCreate(BaseModel):
     selected_files_by_band: Optional[Dict[str, List[str]]] = Field(None, description="Mapping of band name to specific file paths to stack")
     force_recreate: Optional[bool] = Field(False, description="Force re-generation even if an exact matching file exists on NAS")
     request_id: Optional[int] = Field(None, description="Associated request ID")
+    composite_interval: Optional[str] = Field(None, description="Composite interval ('fortnightly', 'weekly', 'monthly', 'none')")
 
 
 class LayerStackTaskResponse(BaseModel):
