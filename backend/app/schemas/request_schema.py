@@ -86,6 +86,8 @@ class RequestEstimateResponse(BaseModel):
     scene_size_gb: float
     estimated_total_gb: float
     estimated_scene_count: int
+    estimated_duration_mins: Optional[int] = None
+    estimated_duration_text: Optional[str] = None
     will_require_approval: bool  # True if > 20% of max storage
     will_be_rejected: bool       # True if exceeds max storage
     approval_threshold_gb: float

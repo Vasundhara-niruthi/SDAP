@@ -558,9 +558,15 @@ def perform_gap_check(
     # Cloud cover threshold filtering (SRS requirement: only download scenes <= max_cloud_cover)
     all_aws_scenes = []
     skipped_high_cloud_scenes = []
+    seen_aws_ids = set()
     for sc in raw_aws_scenes:
+        s_id = sc.get("scene_id")
+        if s_id and s_id in seen_aws_ids:
+            continue
         cld = sc.get("cloud_cover", 0.0)
         if cld <= max_cloud_cover:
+            if s_id:
+                seen_aws_ids.add(s_id)
             all_aws_scenes.append(sc)
         else:
             skipped_high_cloud_scenes.append(sc)

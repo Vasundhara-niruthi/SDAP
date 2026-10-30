@@ -21,6 +21,8 @@ export default defineConfig({
         target: 'http://127.0.0.1:8000',
         changeOrigin: true,
         secure: false,
+        timeout: 600000,       // 10-minute proxy timeout for multi-gigabyte GeoTIFF downloads
+        proxyTimeout: 600000
       }
     }
   }

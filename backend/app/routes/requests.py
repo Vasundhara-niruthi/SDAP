@@ -161,6 +161,46 @@ def estimate_request_storage(req: RequestCreate, db: Session = None) -> dict:
     else:
         status_hint = "ACCEPTED"
 
+    # Calculate realistic pipeline execution duration in minutes
+    import math
+    step1_mins = max(2, round(1.5 + (tile_count * 0.3) + (months * 0.4)))
+    if is_s1 and is_s2:
+        step2_mins = max(5, round((scene_count * 0.4 * 4.0) + (scene_count * 0.6 * 1.8)))
+    elif is_s1:
+        step2_mins = max(5, round(scene_count * 4.0))
+    else:
+        step2_mins = max(5, round(scene_count * 1.8))
+
+    num_indices = len(getattr(req, "indices", []) or []) or 2
+    if is_s1 and not is_s2:
+        step3_mins = round(scene_count * 4.8)
+    elif is_s1 and is_s2:
+        step3_mins = round((scene_count * 0.4 * 4.8) + (scene_count * 0.6 * 0.85 * (num_indices / 2.0)))
+    else:
+        step3_mins = round(scene_count * 0.85 * (num_indices / 2.0))
+
+    comp_interval = (getattr(req, "composite_interval", "monthly") or "monthly").lower()
+    if comp_interval == "weekly":
+        comp_windows = max(1, math.ceil(days / 7))
+    elif comp_interval == "fortnightly":
+        comp_windows = max(1, math.ceil(days / 15))
+    elif comp_interval == "monthly":
+        comp_windows = max(1, math.ceil(days / 30))
+    else:
+        comp_windows = 0
+    step4_mins = round(comp_windows * max(1, num_indices) * 3.2) if comp_windows else 0
+
+    total_duration_mins = step1_mins + step2_mins + step3_mins + step4_mins
+    if total_duration_mins < 60:
+        duration_text = f"~{total_duration_mins} mins"
+    else:
+        hrs = total_duration_mins // 60
+        rem = total_duration_mins % 60
+        if rem == 0:
+            duration_text = f"~{hrs} hrs ({total_duration_mins} mins)"
+        else:
+            duration_text = f"~{hrs} hrs {rem} mins ({total_duration_mins} mins)"
+
     return {
         "tile_count": tile_count,
         "acquisitions_per_month": acquisitions_per_month,
@@ -168,6 +208,8 @@ def estimate_request_storage(req: RequestCreate, db: Session = None) -> dict:
         "date_span_days": days,
         "estimated_total_gb": total_gb,
         "estimated_scene_count": scene_count,
+        "estimated_duration_mins": total_duration_mins,
+        "estimated_duration_text": duration_text,
         "will_require_approval": will_require_approval,
         "will_be_rejected": will_be_rejected,
         "approval_threshold_gb": APPROVAL_THRESHOLD_GB,

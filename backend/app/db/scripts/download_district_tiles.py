@@ -34,6 +34,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from sqlalchemy import text
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from app.core.config import settings
 from app.core.database import SessionLocal
@@ -144,6 +145,33 @@ def _scene_attr(sc, name: str, default=""):
     else:
         val = default
     return default if val is None else val
+
+
+
+def _get_or_create_scene(session, sc_dict):
+    """
+    Atomically creates or retrieves a SceneModel row.
+    Uses PostgreSQL ON CONFLICT (scene_id) DO NOTHING to prevent race conditions
+    between concurrent prefetch threads and the main acquisition loop.
+    """
+    s_id = sc_dict["scene_id"]
+    try:
+        stmt = pg_insert(SceneModel).values(
+            scene_id=s_id,
+            tile=sc_dict.get("tile", "S1_SAR"),
+            sensing_date=sc_dict.get("sensing_date"),
+            satellite=sc_dict.get("satellite"),
+            folder=sc_dict.get("folder"),
+            prefix=sc_dict.get("prefix"),
+            status="PENDING"
+        ).on_conflict_do_nothing(index_elements=["scene_id"])
+        session.execute(stmt)
+        session.commit()
+    except Exception as ex:
+        session.rollback()
+        logger.debug(f"Handled concurrent scene insert for '{s_id}': {ex}")
+
+    return session.query(SceneModel).filter(SceneModel.scene_id == s_id).first()
 
 
 def _is_s1(sc, fallback_satellite: str = "") -> bool:
@@ -512,7 +540,14 @@ def run_district_acquisition_pipeline(
             return False
 
         tiles = gap_res["tiles"]
-        missing_scenes = gap_res["missing_scenes"]
+        raw_missing = gap_res.get("missing_scenes", [])
+        seen_sids = set()
+        missing_scenes = []
+        for sc in raw_missing:
+            sid = sc.get("scene_id")
+            if sid and sid not in seen_sids:
+                seen_sids.add(sid)
+                missing_scenes.append(sc)
         avail_count = gap_res.get("total_available_scenes", 0)
         held_count = gap_res.get("held_scenes_count", 0)
 
@@ -614,6 +649,10 @@ def run_district_acquisition_pipeline(
                     _update_job(db, dl_job, "FAILED", error_log=nas_err_msg)
                     return False
 
+        # Pre-seed SceneModel records atomically so background workers find existing rows
+        for sc in missing_scenes:
+            _get_or_create_scene(db, sc)
+
         downloaded_count = 0       # actually fetched from S3 in this run
         nas_cached_count = 0       # found valid on NAS, download skipped
         failed_count = 0
@@ -631,19 +670,7 @@ def run_district_acquisition_pipeline(
             th_db = SessionLocal()
             try:
                 s_id_bg = sc_item["scene_id"]
-                th_scene = th_db.query(SceneModel).filter(SceneModel.scene_id == s_id_bg).first()
-                if not th_scene:
-                    th_scene = SceneModel(
-                        scene_id=s_id_bg,
-                        tile=sc_item["tile"],
-                        sensing_date=sc_item["sensing_date"],
-                        satellite=sc_item["satellite"],
-                        folder=sc_item["folder"],
-                        prefix=sc_item["prefix"],
-                        status="PENDING"
-                    )
-                    th_db.add(th_scene)
-                    th_db.commit()
+                th_scene = _get_or_create_scene(th_db, sc_item)
 
                 ok_res, b_det, dl_txt = download_and_verify_scene(
                     th_db,
@@ -699,19 +726,7 @@ def run_district_acquisition_pipeline(
                 sc_tile = sc.get("tile", "")
 
                 # Create or retrieve SceneModel record (SRS M4 - archive record)
-                scene_obj = db.query(SceneModel).filter(SceneModel.scene_id == s_id).first()
-                if not scene_obj:
-                    scene_obj = SceneModel(
-                        scene_id=s_id,
-                        tile=sc["tile"],
-                        sensing_date=sc["sensing_date"],
-                        satellite=sc["satellite"],
-                        folder=sc["folder"],
-                        prefix=sc["prefix"],
-                        status="PENDING"
-                    )
-                    db.add(scene_obj)
-                    db.commit()
+                scene_obj = _get_or_create_scene(db, sc)
 
                 dl_msg = f"  [{idx}/{len(missing_scenes)} - {pct}%] Processing '{sc['folder']}' (Tile {sc_tile}, Date {sc['sensing_date']})..."
                 logger.info(dl_msg)

@@ -68,9 +68,11 @@ def ensure_mapping_table_exists(engine):
                 district_id INTEGER NOT NULL,
                 district_uid VARCHAR(50),
                 district_name VARCHAR(100),
+                state_name VARCHAR(100),
                 tile_id VARCHAR(50) NOT NULL,
                 created_at TIMESTAMP WITHOUT TIME ZONE DEFAULT NOW()
             );
+            ALTER TABLE district_tiles_mapping ADD COLUMN IF NOT EXISTS state_name VARCHAR(100);
             CREATE UNIQUE INDEX IF NOT EXISTS uq_district_tile ON district_tiles_mapping(district_id, tile_id);
             CREATE INDEX IF NOT EXISTS idx_dtm_district_id ON district_tiles_mapping(district_id);
             CREATE INDEX IF NOT EXISTS idx_dtm_tile_id ON district_tiles_mapping(tile_id);
@@ -184,6 +186,7 @@ def map_districts_to_tiles():
                         "district_id": d_id,
                         "district_uid": d_uid,
                         "district_name": d_name,
+                        "state_name": d.get("state_name", ""),
                         "tile_id": t_name
                     })
 
@@ -200,8 +203,8 @@ def map_districts_to_tiles():
             batch = mappings[i:i+batch_size]
             conn.execute(
                 text("""
-                    INSERT INTO district_tiles_mapping (district_id, district_uid, district_name, tile_id)
-                    VALUES (:district_id, :district_uid, :district_name, :tile_id)
+                    INSERT INTO district_tiles_mapping (district_id, district_uid, district_name, state_name, tile_id)
+                    VALUES (:district_id, :district_uid, :district_name, :state_name, :tile_id)
                     ON CONFLICT (district_id, tile_id) DO NOTHING;
                 """),
                 batch

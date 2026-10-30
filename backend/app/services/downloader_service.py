@@ -18,9 +18,10 @@ import rasterio
 from botocore import UNSIGNED
 from botocore.config import Config  # type: ignore
 from sqlalchemy.orm import Session
-from sqlalchemy import text
+from sqlalchemy import text, or_, and_
 
 from app.core.config import settings
+from app.services.sentinel1_processor_service import win_safe_path
 from app.models.sdap_models import (
     RequestModel,
     ProcessJobModel,
@@ -1671,6 +1672,20 @@ def download_and_verify_scene(
     return True, band_details, log_msg
 
 
+def strip_win_extended_prefix(p: str) -> str:
+    """Strips Windows extended length prefixes (\\\\?\\ or \\\\?\\UNC\\) to restore standard UNC or absolute paths."""
+    if not p:
+        return p
+    norm = os.path.normpath(p)
+    if norm.startswith("\\\\?\\UNC\\"):
+        return "\\\\" + norm[8:]
+    if norm.startswith("\\\\?\\"):
+        return norm[4:]
+    if norm.startswith("UNC\\"):
+        return "\\\\" + norm[4:]
+    return norm
+
+
 def resolve_tif_path(raw_path: str) -> tuple:
     """
     Checks if a stored DB raster path exists on disk, resolving relative paths
@@ -1678,28 +1693,33 @@ def resolve_tif_path(raw_path: str) -> tuple:
     """
     if not raw_path:
         return raw_path, False
-    from app.services.sentinel1_processor_service import win_safe_path
-    safe_raw = win_safe_path(raw_path)
-    if os.path.exists(safe_raw) or os.path.exists(raw_path):
-        return os.path.abspath(raw_path), True
+    clean_p = strip_win_extended_prefix(raw_path)
+    ensure_nas_connection(clean_p)
+    safe_raw = win_safe_path(clean_p)
+    if os.path.exists(safe_raw) or os.path.exists(clean_p):
+        return clean_p, True
     backend_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-    alt_path = os.path.join(backend_root, raw_path)
-    if os.path.exists(alt_path):
-        return os.path.abspath(alt_path), True
-    norm_p = os.path.normpath(raw_path)
-    if os.path.exists(norm_p):
-        return os.path.abspath(norm_p), True
+    alt_path = os.path.join(backend_root, clean_p)
+    safe_alt = win_safe_path(alt_path)
+    if os.path.exists(safe_alt) or os.path.exists(alt_path):
+        return alt_path, True
+    norm_p = os.path.normpath(clean_p)
+    safe_norm = win_safe_path(norm_p)
+    if os.path.exists(safe_norm) or os.path.exists(norm_p):
+        return norm_p, True
     if hasattr(settings, "RAW_ARCHIVE_DIR") and settings.RAW_ARCHIVE_DIR:
-        parts = os.path.normpath(raw_path).split(os.sep)
+        parts = os.path.normpath(clean_p).split(os.sep)
         if "archive" in parts:
             rel = os.sep.join(parts[parts.index("archive") + 1:])
             nas_cand = os.path.join(settings.RAW_ARCHIVE_DIR, rel)
-            if os.path.exists(nas_cand):
-                return os.path.abspath(nas_cand), True
-        nas_cand2 = os.path.join(settings.RAW_ARCHIVE_DIR, os.path.basename(raw_path))
-        if os.path.exists(nas_cand2):
-            return os.path.abspath(nas_cand2), True
-    return os.path.abspath(raw_path) if not os.path.isabs(raw_path) else raw_path, False
+            safe_cand = win_safe_path(nas_cand)
+            if os.path.exists(safe_cand) or os.path.exists(nas_cand):
+                return nas_cand, True
+        nas_cand2 = os.path.join(settings.RAW_ARCHIVE_DIR, os.path.basename(clean_p))
+        safe_cand2 = win_safe_path(nas_cand2)
+        if os.path.exists(safe_cand2) or os.path.exists(nas_cand2):
+            return nas_cand2, True
+    return clean_p, False
 
 
 def get_downloaded_tifs_for_request(db: Session, request_id: int) -> dict:
@@ -2072,87 +2092,114 @@ def get_downloaded_tifs_for_request(db: Session, request_id: int) -> dict:
                             db.rollback()
 
     req_interval = (req.composite_interval or "none").lower().strip()
-    if req_interval in ("fortnightly", "weekly", "monthly"):
-        district_name = req.district or req.state or "Region"
-        clean_d = district_name.strip()
-        year_str = req.start_date.strftime("%Y") if req.start_date else "2026"
-        specific_dirs = [
-            os.path.join(settings.RAW_ARCHIVE_DIR, "Composites", clean_d, year_str, req_interval),
-            os.path.join(settings.RAW_ARCHIVE_DIR, "Composites", clean_d.capitalize(), year_str, req_interval),
-            os.path.join(settings.RAW_ARCHIVE_DIR, "Composites", clean_d, req_interval),
-        ]
-        composite_tifs = []
-        comp_seen = set()
+    district_name = req.district or req.state or "Region"
+    clean_d = district_name.strip()
+    year_str = req.start_date.strftime("%Y") if req.start_date else "2026"
+    specific_dirs = [
+        os.path.join(settings.RAW_ARCHIVE_DIR, "Composites", clean_d, year_str, req_interval),
+        os.path.join(settings.RAW_ARCHIVE_DIR, "Composites", clean_d.replace(" ", "_"), year_str, req_interval),
+        os.path.join(settings.RAW_ARCHIVE_DIR, "Composites", clean_d.capitalize(), year_str, req_interval),
+        os.path.join(settings.RAW_ARCHIVE_DIR, "Composites", clean_d, req_interval),
+        os.path.join(settings.RAW_ARCHIVE_DIR, "Composites", clean_d),
+        os.path.join(settings.RAW_ARCHIVE_DIR, "Composites", clean_d.replace(" ", "_")),
+        os.path.join(settings.RAW_ARCHIVE_DIR, "delivery", f"request_{request_id}", "composites"),
+        os.path.join(settings.DELIVERY_DIR, f"request_{request_id}", "composites"),
+        os.path.join(settings.BASE_DATA_DIR, "delivery", f"request_{request_id}", "composites"),
+    ]
+    composite_tifs = []
+    comp_seen = set()
 
-        def _scan_composite_dir(target_dir: str):
-            if not os.path.isdir(target_dir):
-                return
-            try:
-                for entry in os.scandir(target_dir):
-                    if entry.is_file() and entry.name.lower().endswith((".tif", ".tiff")):
-                        fn = entry.name
-                        if fn in comp_seen:
-                            continue
+    req_sat_upper = (req.satellite or "").upper()
+    is_pure_s1_req = ("SENTINEL-1" in req_sat_upper and "SENTINEL-2" not in req_sat_upper)
+    is_pure_s2_req = ("SENTINEL-2" in req_sat_upper and "SENTINEL-1" not in req_sat_upper)
+
+    def _scan_composite_dir(target_dir: str):
+        if not os.path.isdir(target_dir):
+            return
+        try:
+            for entry in os.scandir(target_dir):
+                if entry.is_file() and entry.name.lower().endswith((".tif", ".tiff")):
+                    fn = entry.name
+                    if fn.lower() in comp_seen:
+                        continue
+                    if req_interval in ("fortnightly", "weekly", "monthly"):
                         if req_interval not in target_dir.lower() and req_interval not in fn.lower():
                             continue
-                        comp_seen.add(fn)
-                        full_cp = entry.path
-                        try:
-                            sz = entry.stat().st_size
-                        except Exception:
-                            sz = 0
-                        fn_u = fn.upper()
-                        if "VV_VH" in fn_u:
-                            b_type = "VV_VH"
-                        elif "_VV_" in fn_u or fn_u.startswith("COMPOSITE_VV_"):
-                            b_type = "VV"
-                        elif "_VH_" in fn_u or fn_u.startswith("COMPOSITE_VH_"):
-                            b_type = "VH"
-                        elif "LSWI" in fn_u:
-                            b_type = "LSWI"
-                        elif "NDVI" in fn_u:
-                            b_type = "NDVI"
-                        else:
-                            b_type = "INDEX"
+                    
+                    fn_u = fn.upper()
+                    is_s1_comp = any(s in fn_u for s in ("_VV_", "_VH_", "_VV_VH_", "COMPOSITE_VV_", "COMPOSITE_VH_", "-VV-", "-VH-"))
+                    is_s2_comp = any(s in fn_u for s in ("_NDVI_", "_LSWI_", "COMPOSITE_NDVI_", "COMPOSITE_LSWI_", "_B0", "_B1", "_SCL_", "_TCI_"))
 
-                        m_dt = re.search(r"(\d{8})_(\d{8})", fn)
-                        dt_val = f"{m_dt.group(1)}_{m_dt.group(2)}" if m_dt else start_str
+                    # Strict satellite partitioning
+                    if is_pure_s1_req and not is_s1_comp:
+                        continue
+                    if is_pure_s2_req and not is_s2_comp:
+                        continue
 
-                        composite_tifs.append({
-                            "scene_id": f"Composite_{req_interval}_{dt_val}",
-                            "tile": clean_d,
-                            "sensing_date": dt_val,
-                            "satellite": req.satellite or "Composite",
-                            "band": b_type,
-                            "filename": fn,
-                            "path": full_cp,
-                            "is_calibrated": True,
-                            "is_composite": True,
-                            "size_bytes": sz,
-                            "exists_on_disk": True
-                        })
-            except Exception as e_scan:
-                logger.warning(f"Error scanning composite directory {target_dir}: {e_scan}")
+                    comp_seen.add(fn.lower())
+                    full_cp = os.path.normpath(entry.path)
+                    try:
+                        sz = entry.stat().st_size
+                    except Exception:
+                        sz = 0
 
-        # Scan specific interval directories first for instant <10ms lookup
-        for sdir in specific_dirs:
-            _scan_composite_dir(sdir)
+                    if "VV_VH" in fn_u:
+                        b_type = "VV_VH"
+                    elif "_VV_" in fn_u or fn_u.startswith("COMPOSITE_VV_"):
+                        b_type = "VV"
+                    elif "_VH_" in fn_u or fn_u.startswith("COMPOSITE_VH_"):
+                        b_type = "VH"
+                    elif "LSWI" in fn_u:
+                        b_type = "LSWI"
+                    elif "NDVI" in fn_u:
+                        b_type = "NDVI"
+                    else:
+                        b_type = "COMPOSITE"
 
-        # Only if specific subdirectories had no composite files, do a shallow scan of parent Composites/clean_d
-        if not composite_tifs:
-            parent_d = os.path.join(settings.RAW_ARCHIVE_DIR, "Composites", clean_d)
-            if os.path.isdir(parent_d):
-                try:
-                    for entry in os.scandir(parent_d):
-                        if entry.is_dir() and "stack" not in entry.name.lower():
-                            _scan_composite_dir(entry.path)
-                except Exception:
-                    pass
+                    m_dt = re.search(r"(\d{8})_(\d{8})", fn)
+                    dt_val = f"{m_dt.group(1)}_{m_dt.group(2)}" if m_dt else start_str
+                    comp_sat = "Sentinel-1" if is_s1_comp else ("Sentinel-2" if is_s2_comp else (req.satellite or "Composite Deliverable"))
 
-        if composite_tifs:
-            tif_files = composite_tifs
-            tif_paths = [ct["path"] for ct in composite_tifs]
-            total_size = sum(ct["size_bytes"] for ct in composite_tifs)
+                    composite_tifs.append({
+                        "scene_id": f"Composite_{req_interval}_{dt_val}",
+                        "tile": clean_d,
+                        "sensing_date": dt_val,
+                        "satellite": comp_sat,
+                        "band": b_type,
+                        "filename": fn,
+                        "path": full_cp,
+                        "is_calibrated": True,
+                        "is_composite": True,
+                        "size_bytes": sz,
+                        "exists_on_disk": True
+                    })
+        except Exception as e_scan:
+            logger.warning(f"Error scanning composite directory {target_dir}: {e_scan}")
+
+    # Scan specific interval directories first for instant <10ms lookup
+    for sdir in specific_dirs:
+        _scan_composite_dir(sdir)
+
+    # Only if specific subdirectories had no composite files, do a shallow scan of parent Composites/clean_d
+    if not composite_tifs:
+        parent_d = os.path.join(settings.RAW_ARCHIVE_DIR, "Composites", clean_d)
+        if os.path.isdir(parent_d):
+            try:
+                for entry in os.scandir(parent_d):
+                    if entry.is_dir() and "stack" not in entry.name.lower():
+                        _scan_composite_dir(entry.path)
+            except Exception:
+                pass
+
+    if composite_tifs:
+        seen_existing_paths = set(os.path.normpath(p).lower() for p in tif_paths)
+        for ct in composite_tifs:
+            np = os.path.normpath(ct["path"]).lower()
+            if np not in seen_existing_paths:
+                tif_files.append(ct)
+                tif_paths.append(ct["path"])
+                seen_existing_paths.add(np)
+                total_size += ct["size_bytes"]
 
     return {
         "request_id": req.id,
@@ -2162,12 +2209,15 @@ def get_downloaded_tifs_for_request(db: Session, request_id: int) -> dict:
         "satellite": req.satellite,
         "start_date": start_str,
         "end_date": end_str,
+        "composite_interval": req.composite_interval,
         "status": req.status,
         "total_scenes": len(matched_scene_ids),
+        "total_composites": len(composite_tifs),
         "total_tifs": len(tif_files),
         "total_size_bytes": total_size,
         "total_size_mb": round(total_size / (1024 * 1024), 2),
         "tif_paths": tif_paths,
+        "composites": composite_tifs,
         "tifs": tif_files
     }
 
@@ -2480,8 +2530,26 @@ def search_downloaded_tifs_by_region(
     band: Optional[str] = None,
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
-    composite_interval: Optional[str] = None
+    composite_interval: Optional[str] = None,
+    request_id: Optional[int] = None
 ) -> dict:
+    if request_id:
+        req_obj = db.query(RequestModel).filter(RequestModel.id == request_id).first()
+        if req_obj:
+            if not state:
+                state = req_obj.state
+            if not district:
+                district = req_obj.district
+            if not satellite:
+                satellite = req_obj.satellite
+            if (not composite_interval or composite_interval.upper() == "ALL") and req_obj.composite_interval and req_obj.composite_interval != "none":
+                composite_interval = req_obj.composite_interval
+            if not start_date and req_obj.start_date:
+                start_date = req_obj.start_date.strftime("%Y-%m-%d")
+            if not end_date and req_obj.end_date:
+                end_date = req_obj.end_date.strftime("%Y-%m-%d")
+    from sqlalchemy import or_, and_, func
+
     def _clean_str(val):
         if not val or not isinstance(val, str):
             return None
@@ -2573,11 +2641,59 @@ def search_downloaded_tifs_by_region(
             "tifs": []
         }
 
+    tif_files = []
+    tif_paths = []
+    total_size = 0
+    matched_scenes = []
+
+    # 2. Determine whether this is a pure composite retrieval or raw scene retrieval
+    composite_tokens = {
+        "COMPOSITE", "COMPOSITES",
+        "VV_COMPOSITE", "COMPOSITE_VV",
+        "VH_COMPOSITE", "COMPOSITE_VH",
+        "VV_VH_COMPOSITE", "COMPOSITE_VV_VH",
+        "NDVI_COMPOSITE", "COMPOSITE_NDVI",
+        "LSWI_COMPOSITE", "COMPOSITE_LSWI"
+    }
+
+    raw_band_list = [
+        b.strip().replace(".tif", "").replace(".tiff", "")
+        for b in (band or "").split(",")
+        if b.strip() and b.strip().upper() != "ALL"
+    ]
+
+    clean_band_tokens = [
+        b.upper().replace(" ", "_").replace("-", "_")
+        for b in raw_band_list
+    ]
+
+    has_explicit_composite = any(
+        cb in composite_tokens or "COMPOSITE" in cb
+        for cb in clean_band_tokens
+    )
+    has_explicit_raw_scene = any(
+        cb not in composite_tokens and "COMPOSITE" not in cb
+        for cb in clean_band_tokens
+    )
+
+    is_s1_request = bool((satellite and "Sentinel-1" in satellite) or any("VV" in b.upper() or "VH" in b.upper() for b in raw_band_list))
+
+    if has_explicit_composite and not has_explicit_raw_scene:
+        # User explicitly requested ONLY composite deliverables
+        skip_raw_scenes = True
+    elif clean_interval in ("weekly", "fortnightly", "monthly") and not has_explicit_raw_scene and raw_band_list:
+        skip_raw_scenes = True
+    elif clean_interval in ("weekly", "fortnightly", "monthly") and not raw_band_list:
+        # Specific composite interval requested with all bands
+        skip_raw_scenes = True
+    else:
+        skip_raw_scenes = False
+
     # Filter scenes strictly to those requested/downloaded for the specified district/state
     # This prevents neighboring districts that share the same 100km MGRS tile from displaying
     # or downloading data when no acquisition request has been submitted for this district.
     allowed_scene_ids = None
-    if district or state:
+    if (district or state) and not skip_raw_scenes:
         from app.models.sdap_models import ProcessJobModel, RequestModel
         from sqlalchemy import func
 
@@ -2641,48 +2757,12 @@ def search_downloaded_tifs_by_region(
             except Exception as e:
                 logger.warning(f"Could not search S1 candidates by region: {e}")
 
-        # If user explicitly filtered by district or state, but no scenes were acquired for it:
-        if len(allowed_scene_ids) == 0:
-            return {
-                "query_state": state,
-                "query_district": district,
-                "query_satellite": satellite,
-                "query_band": band,
-                "query_composite_interval": composite_interval,
-                "query_start_date": start_date,
-                "query_end_date": end_date,
-                "matched_tiles": [],
-                "matched_districts": [district] if district else (resolved_districts or []),
-                "total_scenes": 0,
-                "total_tifs": 0,
-                "total_size_bytes": 0,
-                "total_size_mb": 0.0,
-                "tif_paths": [],
-                "tifs": []
-            }
-
     # Support Sentinel-1 tile alias if tile filter was generated from region
     if tiles and (not satellite or "Sentinel-1" in satellite):
         tiles.append("S1_SAR")
 
-    tif_files = []
-    tif_paths = []
-    total_size = 0
-    matched_scenes = []
-
-    # 2. Build Scene Query for individual scenes
-    is_s1_request = bool((satellite and "Sentinel-1" in satellite) or (band and ("ORB" in band.upper() or "VV" in band.upper() or "VH" in band.upper())))
-    has_explicit_scene_band = bool(band and any(
-        b.upper() not in ("ALL", "COMPOSITE", "COMPOSITES")
-        for b in band.split(",")
-    ))
-
-    # Never skip individual scene queries for Sentinel-1 or when user requested specific scene bands
-    if is_s1_request or has_explicit_scene_band:
-        skip_raw_scenes = False
-    else:
-        skip_raw_scenes = clean_interval in ("weekly", "fortnightly", "monthly")
-    if not skip_raw_scenes:
+    # 3. Query SceneModel and BandFileModel for individual raw scenes
+    if not skip_raw_scenes and (allowed_scene_ids is None or len(allowed_scene_ids) > 0):
         scene_query = db.query(SceneModel).filter(SceneModel.status == "HELD")
         if tiles:
             scene_query = scene_query.filter(SceneModel.tile.in_(tiles))
@@ -2696,7 +2776,6 @@ def search_downloaded_tifs_by_region(
             if len(sat_parts) == 1:
                 scene_query = scene_query.filter(SceneModel.satellite.ilike(f"%{sat_parts[0]}%"))
             elif len(sat_parts) > 1:
-                from sqlalchemy import or_
                 or_clauses = [SceneModel.satellite.ilike(f"%{sp}%") for sp in sat_parts]
                 scene_query = scene_query.filter(or_(*or_clauses))
 
@@ -2748,7 +2827,6 @@ def search_downloaded_tifs_by_region(
                     if b.strip() and b.strip().upper() != "ALL"
                 ]
                 if band_tokens:
-                    from sqlalchemy import or_, and_
                     user_wants_vv_vh = any("VV_VH" in bt.upper() or "VV/VH" in bt.upper() or "SAR_RATIO" in bt.upper() or "VV-VH" in bt.upper() for bt in band_tokens)
                     conditions = []
                     for b_token in band_tokens:
@@ -2874,105 +2952,189 @@ def search_downloaded_tifs_by_region(
             if b.strip() and b.strip().upper() != "ALL"
         ] if band and band.upper() != "ALL" else []
         search_dirs = []
-        if district and district.strip():
-            search_dirs.append(os.path.join(settings.RAW_ARCHIVE_DIR, "Composites", district.strip()))
-        search_dirs.append(os.path.join(settings.RAW_ARCHIVE_DIR, "Composites"))
+        clean_d = (district or "").split(",")[0].strip() if district else ""
+        if clean_d:
+            search_dirs.extend([
+                os.path.join(settings.RAW_ARCHIVE_DIR, "Composites", clean_d),
+                os.path.join(settings.RAW_ARCHIVE_DIR, "Composites", clean_d.replace(" ", "_")),
+                os.path.join(settings.RAW_ARCHIVE_DIR, "Composites", clean_d.replace("_", " ")),
+                os.path.join(settings.RAW_ARCHIVE_DIR, "Composites", clean_d.title()),
+                os.path.join(settings.RAW_ARCHIVE_DIR, "Composites", clean_d.capitalize()),
+            ])
+            # Direct year/interval targeting if dates provided
+            candidate_years = set()
+            for dt_param in (start_date, end_date):
+                if dt_param:
+                    try:
+                        y = dt_param.split("-")[0].strip()
+                        if len(y) == 4:
+                            candidate_years.add(y)
+                    except Exception:
+                        pass
+            if not candidate_years:
+                candidate_years.add("2026")
+            for cy in candidate_years:
+                for base_d in [clean_d, clean_d.replace(" ", "_")]:
+                    search_dirs.append(os.path.join(settings.RAW_ARCHIVE_DIR, "Composites", base_d, cy))
+                    if clean_interval and clean_interval in ("weekly", "fortnightly", "monthly"):
+                        search_dirs.append(os.path.join(settings.RAW_ARCHIVE_DIR, "Composites", base_d, cy, clean_interval))
+            if request_id:
+                search_dirs.extend([
+                    os.path.join(settings.RAW_ARCHIVE_DIR, "delivery", f"request_{request_id}", "composites"),
+                    os.path.join(settings.DELIVERY_DIR, f"request_{request_id}", "composites"),
+                    os.path.join(settings.BASE_DATA_DIR, "delivery", f"request_{request_id}", "composites"),
+                ])
+        else:
+            search_dirs.extend([
+                os.path.join(settings.RAW_ARCHIVE_DIR, "Composites"),
+                os.path.join(settings.BASE_DATA_DIR, "Composites"),
+            ])
 
-        dist_clean = (district or "").strip().lower()
+        dist_clean = clean_d.lower()
+        dist_variants = [dist_clean, dist_clean.replace(" ", "_"), dist_clean.replace("_", " ")] if dist_clean else []
         seen_paths = set(tif_paths)
         seen_filenames = set(os.path.basename(p).lower() for p in tif_paths)
 
+        sat_req_upper = (satellite or "").strip().upper()
+        is_pure_s1_sat = ("SENTINEL-1" in sat_req_upper and "SENTINEL-2" not in sat_req_upper)
+        is_pure_s2_sat = ("SENTINEL-2" in sat_req_upper and "SENTINEL-1" not in sat_req_upper)
+
+        seen_safe_dirs = set()
         for s_dir in search_dirs:
-            if not s_dir or not os.path.exists(s_dir):
+            if not s_dir:
                 continue
-            for root, _, files in os.walk(s_dir):
-                for f in files:
-                    if not (f.lower().endswith(".tif") or f.lower().endswith(".tiff")):
-                        continue
-                    if f.lower() in seen_filenames:
-                        continue
-                    full_p = os.path.normpath(os.path.join(root, f))
-                    if full_p in seen_paths:
-                        continue
-
-                    full_p_lower = full_p.lower()
-                    if dist_clean and dist_clean not in full_p_lower:
-                        continue
-
-                    # Filter by composite interval if specified (weekly, fortnightly, monthly)
-                    if clean_interval and clean_interval in ("weekly", "fortnightly", "monthly"):
-                        if clean_interval not in full_p_lower:
+            ensure_nas_connection(s_dir)
+            safe_sdir = win_safe_path(s_dir)
+            if safe_sdir.lower() in seen_safe_dirs:
+                continue
+            seen_safe_dirs.add(safe_sdir.lower())
+            if not os.path.exists(safe_sdir):
+                continue
+            try:
+                for root, dirs, files in os.walk(safe_sdir):
+                    dirs[:] = [d for d in dirs if not d.startswith(".") and not d.startswith("_temp")]
+                    for f in files:
+                        if not (f.lower().endswith(".tif") or f.lower().endswith(".tiff")):
+                            continue
+                        if f.lower() in seen_filenames:
+                            continue
+                        full_p = os.path.normpath(os.path.join(root, f))
+                        clean_full_p = strip_win_extended_prefix(full_p)
+                        if clean_full_p.lower() in seen_paths or full_p.lower() in seen_paths:
                             continue
 
-                    f_upper = f.upper()
-                    if band_tokens_comp:
-                        matched_token = False
-                        user_wants_vv_vh_comp = any("VV_VH" in b or "VV/VH" in b or "SAR_RATIO" in b or "VV-VH" in b for b in band_tokens_comp)
-                        for b_tok in band_tokens_comp:
-                            if b_tok in ("COMPOSITE", "COMPOSITES"):
-                                if "COMPOSITE" in f_upper or "CLIPPED" in f_upper:
-                                    matched_token = True
-                                    break
-                            elif "VV_VH" in b_tok or b_tok in ("VV_VH", "VV/VH", "SAR_RATIO"):
-                                if "VV_VH" in f_upper or "VV/VH" in f_upper or "VV-VH" in f_upper:
-                                    matched_token = True
-                                    break
-                            elif "VV_ORB" in b_tok:
-                                if "VV_ORB" in f_upper or ("VV" in f_upper and "VH" not in f_upper):
-                                    matched_token = True
-                                    break
-                            elif "VH_ORB" in b_tok:
-                                if "VH_ORB" in f_upper or ("VH" in f_upper and "VV_VH" not in f_upper and "VV/VH" not in f_upper):
-                                    matched_token = True
-                                    break
-                            elif b_tok in ("VV", "VH"):
-                                # Ensure this composite file is strictly VV or VH, NOT VV_VH
-                                is_ratio = ("VV_VH" in f_upper or "VV/VH" in f_upper or "VV-VH" in f_upper)
-                                if not is_ratio:
-                                    if f"_{b_tok}." in f_upper or f"_{b_tok}_" in f_upper or f"-{b_tok}." in f_upper:
+                        full_p_lower = full_p.lower()
+                        if dist_variants and not any(v in full_p_lower for v in dist_variants):
+                            continue
+
+                        # Filter by composite interval if specified (weekly, fortnightly, monthly)
+                        if clean_interval and clean_interval in ("weekly", "fortnightly", "monthly"):
+                            if clean_interval not in full_p_lower:
+                                continue
+
+                        f_upper = f.upper()
+                        is_s1_comp = any(s in f_upper for s in ("_VV_", "_VH_", "_VV_VH_", "COMPOSITE_VV_", "COMPOSITE_VH_", "-VV-", "-VH-"))
+                        is_s2_comp = any(s in f_upper for s in ("_NDVI_", "_LSWI_", "COMPOSITE_NDVI_", "COMPOSITE_LSWI_", "_B0", "_B1", "_SCL_", "_TCI_"))
+
+                        # Enforce satellite filtering for composites
+                        if is_pure_s1_sat and not is_s1_comp:
+                            continue
+                        if is_pure_s2_sat and not is_s2_comp:
+                            continue
+
+                        if band_tokens_comp:
+                            matched_token = False
+                            user_wants_any_composite = any(b in ("COMPOSITE", "COMPOSITES") for b in band_tokens_comp)
+                            if user_wants_any_composite:
+                                matched_token = True
+                            else:
+                                user_wants_vv_vh_comp = any("VV_VH" in b or "VV/VH" in b or "SAR_RATIO" in b or "VV-VH" in b for b in band_tokens_comp)
+                                for b_tok in band_tokens_comp:
+                                    b_tok_clean = b_tok.replace("COMPOSITE_", "").replace("_COMPOSITE", "")
+                                    if b_tok in ("VV_VH_COMPOSITE", "COMPOSITE_VV_VH", "SAR_RATIO") or "VV_VH" in b_tok or "VV/VH" in b_tok:
+                                        if "VV_VH" in f_upper or "VV/VH" in f_upper or "VV-VH" in f_upper:
+                                            matched_token = True
+                                            break
+                                    elif b_tok in ("VV_COMPOSITE", "COMPOSITE_VV") or b_tok_clean == "VV":
+                                        is_ratio = ("VV_VH" in f_upper or "VV/VH" in f_upper or "VV-VH" in f_upper)
+                                        if not is_ratio and ("_VV_" in f_upper or f_upper.startswith("COMPOSITE_VV_") or "-VV-" in f_upper or "_VV." in f_upper):
+                                            matched_token = True
+                                            break
+                                    elif b_tok in ("VH_COMPOSITE", "COMPOSITE_VH") or b_tok_clean == "VH":
+                                        is_ratio = ("VV_VH" in f_upper or "VV/VH" in f_upper or "VV-VH" in f_upper)
+                                        if not is_ratio and ("_VH_" in f_upper or f_upper.startswith("COMPOSITE_VH_") or "-VH-" in f_upper or "_VH." in f_upper):
+                                            matched_token = True
+                                            break
+                                    elif b_tok in ("NDVI_COMPOSITE", "COMPOSITE_NDVI") or b_tok_clean == "NDVI":
+                                        if "NDVI" in f_upper:
+                                            matched_token = True
+                                            break
+                                    elif b_tok in ("LSWI_COMPOSITE", "COMPOSITE_LSWI") or b_tok_clean == "LSWI":
+                                        if "LSWI" in f_upper:
+                                            matched_token = True
+                                            break
+                                    elif b_tok in f_upper:
+                                        is_ratio = ("VV_VH" in f_upper or "VV/VH" in f_upper or "VV-VH" in f_upper)
+                                        if is_ratio and not user_wants_vv_vh_comp:
+                                            continue
                                         matched_token = True
                                         break
-                            elif b_tok in f_upper:
-                                # If file is a VV_VH ratio but user did not ask for VV_VH, don't match
-                                is_ratio = ("VV_VH" in f_upper or "VV/VH" in f_upper or "VV-VH" in f_upper)
-                                if is_ratio and not user_wants_vv_vh_comp:
-                                    continue
-                                matched_token = True
-                                break
-                        if not matched_token:
-                            continue
+                            if not matched_token:
+                                continue
 
-                    date_match = re.search(r'(\d{8})_(\d{8})', f)
-                    if date_match and (start_date or end_date):
-                        f_start = f"{date_match.group(1)[:4]}-{date_match.group(1)[4:6]}-{date_match.group(1)[6:8]}"
-                        f_end = f"{date_match.group(2)[:4]}-{date_match.group(2)[4:6]}-{date_match.group(2)[6:8]}"
-                        
-                        q_start = (start_date or "1970-01-01").split("T")[0]
-                        q_end = (end_date or "2099-12-31").split("T")[0]
+                        date_match = re.search(r'(\d{8})_(\d{8})', f)
+                        if date_match and (start_date or end_date):
+                            f_start = f"{date_match.group(1)[:4]}-{date_match.group(1)[4:6]}-{date_match.group(1)[6:8]}"
+                            f_end = f"{date_match.group(2)[:4]}-{date_match.group(2)[4:6]}-{date_match.group(2)[6:8]}"
+                            
+                            q_start = (start_date or "1970-01-01").split("T")[0]
+                            q_end = (end_date or "2099-12-31").split("T")[0]
 
-                        if f_start > q_end or f_end < q_start:
-                            continue
+                            if f_start > q_end or f_end < q_start:
+                                continue
 
-                    seen_paths.add(full_p)
-                    seen_filenames.add(f.lower())
-                    actual_size = os.path.getsize(full_p) if os.path.exists(full_p) else 0
-                    total_size += actual_size
+                        seen_paths.add(clean_full_p.lower())
+                        seen_paths.add(full_p.lower())
+                        seen_filenames.add(f.lower())
+                        try:
+                            safe_full_p = win_safe_path(full_p)
+                            actual_size = os.path.getsize(safe_full_p) if os.path.exists(safe_full_p) else 0
+                        except Exception:
+                            actual_size = 0
+                        total_size += actual_size
 
-                    tif_paths.append(full_p)
-                    tif_files.append({
-                        "scene_id": f"Composite_{district or 'Region'}",
-                        "tile": district or "Composite",
-                        "sensing_date": date_match.group(1) if date_match else (start_date or "2026-01-01"),
-                        "satellite": "Composite Deliverable",
-                        "band": f,
-                        "path": full_p,
-                        "size_bytes": actual_size,
-                        "exists_on_disk": True
-                    })
+                        comp_sat = "Sentinel-1" if is_s1_comp else ("Sentinel-2" if is_s2_comp else "Composite Deliverable")
+                        if "VV_VH" in f_upper or "VV/VH" in f_upper:
+                            comp_band = "VV_VH Composite"
+                        elif "_VV_" in f_upper or f_upper.startswith("COMPOSITE_VV_"):
+                            comp_band = "VV Composite"
+                        elif "_VH_" in f_upper or f_upper.startswith("COMPOSITE_VH_"):
+                            comp_band = "VH Composite"
+                        elif "LSWI" in f_upper:
+                            comp_band = "LSWI Composite"
+                        elif "NDVI" in f_upper:
+                            comp_band = "NDVI Composite"
+                        else:
+                            comp_band = "Composite"
+
+                        tif_paths.append(clean_full_p)
+                        tif_files.append({
+                            "scene_id": f"Composite_{clean_interval}_{clean_d or 'Region'}",
+                            "tile": district or "Composite",
+                            "sensing_date": date_match.group(1) if date_match else (start_date or "2026-01-01"),
+                            "satellite": comp_sat,
+                            "band": comp_band,
+                            "filename": f,
+                            "path": clean_full_p,
+                            "size_bytes": actual_size,
+                            "is_composite": True,
+                            "exists_on_disk": True
+                        })
+            except Exception as e_walk:
+                logger.warning(f"Error scanning composite directory {s_dir}: {e_walk}")
 
     # 3.5. Direct NAS storage scan fallback for Sentinel-1 calibrated deliverables
-    if is_s1_request or (satellite and "Sentinel-1" in satellite):
-        from app.services.sentinel1_processor_service import win_safe_path
+    if (is_s1_request or (satellite and "Sentinel-1" in satellite)) and not skip_raw_scenes:
         s1_target_stems = ["VV_Orb_tnr_cal_Tc_db", "VH_Orb_tnr_cal_Tc_db", "VV_VH_Orb_tnr_cal_Tc_db"]
         if band and band.strip().upper() != "ALL":
             b_tokens_upper = [b.upper().replace(".TIFF", "").replace(".TIF", "").strip() for b in band.split(",") if b.strip()]
@@ -3055,7 +3217,7 @@ def search_downloaded_tifs_by_region(
                                 continue
 
                             full_file = os.path.join(root_dir, fn)
-                            norm_f = full_file.replace(r"\\?\\UNC\\", r"\\").replace(r"\\?\\", "")
+                            norm_f = strip_win_extended_prefix(full_file)
                             norm_lower = os.path.normpath(norm_f).lower()
                             if norm_lower in seen_disk_paths:
                                 continue
@@ -3079,20 +3241,36 @@ def search_downloaded_tifs_by_region(
             except Exception as walk_err:
                 logger.warning(f"Error scanning Sentinel-1 path {s1_root}: {walk_err}")
 
-    # If pure Sentinel-1 is requested, return ONLY the 3 calibrated GeoTIFF deliverables
+    # If pure Sentinel-1 is requested, return ONLY the 3 calibrated GeoTIFF deliverables or S1 composites
     is_pure_s1 = bool(satellite and "Sentinel-1" in satellite and "Sentinel-2" not in satellite)
     if is_pure_s1:
         s1_valid_stems = ("vv_orb_tnr_cal_tc_db", "vh_orb_tnr_cal_tc_db", "vv_vh_orb_tnr_cal_tc_db")
         tif_files = [
             f for f in tif_files
-            if any(v in os.path.splitext(os.path.basename(f.get("path", "")))[0].lower() for v in s1_valid_stems)
+            if (f.get("is_composite") and f.get("satellite") == "Sentinel-1")
+            or any(v in os.path.splitext(os.path.basename(f.get("path", "")))[0].lower() for v in s1_valid_stems)
             or any(v in f.get("band", "").lower() for v in s1_valid_stems)
         ]
         tif_paths = [f["path"] for f in tif_files]
         total_size = sum(f.get("size_bytes", 0) for f in tif_files)
 
+    is_pure_s2 = bool(satellite and "Sentinel-2" in satellite and "Sentinel-1" not in satellite)
+    if is_pure_s2:
+        tif_files = [
+            f for f in tif_files
+            if f.get("satellite") == "Sentinel-2" or f.get("satellite") == "Composite Deliverable"
+        ]
+        tif_paths = [f["path"] for f in tif_files]
+        total_size = sum(f.get("size_bytes", 0) for f in tif_files)
+
+    if skip_raw_scenes:
+        tif_files = [f for f in tif_files if f.get("is_composite")]
+        tif_paths = [f["path"] for f in tif_files]
+        total_size = sum(f.get("size_bytes", 0) for f in tif_files)
+
     total_scenes_cnt = len(matched_scenes) if not skip_raw_scenes else len(set(f["scene_id"] for f in tif_files))
     actual_tiles = sorted(list(set(s.tile for s in matched_scenes if s.tile))) if matched_scenes else (tiles if not region_filtered else [])
+    composite_tifs = [t for t in tif_files if t.get("is_composite")]
     return {
         "query_state": state,
         "query_district": district,
@@ -3101,13 +3279,16 @@ def search_downloaded_tifs_by_region(
         "query_composite_interval": composite_interval,
         "query_start_date": start_date,
         "query_end_date": end_date,
+        "query_request_id": request_id,
         "matched_tiles": actual_tiles,
         "matched_districts": [district] if district else (resolved_districts or []),
         "total_scenes": total_scenes_cnt,
+        "total_composites": len(composite_tifs),
         "total_tifs": len(tif_files),
         "total_size_bytes": total_size,
         "total_size_mb": round(total_size / (1024 * 1024), 2),
         "tif_paths": tif_paths,
+        "composites": composite_tifs,
         "tifs": tif_files
     }
 

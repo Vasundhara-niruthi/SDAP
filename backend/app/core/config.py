@@ -4,10 +4,10 @@ from urllib.parse import quote_plus
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from typing import Optional
 
-# Absolute Project Root (c:\Users\vasundharak\Desktop\SDAP)
+# Absolute Project Root (e.g. c:\Users\vasundharak\Desktop\SDAP)
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 
-# Single unified data directory
+# Single unified data directory default
 UNIFIED_DATA_DIR = os.path.join(PROJECT_ROOT, "data")
 _ENV_FILE_PATH = os.path.join(PROJECT_ROOT, "backend", ".env")
 
@@ -19,17 +19,17 @@ class Settings(BaseSettings):
     API_V1_STR: str = "/api/v1"
     DEBUG: bool = True
 
-    # JWT Authentication Settings
-    SECRET_KEY: str = "sdap_niruthi_secret_key_super_secure_jwt_token_key"
+    # JWT Authentication Settings (Loaded dynamically from .env)
+    SECRET_KEY: str = ""
     ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 1440  # 24 hours
 
-    # PostgreSQL Database Settings (Read dynamically from .env or environment)
-    POSTGRES_SERVER: str = "172.16.16.213"
-    POSTGRES_PORT: int = 5432
-    POSTGRES_USER: str = "postgres"
+    # PostgreSQL Database Settings (Loaded dynamically from .env)
+    POSTGRES_SERVER: str = ""
+    POSTGRES_PORT: Optional[int] = None
+    POSTGRES_USER: str = ""
     POSTGRES_PASSWORD: str = ""
-    POSTGRES_DB: str = "sdap_db"
+    POSTGRES_DB: str = ""
 
     # Custom Database URI Override (optional)
     SQLALCHEMY_DATABASE_URI: Optional[str] = None
@@ -38,45 +38,53 @@ class Settings(BaseSettings):
     def database_url(self) -> str:
         if self.SQLALCHEMY_DATABASE_URI:
             return self.SQLALCHEMY_DATABASE_URI
-        pwd_encoded = quote_plus(self.POSTGRES_PASSWORD, safe='')
-        user_encoded = quote_plus(self.POSTGRES_USER, safe='')
-        return f"postgresql://{user_encoded}:{pwd_encoded}@{self.POSTGRES_SERVER}:{self.POSTGRES_PORT}/{self.POSTGRES_DB}"
+        pwd_encoded = quote_plus(self.POSTGRES_PASSWORD or "", safe='')
+        user_encoded = quote_plus(self.POSTGRES_USER or "", safe='')
+        port_part = f":{self.POSTGRES_PORT}" if self.POSTGRES_PORT else ""
+        return f"postgresql://{user_encoded}:{pwd_encoded}@{self.POSTGRES_SERVER}{port_part}/{self.POSTGRES_DB}"
 
     @property
     def async_database_url(self) -> str:
-        pwd_encoded = quote_plus(self.POSTGRES_PASSWORD, safe='')
-        user_encoded = quote_plus(self.POSTGRES_USER, safe='')
-        return f"postgresql+asyncpg://{user_encoded}:{pwd_encoded}@{self.POSTGRES_SERVER}:{self.POSTGRES_PORT}/{self.POSTGRES_DB}"
+        pwd_encoded = quote_plus(self.POSTGRES_PASSWORD or "", safe='')
+        user_encoded = quote_plus(self.POSTGRES_USER or "", safe='')
+        port_part = f":{self.POSTGRES_PORT}" if self.POSTGRES_PORT else ""
+        return f"postgresql+asyncpg://{user_encoded}:{pwd_encoded}@{self.POSTGRES_SERVER}{port_part}/{self.POSTGRES_DB}"
 
-    # Storage Paths — Grounded in single root data directory (c:\Users\vasundharak\Desktop\SDAP\data)
-    BASE_DATA_DIR: str = UNIFIED_DATA_DIR
-    STAGING_DIR: str = os.path.join(UNIFIED_DATA_DIR, "staging")
-    RAW_ARCHIVE_DIR: str = os.path.join(UNIFIED_DATA_DIR, "archive")
-    OUTPUT_INDEX_DIR: str = os.path.join(UNIFIED_DATA_DIR, "output")
-    DELIVERY_DIR: str = os.path.join(UNIFIED_DATA_DIR, "delivery")
+    # Storage Paths — Configurable via .env, defaults to project root / data subfolders
+    BASE_DATA_DIR: Optional[str] = None
+    STAGING_DIR: Optional[str] = None
+    RAW_ARCHIVE_DIR: Optional[str] = None
+    OUTPUT_INDEX_DIR: Optional[str] = None
+    DELIVERY_DIR: Optional[str] = None
 
-    # NAS Network Credentials & Persistent Storage Settings
-    NAS_SERVER_IP: str = "172.16.16.52"
-    NAS_SHARE_NAME: str = "Remote-sensing"
-    NAS_DRIVE_LETTER: str = "Y:"
+    # NAS Network Credentials & Persistent Storage Settings (Loaded dynamically from .env)
+    NAS_STORAGE_PATH: Optional[str] = None
+    NAS_SERVER_IP: Optional[str] = None
+    NAS_SHARE_NAME: Optional[str] = None
+    NAS_DRIVE_LETTER: Optional[str] = None
     NAS_USER: Optional[str] = None
     NAS_PASSWORD: Optional[str] = None
 
-    # AWS Open Data Registry - Sentinel-2 COGs (https://registry.opendata.aws/sentinel-2-l2a-cogs/)
-    AWS_SENTINEL_BUCKET: str = "sentinel-cogs"
-    AWS_REGION: str = "us-west-2"
-    AWS_SENTINEL_COGS_BUCKET: str = "sentinel-cogs"
-    AWS_COGS_REGION: str = "us-west-2"
-    AWS_SENTINEL_L1C_BUCKET: str = "sentinel-s2-l1c"
-    AWS_SENTINEL_SNS_TOPIC_L2A: str = "arn:aws:sns:eu-central-1:214830741341:SentinelS2L2A"
-    AWS_SENTINEL_SNS_TOPIC_L1C: str = "arn:aws:sns:eu-west-1:214830741341:NewSentinel2Product"
+    # AWS Open Data Registry - Sentinel-2 COGs (Loaded dynamically from .env)
+    AWS_SENTINEL_BUCKET: Optional[str] = None
+    AWS_REGION: Optional[str] = None
+    AWS_SENTINEL_COGS_BUCKET: Optional[str] = None
+    AWS_COGS_REGION: Optional[str] = None
+    AWS_SENTINEL_L1C_BUCKET: Optional[str] = None
+    AWS_SENTINEL_SNS_TOPIC_L2A: Optional[str] = None
+    AWS_SENTINEL_SNS_TOPIC_L1C: Optional[str] = None
 
-    # AWS Open Data Registry - Sentinel-1 GRD (https://registry.opendata.aws/sentinel-1/)
-    AWS_SENTINEL_1_BUCKET: str = "sentinel-s1-l1c"
-    AWS_SENTINEL_1_REGION: str = "eu-central-1"
+    # AWS Open Data Registry - Sentinel-1 GRD (Loaded dynamically from .env)
+    AWS_SENTINEL_1_BUCKET: Optional[str] = None
+    AWS_SENTINEL_1_REGION: Optional[str] = None
 
-    # ESA SNAP GPT Engine Path for Sentinel-1 Processing
-    SNAP_GPT_PATH: str = r"C:\Program Files\snap\bin\gpt.exe"
+    # ESA SNAP GPT Engine Path for Sentinel-1 Processing (Loaded dynamically from .env)
+    SNAP_GPT_PATH: Optional[str] = None
+
+    # Default Admin Account for DB Initialization (Loaded dynamically from .env)
+    DEFAULT_ADMIN_EMAIL: Optional[str] = None
+    DEFAULT_ADMIN_PASSWORD: Optional[str] = None
+    DEFAULT_ADMIN_NAME: Optional[str] = None
 
     model_config = SettingsConfigDict(
         env_file=[_ENV_FILE_PATH, "backend/.env", ".env"],
@@ -88,19 +96,29 @@ class Settings(BaseSettings):
 settings = Settings()
 
 # Force single absolute path resolution across all services regardless of launch CWD
-if not os.path.isabs(settings.STAGING_DIR):
-    settings.STAGING_DIR = os.path.abspath(os.path.join(PROJECT_ROOT, settings.STAGING_DIR))
-
-if not os.path.isabs(settings.OUTPUT_INDEX_DIR):
-    settings.OUTPUT_INDEX_DIR = os.path.abspath(os.path.join(PROJECT_ROOT, settings.OUTPUT_INDEX_DIR))
-
-if not os.path.isabs(settings.DELIVERY_DIR):
-    settings.DELIVERY_DIR = os.path.abspath(os.path.join(PROJECT_ROOT, settings.DELIVERY_DIR))
-
-if not os.path.isabs(settings.BASE_DATA_DIR):
+if not settings.BASE_DATA_DIR or settings.BASE_DATA_DIR.strip() == "":
+    settings.BASE_DATA_DIR = UNIFIED_DATA_DIR
+elif not os.path.isabs(settings.BASE_DATA_DIR):
     settings.BASE_DATA_DIR = os.path.abspath(os.path.join(PROJECT_ROOT, settings.BASE_DATA_DIR))
 
-if not settings.RAW_ARCHIVE_DIR.startswith("\\\\") and not os.path.isabs(settings.RAW_ARCHIVE_DIR):
+if not settings.STAGING_DIR or settings.STAGING_DIR.strip() == "":
+    settings.STAGING_DIR = os.path.join(settings.BASE_DATA_DIR, "staging")
+elif not os.path.isabs(settings.STAGING_DIR):
+    settings.STAGING_DIR = os.path.abspath(os.path.join(PROJECT_ROOT, settings.STAGING_DIR))
+
+if not settings.OUTPUT_INDEX_DIR or settings.OUTPUT_INDEX_DIR.strip() == "":
+    settings.OUTPUT_INDEX_DIR = os.path.join(settings.BASE_DATA_DIR, "output")
+elif not os.path.isabs(settings.OUTPUT_INDEX_DIR):
+    settings.OUTPUT_INDEX_DIR = os.path.abspath(os.path.join(PROJECT_ROOT, settings.OUTPUT_INDEX_DIR))
+
+if not settings.DELIVERY_DIR or settings.DELIVERY_DIR.strip() == "":
+    settings.DELIVERY_DIR = os.path.join(settings.BASE_DATA_DIR, "delivery")
+elif not os.path.isabs(settings.DELIVERY_DIR):
+    settings.DELIVERY_DIR = os.path.abspath(os.path.join(PROJECT_ROOT, settings.DELIVERY_DIR))
+
+if not settings.RAW_ARCHIVE_DIR or settings.RAW_ARCHIVE_DIR.strip() == "":
+    settings.RAW_ARCHIVE_DIR = os.path.join(settings.BASE_DATA_DIR, "archive")
+elif not settings.RAW_ARCHIVE_DIR.startswith("\\\\") and not os.path.isabs(settings.RAW_ARCHIVE_DIR):
     settings.RAW_ARCHIVE_DIR = os.path.abspath(os.path.join(PROJECT_ROOT, settings.RAW_ARCHIVE_DIR))
 
 # Ensure single root storage directories exist on startup
