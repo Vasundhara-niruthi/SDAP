@@ -1,26 +1,8 @@
 """
-=============================================================================
-SDAP Temporal Compositing & District Mosaicing Service (SRS 8.4 & 8.5)
-=============================================================================
-Location: backend/app/services/compositor_service.py
+Temporal compositing and district mosaicing (SRS 8.4 & 8.5).
 
-Description:
-    Performs dedicated temporal compositing for:
-      - Sentinel-1 SAR:
-          * Polarizations: Strictly VV and VH backscatter in dB.
-          * Windows: Strictly 12-day cycles for fortnightly (matching SAR repeat orbit).
-          * Processed files ONLY: Only calibrated GeoTIFFs (VV_Orb_tnr_cal_Tc_db.tiff
-            and VH_Orb_tnr_cal_Tc_db.tiff). Raw measurement files are strictly rejected.
-          * Output: Composite_VV_<level>_fortnightly_<district>_<start>_<end>.tif
-                    Composite_VH_<level>_fortnightly_<district>_<start>_<end>.tif
-      - Sentinel-2 Optical:
-          * Indices: Strictly NDVI and LSWI (or requested optical indices).
-          * Windows: 15-day windows for fortnightly (optical cloud-clearing).
-          * Processed files ONLY: Only computed cloud-masked index rasters (NDVI.tif, LSWI.tif).
-            Raw L2A bands (B02, B03, B04, B08, SCL, TCI) are strictly rejected.
-          * Output: Composite_NDVI_<level>_<interval>_<district>_<start>_<end>.tif
-                    Composite_LSWI_<level>_<interval>_<district>_<start>_<end>.tif
-=============================================================================
+S1: VV/VH dB backscatter, 12-day windows (orbit repeat), mean composite, calibrated rasters only.
+S2: NDVI/LSWI, 15-day windows, cloud-masked index rasters only (no raw bands).
 """
 
 import os
@@ -43,7 +25,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import text, func
 
 from app.core.config import settings
-from app.models.sdap_models import RequestModel, ProcessJobModel, SceneModel, BandFileModel
+from app.db.models import RequestModel, ProcessJobModel, SceneModel, BandFileModel
 from app.services.delivery_service import get_district_geometry_from_db
 from app.services.downloader_service import verify_raster, resolve_tif_path, is_raster_overlapping_district
 from app.services.sentinel1_processor_service import win_safe_path, resolve_s1_raster_georeferencing
@@ -51,21 +33,12 @@ from app.services.sentinel1_processor_service import win_safe_path, resolve_s1_r
 logger = logging.getLogger("sdap.compositor")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 1. Date Window Generator (12-Day for S1 Fortnightly, 15-Day for S2)
-# ─────────────────────────────────────────────────────────────────────────────
 
 def generate_composite_windows(start_date: str, end_date: str, interval: str, satellite: Optional[str] = None) -> List[Dict[str, Any]]:
     """
-    Slices a date range into discrete composite windows based on the requested interval.
-    
-    Intervals supported:
-      - 'weekly' (7-day discrete windows)
-      - 'fortnightly' / 'biweekly':
-          * Sentinel-1: Strictly 12-day windows (matching SAR repeat cycle)
-          * Sentinel-2: Strictly 15-day windows (optical bi-weekly)
-      - 'monthly' (full calendar months)
-      - 'none' (full date range)
+    Slices a date range into composite windows.
+
+    Intervals: weekly (7d), fortnightly/biweekly (12d for S1, 15d for S2), monthly, none.
     """
     if not interval or interval.lower() in ("none", "null", "false", "0"):
         return []
@@ -97,7 +70,7 @@ def generate_composite_windows(start_date: str, end_date: str, interval: str, sa
 
     elif interval_lower in ("fortnightly", "biweekly", "15-day", "15day", "fortnight", "12-day", "12day"):
         is_s1_only = bool(satellite and "Sentinel-1" in satellite and "Sentinel-2" not in satellite)
-        # Sentinel-1 orbit repeat cycle is strictly 12 days; Sentinel-2 is 15 days
+        # S1 orbit repeat is 12 days; S2 windows are 15 days
         span_days = 11 if is_s1_only else 14
         cur = start_dt
         w_idx = 1
@@ -158,9 +131,6 @@ def generate_composite_windows(start_date: str, end_date: str, interval: str, sa
     return windows
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 2. Sentinel-1 Processed Raster Finder (PROCESSED FILES ONLY)
-# ─────────────────────────────────────────────────────────────────────────────
 
 def find_sentinel1_processed_rasters(
     db: Session,
@@ -172,14 +142,10 @@ def find_sentinel1_processed_rasters(
     district_bbox: Optional[Tuple[float, float, float, float]] = None
 ) -> List[str]:
     """
-    Finds verified Sentinel-1 PROCESSED (calibrated) GeoTIFFs strictly for the requested polarization:
-      - VV: 'VV_Orb_tnr_cal_Tc_db.tiff' (or .tif)
-      - VH: 'VH_Orb_tnr_cal_Tc_db.tiff' (or .tif)
-      
-    STRICT PROCESSED-ONLY GUARANTEE:
-      - NEVER accepts uncalibrated raw measurement files (iw-vv, s1a-iw-grd-vv-...).
-      - If a scene has only raw measurement files and was not calibrated, it is STRICTLY EXCLUDED.
-      - Strictly verifies raster existence, size (> 1024 bytes), and district boundary overlap.
+    Finds calibrated S1 GeoTIFFs ({VV,VH}_Orb_tnr_cal_Tc_db) for one polarization.
+
+    Raw measurement files are never accepted; rasters must exist, exceed 1024 bytes
+    and overlap the district.
     """
     pol = polarization.upper().strip()
     if pol not in ("VV", "VH"):
@@ -212,7 +178,6 @@ def find_sentinel1_processed_rasters(
             if r[0]:
                 candidate_scene_ids.add(r[0])
 
-    # 1. Query BandFileModel records
     bf_query = db.query(BandFileModel).filter(BandFileModel.verified == 1)
     if candidate_scene_ids:
         bf_query = bf_query.filter(BandFileModel.scene_id.in_(candidate_scene_ids))
@@ -235,7 +200,7 @@ def find_sentinel1_processed_rasters(
             parent_dir = os.path.dirname(resolved)
             scene_root = os.path.dirname(parent_dir) if os.path.basename(parent_dir).lower() == "measurement" else parent_dir
 
-            # PROCESSED CHECK: Find the calibrated file strictly
+            # Processed (calibrated) file only
             cal_cand = None
             for ext in (".tiff", ".tif", ".TIFF", ".TIF"):
                 check_p = os.path.join(scene_root, f"{target_cal_name}{ext}")
@@ -248,21 +213,21 @@ def find_sentinel1_processed_rasters(
                 if res_base.startswith(target_cal_name.lower()) and os.path.getsize(resolved) > 1024:
                     cal_cand = resolved
 
-            # If no processed calibrated file exists, REJECT THIS SCENE!
+            # No calibrated file: skip scene
             if not cal_cand:
                 continue
 
-            # Verify spatial overlap against district boundary polygon / bbox
+            # Require overlap with district boundary
             if district_bbox and not is_raster_overlapping_district(cal_cand, district_bbox):
                 continue
 
             sc_id = row.scene_id or os.path.basename(scene_root)
             scene_to_raster[sc_id] = cal_cand
             seen_paths.add(cal_cand)
-        except Exception:
+        except Exception as e:
+            logger.debug(f"Skipping S1 band file '{row.path}': {e}")
             continue
 
-    # 2. Disk fallback search on NAS if DB records were missing or incomplete
     if not scene_to_raster:
         search_dirs = [
             os.path.join(settings.RAW_ARCHIVE_DIR, "Sentinel-1", "S1_SAR", district_name),
@@ -277,7 +242,7 @@ def find_sentinel1_processed_rasters(
             for root, _, files in os.walk(s_dir):
                 for fn in files:
                     fn_u = fn.upper()
-                    # PROCESSED CHECK: strictly match target_cal_name
+                    # Match calibrated name only
                     if fn_u.startswith(target_cal_name.upper()) and (fn_u.endswith(".TIFF") or fn_u.endswith(".TIF")):
                         full_p = os.path.join(root, fn)
                         if full_p in seen_paths or not (os.path.isfile(full_p) and os.path.getsize(full_p) > 1024):
@@ -315,9 +280,6 @@ def find_sentinel1_processed_rasters(
     return list(scene_to_raster.values())
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 3. Sentinel-2 Processed Raster Finder (PROCESSED FILES ONLY)
-# ─────────────────────────────────────────────────────────────────────────────
 
 def find_sentinel2_processed_rasters(
     db: Session,
@@ -329,13 +291,10 @@ def find_sentinel2_processed_rasters(
     district_bbox: Optional[Tuple[float, float, float, float]] = None
 ) -> List[str]:
     """
-    Finds verified Sentinel-2 PROCESSED spectral index GeoTIFFs strictly:
-      - 'NDVI.tif' / 'NDVI.tiff' / 'NDVI_<district>.tif'
-      - 'LSWI.tif' / 'LSWI.tiff' / 'LSWI_<district>.tif'
-      
-    STRICT PROCESSED-ONLY GUARANTEE:
-      - NEVER accepts raw L2A band files (B02, B03, B04, B08, SCL, TCI).
-      - Strictly verifies raster existence, size (> 1024 bytes), and district boundary overlap.
+    Finds processed S2 index GeoTIFFs (NDVI/LSWI, optionally suffixed by district).
+
+    Raw L2A bands are never accepted; rasters must exist, exceed 1024 bytes
+    and overlap the district.
     """
     idx_clean = index_name.upper().strip()
     w_start_dt = datetime.strptime(window_start, "%Y-%m-%d").date()
@@ -378,7 +337,6 @@ def find_sentinel2_processed_rasters(
                 if r[0]:
                     candidate_scene_ids.add(r[0])
 
-    # 1. Query BandFileModel records strictly matching processed index names
     valid_band_names = [
         idx_clean,
         f"{idx_clean}.tif",
@@ -409,7 +367,7 @@ def find_sentinel2_processed_rasters(
             if not exists or not os.path.exists(resolved):
                 continue
 
-            # Ensure it is strictly an index file and NOT a raw band
+            # Index files only, not raw bands
             fn_base = os.path.basename(resolved).upper()
             if not (fn_base.startswith(idx_clean) or fn_base in (f"{idx_clean}.TIF", f"{idx_clean}.TIFF")):
                 continue
@@ -420,10 +378,10 @@ def find_sentinel2_processed_rasters(
             if resolved not in seen_paths and os.path.getsize(resolved) > 1024:
                 raster_paths.append(resolved)
                 seen_paths.add(resolved)
-        except Exception:
+        except Exception as e:
+            logger.debug(f"Skipping S2 band file '{row.path}': {e}")
             continue
 
-    # 2. Fallback: Check NAS storage under specific district tiles
     if not raster_paths and district_tiles:
         for tile in district_tiles:
             tile_dir = os.path.join(settings.RAW_ARCHIVE_DIR, tile)
@@ -493,9 +451,6 @@ def find_index_rasters_for_window(
         )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 4. Maximum / Min / Mean Compositing Engine
-# ─────────────────────────────────────────────────────────────────────────────
 
 def create_temporal_composite_raster(
     input_raster_paths: List[str],
@@ -506,8 +461,7 @@ def create_temporal_composite_raster(
     resolution_deg: float = 0.0001
 ) -> Optional[Dict[str, Any]]:
     """
-    Computes a single seamless cloud-masked Composite GeoTIFF
-    from a list of multi-day index rasters across one or more tiles.
+    Builds one composite GeoTIFF from multi-day index rasters across tiles.
     """
     valid_inputs = [p for p in input_raster_paths if p and os.path.exists(p) and os.path.getsize(p) > 1024]
     if not valid_inputs:
@@ -517,7 +471,6 @@ def create_temporal_composite_raster(
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     method_clean = (method or "max").lower().strip()
 
-    # 1. Determine Target Extent from District Geometry or Inputs
     d_shape = None
     if district_geom:
         d_shape = shape(district_geom) if isinstance(district_geom, dict) else district_geom
@@ -531,13 +484,13 @@ def create_temporal_composite_raster(
                         b_minx, b_miny, b_maxx, b_maxy = transform_bounds(src.crs, target_crs, *src.bounds)
                         minx, miny = min(minx, b_minx), min(miny, b_miny)
                         maxx, maxy = max(maxx, b_maxx), max(maxy, b_maxy)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"Could not read bounds of '{p}': {e}")
 
     width = max(1, int(np.ceil((maxx - minx) / resolution_deg)))
     height = max(1, int(np.ceil((maxy - miny) / resolution_deg)))
 
-    # Memory Safeguard: Cap canvas size to prevent memory allocation spikes (< 180 MB per float32 layer)
+    # Cap canvas size to limit memory (<180 MB per float32 layer)
     max_pixels = 45_000_000
     if (width * height) > max_pixels:
         scale_factor = np.sqrt((width * height) / float(max_pixels))
@@ -548,7 +501,6 @@ def create_temporal_composite_raster(
 
     dst_transform = rasterio.transform.from_bounds(minx, miny, maxx, maxy, width, height)
 
-    # 2. District Boundary Mask
     district_mask = None
     if d_shape:
         district_mask = rasterio.features.geometry_mask(
@@ -558,7 +510,6 @@ def create_temporal_composite_raster(
             invert=True
         )
 
-    # 3. Canvas Arrays
     if method_clean == "mean":
         sum_arr = np.zeros((height, width), dtype="float32")
         count_arr = np.zeros((height, width), dtype="uint16")
@@ -567,7 +518,6 @@ def create_temporal_composite_raster(
     else:  # "max"
         accumulated = np.full((height, width), np.nan, dtype="float32")
 
-    # 4. Reproject each tile using window slicing
     for r_idx, r_path in enumerate(valid_inputs, start=1):
         try:
             with rasterio.open(win_safe_path(r_path)) as src:
@@ -587,11 +537,9 @@ def create_temporal_composite_raster(
                 else:
                     t_minx, t_miny, t_maxx, t_maxy = transform_bounds(src_crs, target_crs, *src.bounds)
 
-                # Check spatial overlap with target grid
                 if t_maxx < minx or t_minx > maxx or t_maxy < miny or t_miny > maxy:
                     continue
 
-                # Compute intersecting window
                 c_minx = max(minx, t_minx)
                 c_miny = max(miny, t_miny)
                 c_maxx = min(maxx, t_maxx)
@@ -630,7 +578,7 @@ def create_temporal_composite_raster(
 
                 reproject(**reproject_kwargs)
 
-                # CRITICAL: Clean out GDAL/SNAP nodata artifacts (e.g. 3.4e38, -3.4e38, -999.0, inf)
+                # Strip GDAL/SNAP nodata artifacts (+-3.4e38, -999, inf)
                 invalid_mask = (
                     np.isnan(dest_slice) |
                     np.isinf(dest_slice) |
@@ -643,8 +591,8 @@ def create_temporal_composite_raster(
                 # If Sentinel-1 SAR band (VV, VH, VV_VH):
                 is_sar_raster = any(s in output_path.upper() for s in ("_VV_", "_VH_", "COMPOSITE_VV_", "COMPOSITE_VH_"))
                 if is_sar_raster:
-                    # Physical backscatter in dB is typically -50 dB to +5 dB.
-                    # Treat 0.0 (swath boundary / unassigned), < -60 dB, > 15 dB as nodata:
+                    # Backscatter is typically -50 to +5 dB.
+                    # 0.0 (swath edge), < -60 dB and > 15 dB are nodata
                     sar_invalid = (dest_slice < -60.0) | (dest_slice > 15.0) | (dest_slice == 0.0)
                     dest_slice[sar_invalid] = np.nan
 
@@ -667,7 +615,6 @@ def create_temporal_composite_raster(
         except Exception as e:
             logger.warning(f"Error compositing tile '{r_path}': {e}")
 
-    # 5. Finalize composite array
     if method_clean == "mean":
         with np.errstate(divide="ignore", invalid="ignore"):
             accumulated = np.where(count_arr > 0, sum_arr / count_arr, np.nan).astype("float32")
@@ -675,7 +622,6 @@ def create_temporal_composite_raster(
     if district_mask is not None:
         accumulated[~district_mask] = np.nan
 
-    # 6. Save compressed single-band GeoTIFF
     profile = {
         "driver": "GTiff",
         "height": height,
@@ -684,7 +630,7 @@ def create_temporal_composite_raster(
         "dtype": "float32",
         "crs": target_crs,
         "transform": dst_transform,
-        "nodata": -999.0,  # Explicit nodata for QGIS / GDAL compatibility
+        "nodata": -999.0,  # QGIS/GDAL compatibility
         "compress": "DEFLATE",
         "predictor": 3,
         "zlevel": 1,
@@ -713,8 +659,8 @@ def create_temporal_composite_raster(
                 })
             try:
                 dst.update_tags(1, **tag_dict)
-            except Exception:
-                pass
+            except Exception as tag_err:
+                logger.debug(f"Could not write band tags: {tag_err}")
             try:
                 dst.build_overviews([2, 4, 8, 16], Resampling.average)
                 dst.update_tags(ns="rio_overview", resampling="average")
@@ -722,15 +668,23 @@ def create_temporal_composite_raster(
                 logger.debug(f"Overview pyramid note: {ov_err}")
 
         temp_target = output_path + ".tmp"
-        shutil.copy2(temp_file, temp_target)
-        if os.path.exists(output_path):
-            try:
-                os.remove(output_path)
-            except Exception:
-                pass
-        os.replace(temp_target, output_path)
+        try:
+            shutil.copy2(temp_file, temp_target)
+            if os.path.exists(output_path):
+                try:
+                    os.remove(output_path)
+                except Exception:
+                    pass
+            os.replace(temp_target, output_path)
+        except Exception:
+            # Don't leave a partial .tmp next to the output
+            if os.path.exists(temp_target):
+                try:
+                    os.remove(temp_target)
+                except Exception:
+                    pass
+            raise
 
-    # 7. Calculate Statistics
     is_sar_out = any(s in output_path.upper() for s in ("_VV_", "_VH_", "COMPOSITE_VV_", "COMPOSITE_VH_"))
     valid_mask = (~np.isnan(accumulated)) & (accumulated != -990.0) & (accumulated != -999.0) & (accumulated < 1e30) & (accumulated > -1e30)
     if is_sar_out:
@@ -758,9 +712,6 @@ def create_temporal_composite_raster(
     }
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 5. Dedicated Sentinel-1 SAR Compositing Pipeline
-# ─────────────────────────────────────────────────────────────────────────────
 
 def run_sentinel1_compositing(
     db: Session,
@@ -769,14 +720,8 @@ def run_sentinel1_compositing(
     req_level: str
 ) -> List[Dict[str, Any]]:
     """
-    Executes Temporal Compositing dedicated for Sentinel-1 SAR.
-    
-    Guarantees:
-      - Fortnightly uses strictly 12-day windows (matching SAR repeat orbit cycle).
-      - Strictly computes composites for backscatter polarizations 'VV' and 'VH'.
-      - Strictly inputs PROCESSED calibrated files (VV_Orb_tnr_cal_Tc_db.tiff and VH_Orb_tnr_cal_Tc_db.tiff).
-      - Output format: Composite_VV_<level>_fortnightly_<district>_<start>_<end>.tif
-                       Composite_VH_<level>_fortnightly_<district>_<start>_<end>.tif
+    Sentinel-1 compositing: VV/VH from calibrated rasters, 12-day fortnightly windows.
+    Output: Composite_<pol>_<level>_<interval>_<district>_<start>_<end>.tif
     """
     from app.db.scripts.download_district_tiles import append_request_log
 
@@ -785,14 +730,11 @@ def run_sentinel1_compositing(
     start_str = req.start_date.strftime("%Y-%m-%d")
     end_str = req.end_date.strftime("%Y-%m-%d")
 
-    # 1. Generate strictly 12-day windows for fortnightly (or 7-day for weekly, full calendar month for monthly)
     windows = generate_composite_windows(start_str, end_str, interval, satellite="Sentinel-1")
     if not windows:
         logger.info(f"No composite windows generated for S1 interval '{interval}' between {start_str} and {end_str}.")
         return []
 
-    # For Sentinel-1 SAR backscatter in dB, temporal aggregation strictly uses MEAN (average dB)
-    sar_level = "mean"
     cycle_desc = "12-DAY ORBIT CYCLES" if interval.lower() in ("fortnightly", "biweekly") else f"{interval.upper()} WINDOWS"
     header_msg = (
         f"\n==============================================================================\n"
@@ -803,7 +745,6 @@ def run_sentinel1_compositing(
     logger.info(header_msg)
     append_request_log(db, request_id, header_msg)
 
-    # 2. Fetch District Geometry
     geom_dict, state_name = get_district_geometry_from_db(db, district_name)
     district_bbox = None
     if geom_dict:
@@ -833,7 +774,7 @@ def run_sentinel1_compositing(
         append_request_log(db, request_id, f"\n  ▶ Processing S1 Window '{w_label}' ({w_start} to {w_end}, {win['days_count']} days)...")
 
         for pol in polarizations:
-            # STRICT: Find PROCESSED calibrated files only (VV_Orb_tnr_cal_Tc_db / VH_Orb_tnr_cal_Tc_db)
+            # Calibrated files only
             input_rasters = find_sentinel1_processed_rasters(
                 db=db,
                 district_name=district_name,
@@ -850,6 +791,7 @@ def run_sentinel1_compositing(
                 append_request_log(db, request_id, warn_msg, level="WARNING")
                 continue
 
+            # S1 dB backscatter is aggregated with mean
             sar_level = "mean"
             out_filename = f"Composite_{pol}_{sar_level}_{interval.lower()}_{district_name}_{w_start.replace('-', '')}_{w_end.replace('-', '')}.tif"
             nas_out_path = os.path.join(nas_composite_dir, out_filename)
@@ -870,7 +812,7 @@ def run_sentinel1_compositing(
                         max_val = float(np.nanmax(arr[valid_mask])) if valid_pixels > 0 else 0.0
                         file_size_mb = os.path.getsize(nas_out_path) / (1024 * 1024)
 
-                    # Quality check: verify the file is not corrupted with 3.4e38, negative infinity, or all NaNs/nodata
+                    # Skip corrupt files (3.4e38, -inf, all NaN/nodata)
                     is_corrupted = (valid_pixels == 0) or (coverage_pct < 0.1) or (mean_val > 25.0) or (min_val < -65.0) or (max_val > 30.0)
 
                     if not is_corrupted:
@@ -939,9 +881,6 @@ def run_sentinel1_compositing(
     return composite_results
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 6. Dedicated Sentinel-2 Optical Compositing Pipeline
-# ─────────────────────────────────────────────────────────────────────────────
 
 def run_sentinel2_compositing(
     db: Session,
@@ -950,15 +889,8 @@ def run_sentinel2_compositing(
     req_level: str
 ) -> List[Dict[str, Any]]:
     """
-    Executes Temporal Compositing dedicated for Sentinel-2 Optical.
-    
-    Guarantees:
-      - Fortnightly uses strictly 15-day windows (Days 1-15, 16-30).
-      - Strictly computes composites for optical spectral indices (NDVI, LSWI).
-      - Strictly inputs PROCESSED cloud-masked index rasters (NDVI.tif, LSWI.tif).
-        Raw L2A bands (B02, B03, B04, B08, SCL, TCI) are strictly rejected.
-      - Output format: Composite_NDVI_<level>_<interval>_<district>_<start>_<end>.tif
-                       Composite_LSWI_<level>_<interval>_<district>_<start>_<end>.tif
+    Sentinel-2 compositing: NDVI/LSWI from cloud-masked index rasters, 15-day fortnightly windows.
+    Output: Composite_<index>_<level>_<interval>_<district>_<start>_<end>.tif
     """
     from app.db.scripts.download_district_tiles import append_request_log
 
@@ -967,7 +899,6 @@ def run_sentinel2_compositing(
     start_str = req.start_date.strftime("%Y-%m-%d")
     end_str = req.end_date.strftime("%Y-%m-%d")
 
-    # 1. Generate strictly 15-day windows for fortnightly (or 7-day for weekly, full calendar month for monthly)
     windows = generate_composite_windows(start_str, end_str, interval, satellite="Sentinel-2")
     if not windows:
         logger.info(f"No composite windows generated for S2 interval '{interval}' between {start_str} and {end_str}.")
@@ -987,7 +918,6 @@ def run_sentinel2_compositing(
     logger.info(header_msg)
     append_request_log(db, request_id, header_msg)
 
-    # 2. Fetch District Geometry
     geom_dict, state_name = get_district_geometry_from_db(db, district_name)
     district_bbox = None
     if geom_dict:
@@ -1020,7 +950,7 @@ def run_sentinel2_compositing(
         for idx_name in spectral_indices:
             idx_clean = idx_name.upper().strip()
 
-            # STRICT: Find PROCESSED cloud-masked index rasters only (NDVI.tif, LSWI.tif)
+            # Cloud-masked index rasters only
             input_rasters = find_sentinel2_processed_rasters(
                 db=db,
                 district_name=district_name,
@@ -1133,9 +1063,6 @@ def run_sentinel2_compositing(
     return composite_results
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 7. Master Composite Pipeline Execution Dispatcher
-# ─────────────────────────────────────────────────────────────────────────────
 
 def run_temporal_compositing_for_request(
     db: Session,
@@ -1144,10 +1071,7 @@ def run_temporal_compositing_for_request(
     level: Optional[str] = None
 ) -> List[Dict[str, Any]]:
     """
-    Master Dispatcher for Stage 4 Temporal Compositing.
-    Inspects user request and executes the dedicated satellite pipeline:
-      - Sentinel-1: run_sentinel1_compositing() [12-day fortnightly, strictly VV and VH backscatter in dB, processed calibrated rasters only]
-      - Sentinel-2: run_sentinel2_compositing() [15-day fortnightly, strictly NDVI and LSWI optical indices, processed cloud-masked rasters only]
+    Dispatches a request to the S1 or S2 compositing pipeline.
     """
     req = db.query(RequestModel).filter(RequestModel.id == request_id).first()
     if not req:
@@ -1167,7 +1091,6 @@ def run_temporal_compositing_for_request(
     is_s1 = bool("Sentinel-1" in req_satellite and "Sentinel-2" not in req_satellite)
 
     if is_s1:
-        # Dedicated Sentinel-1 SAR Compositing
         return run_sentinel1_compositing(
             db=db,
             req=req,
@@ -1175,7 +1098,6 @@ def run_temporal_compositing_for_request(
             req_level=req_level
         )
     else:
-        # Dedicated Sentinel-2 Optical Compositing
         return run_sentinel2_compositing(
             db=db,
             req=req,

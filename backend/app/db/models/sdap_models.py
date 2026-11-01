@@ -1,14 +1,8 @@
-"""
-=============================================================================
-SDAP SQLAlchemy ORM Models
-=============================================================================
-Location: backend/app/db/models/sdap_models.py
+"""SDAP SQLAlchemy ORM Models
 
-Description:
-    Defines database tables, columns, relationships, indexes, and constraints
-    for Users, Requests, Scenes, Band Files, Processing Jobs, Tile Mappings,
-    Open Data Registry Metadata, and Layer Stack Jobs.
-=============================================================================
+Defines database tables, columns, relationships, indexes, and constraints
+for Users, Requests, Scenes, Band Files, Processing Jobs, Tile Mappings,
+Open Data Registry Metadata, and Layer Stack Jobs.
 """
 
 import enum

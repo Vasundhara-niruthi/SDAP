@@ -1,32 +1,21 @@
 """
-=============================================================================
-SDAP Optical Cloud Removal & Full-Tile Index Processor (SRS 8.4.1 & 8.4.3)
-=============================================================================
-Location: backend/app/services/processor_service.py
+Optical cloud removal and full-tile index calculation (SRS 8.4.1 & 8.4.3).
 
-Description:
-    1. Cloud Masking (Optical): Uses SCL (Scene Classification Layer) to discard
-       pixels labelled cloud (8, 9), cloud shadow (3), cirrus (10), snow (11),
-       and defective (1). Retains vegetation (4), bare soil (5), and water (6).
-    2. Cloud Mask Dilation: Expands cloud mask by ~2 pixels using pure numpy dilation.
-    3. Full-Tile Index Calculation (SRS 8.4.3): Calculates NDVI, LSWI, VV/VH ratio
-       on the FULL tile prior to clipping, saving the indexed tile to the archive.
-=============================================================================
+Masks cloud/shadow/cirrus/snow/defective pixels via SCL (dilated ~2 px), then computes
+NDVI, LSWI and VV/VH ratio on the full tile before clipping.
 """
 
 import os
-import sys
 import logging
-from typing import Dict, Any, Tuple, Optional, List
+from typing import Dict, Tuple
 
 import numpy as np
 import rasterio
 
 logger = logging.getLogger("sdap.processor")
 
-# SCL Scene Classification Values to MASK OUT (discard):
-# 0: No Data, 1: Saturated/Defective, 2: Dark Area Pixels, 3: Cloud Shadows,
-# 8: Cloud Medium Probability, 9: Cloud High Probability, 10: Thin Cirrus, 11: Snow
+# SCL classes to mask out: 0 no data, 1 saturated/defective, 2 dark area, 3 cloud shadow,
+# 8/9 cloud medium/high, 10 thin cirrus, 11 snow
 INVALID_SCL_CLASSES = {0, 1, 2, 3, 8, 9, 10, 11}
 
 
@@ -43,9 +32,8 @@ def dilate_mask_numpy(mask: np.ndarray, dilation_pixels: int = 2) -> np.ndarray:
 
 def generate_dilated_cloud_mask(scl_path: str, dilation_pixels: int = 2) -> Tuple[np.ndarray, dict]:
     """
-    Reads SCL.tif, identifies cloud/shadow/cirrus/snow pixels, and dilates the mask
-    by `dilation_pixels` (default 2 pixels) to catch soft cloud edges (SRS 8.4.1).
-    Returns boolean mask (True = INVALID/DISCARD, False = VALID) and raster metadata.
+    Builds a cloud/shadow/cirrus/snow mask from SCL.tif, dilated by `dilation_pixels` to catch soft edges.
+    Returns (mask, raster metadata); mask is True where pixels are invalid.
     """
     if not os.path.exists(scl_path):
         raise FileNotFoundError(f"SCL mask file not found at '{scl_path}'.")
@@ -54,10 +42,8 @@ def generate_dilated_cloud_mask(scl_path: str, dilation_pixels: int = 2) -> Tupl
         scl_data = src.read(1)
         profile = src.profile.copy()
 
-    # Create initial boolean mask of invalid classes
     invalid_mask = np.isin(scl_data, list(INVALID_SCL_CLASSES))
 
-    # Dilate invalid mask by 2 pixels using pure NumPy dilation
     if dilation_pixels > 0:
         dilated_mask = dilate_mask_numpy(invalid_mask, dilation_pixels)
     else:
@@ -77,17 +63,13 @@ def compute_full_tile_index(
     dilation_pixels: int = 2
 ) -> Tuple[str, float]:
     """
-    Computes specified index on the FULL TILE before clipping (SRS 8.4.3).
-    - NDVI: (B08 - B04) / (B08 + B04)
-    - LSWI: (B08A - B11) / (B08A + B11)
-    - VV_VH_RATIO: 10 * log10(VV) - 10 * log10(VH)
-    
+    Computes an index on the full tile before clipping (SRS 8.4.3).
+    NDVI = (B08-B04)/(B08+B04); LSWI = (B08A-B11)/(B08A+B11); VV_VH_RATIO = 10*log10(VV) - 10*log10(VH).
     Returns (output_path, clear_coverage_percentage).
     """
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     index_type = index_type.upper()
 
-    # 1. Cloud Masking via SCL.tif if present
     invalid_mask = None
     if "SCL" in band_paths and os.path.exists(band_paths["SCL"]):
         invalid_mask, scl_profile = generate_dilated_cloud_mask(band_paths["SCL"], dilation_pixels)
@@ -103,12 +85,10 @@ def compute_full_tile_index(
             nir = src_nir.read(1).astype(np.float32)
             profile = src_nir.profile.copy()
 
-        # Calculate NDVI: (NIR - RED) / (NIR + RED)
         denom = nir + red
         denom[denom == 0] = np.nan
         ndvi = (nir - red) / denom
         
-        # Apply cloud mask (set invalid pixels to NaN)
         if invalid_mask is not None:
             if invalid_mask.shape != ndvi.shape:
                 sy = max(1, ndvi.shape[0] // invalid_mask.shape[0])
@@ -119,7 +99,6 @@ def compute_full_tile_index(
         valid_pixels = np.count_nonzero(~np.isnan(ndvi))
         coverage_pct = (valid_pixels / ndvi.size) * 100.0
 
-        # Save indexed raster
         profile.update(dtype=rasterio.float32, count=1, nodata=np.nan, compress="lzw")
         with rasterio.open(output_path, "w", **profile) as dst:
             dst.write(ndvi.astype(np.float32), 1)
@@ -138,7 +117,6 @@ def compute_full_tile_index(
             swir = src_swir.read(1).astype(np.float32)
             profile = src_swir.profile.copy()
 
-        # Calculate LSWI: (NIR - SWIR) / (NIR + SWIR)
         denom = nir + swir
         denom[denom == 0] = np.nan
         lswi = (nir - swir) / denom

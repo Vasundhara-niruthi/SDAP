@@ -22,22 +22,18 @@ SDAP-server/
 ├── .env.example               # Template environment configuration
 ├── requirements.txt           # Python dependencies (FastAPI 0.141.1, PostgreSQL drivers, etc.)
 ├── init_db.py                 # PostgreSQL database & table initialization script
+├── alembic/                   # Schema migrations (versions/)
 ├── app/
-│   ├── main.py                # FastAPI entry point & CORS configuration
+│   ├── main.py                # FastAPI entry point, CORS & startup seeding
 │   ├── core/
 │   │   ├── config.py          # Application settings & environment loader
-│   │   └── database.py        # SQLAlchemy engine, session maker & health check
-│   ├── models/
-│   │   └── sdap_models.py     # Database models (Requests, Scenes, SceneFiles, ProcessJobs)
-│   ├── schemas/
-│   │   ├── health_schema.py   # Health check response schema
-│   │   └── request_schema.py  # Validation schemas for satellite acquisition requests
-│   └── api/
-│       └── v1/
-│           ├── api.py         # Main router aggregator
-│           └── endpoints/
-│               ├── health.py  # /api/v1/health endpoint
-│               └── requests.py# /api/v1/requests endpoints
+│   │   └── security.py        # JWT, password hashing & auth dependencies
+│   ├── db/                    # Engine/session, ORM models, repositories, seeds, ingestion scripts
+│   ├── routes/                # API routers (auth, users, requests, layer_stack, rasters, boundaries, health)
+│   ├── schemas/               # Pydantic request/response schemas
+│   ├── services/              # Gap check, download, S1/S2 processing, compositing, stacking, delivery
+│   └── graphs/                # SNAP processing graphs
+└── scripts/                   # Standalone helper scripts
 ```
 
 ---

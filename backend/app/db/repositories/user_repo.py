@@ -1,12 +1,6 @@
-"""
-=============================================================================
-SDAP User Repository (Reusable Database Queries)
-=============================================================================
-Location: backend/app/db/repositories/user_repo.py
+"""SDAP User Repository (Reusable Database Queries)
 
-Description:
-    Reusable database queries for user accounts, credentials, and RBAC roles.
-=============================================================================
+Reusable database queries for user accounts, credentials, and RBAC roles.
 """
 
 from typing import List, Optional

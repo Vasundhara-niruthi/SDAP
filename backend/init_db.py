@@ -98,7 +98,7 @@ def create_postgres_db():
         migrate_schema()
         print("All SDAP tables verified/migrated successfully!")
 
-        # Seed System Users via app/db/migrations/user_data.py
+        # Seed System Users via app/db/seeds/user_seeds.py
         db = SessionLocal()
         try:
             run_user_data_migrations(db)

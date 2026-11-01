@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback, useRef } from 'react';
+import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import axios from 'axios';
 import {
   Satellite, Activity, HardDrive, User, LogOut, RefreshCw, FileText, Folder,
@@ -16,7 +16,16 @@ const getAuthHeader = () => {
   return token ? { Authorization: `Bearer ${token}` } : {};
 };
 
-// Helper function to extract clear, readable error messages from FastAPI responses
+// Terminal request statuses: logs stop being tailed (after one final fetch) once one of these is reached
+const isTerminalLogStatus = (s) => ['COMPLETED', 'FAILED', 'CANCELLED', 'STOPPED'].includes(String(s || '').toUpperCase());
+
+// Length in Unicode code points (matches Python len() used by the backend for log offsets)
+const codePointLength = (s) => {
+  if (!s) return 0;
+  const highSurrogates = s.match(/[\uD800-\uDBFF]/g);
+  return s.length - (highSurrogates ? highSurrogates.length : 0);
+};
+
 const formatApiError = (err, defaultMsg) => {
   if (!err) return defaultMsg;
   if (!err.response) {
@@ -44,9 +53,6 @@ const formatApiError = (err, defaultMsg) => {
 };
 
 export default function App() {
-  // ---------------------------------------------------------------------------
-  // 1. Authentication State
-  // ---------------------------------------------------------------------------
   const [token, setToken] = useState(localStorage.getItem('sdap_token') || '');
   const [currentUser, setCurrentUser] = useState(() => {
     const saved = localStorage.getItem('sdap_user');
@@ -64,31 +70,18 @@ export default function App() {
   const [regFullName, setRegFullName] = useState('');
 
   // Forgot password fields
-  const [forgotEmail, setForgotEmail] = useState('');
-  const [forgotNewPassword, setForgotNewPassword] = useState('');
-  const [forgotConfirmPassword, setForgotConfirmPassword] = useState('');
-  const [forgotSuccessMsg, setForgotSuccessMsg] = useState('');
 
   const [authError, setAuthError] = useState('');
   const [authLoading, setAuthLoading] = useState(false);
 
-  // ---------------------------------------------------------------------------
-  // 2. Main App Navigation & UI State
-  // ---------------------------------------------------------------------------
   const [activeTab, setActiveTab] = useState('requests'); // 'requests' | 'new_request' | 'admin'
   const [searchTerm, setSearchTerm] = useState('');
   const [statusFilter, setStatusFilter] = useState('ALL');
 
-  // ---------------------------------------------------------------------------
-  // 3. Dynamic Administrative Boundaries State (From DB)
-  // ---------------------------------------------------------------------------
   const [statesList, setStatesList] = useState([]);
   const [districtsList, setDistrictsList] = useState([]);
   const [loadingBoundaries, setLoadingBoundaries] = useState(false);
 
-  // ---------------------------------------------------------------------------
-  // 4. New Request Form State
-  // ---------------------------------------------------------------------------
   const [reqTitle, setReqTitle] = useState('');
   const [areaType, setAreaType] = useState('Administrative Unit');
   const [selectedState, setSelectedState] = useState('');
@@ -120,9 +113,6 @@ export default function App() {
   // Storage estimation breakdown modal
   const [showStorageModal, setShowStorageModal] = useState(false);
 
-  // ---------------------------------------------------------------------------
-  // 5. Requests & Live Logs State
-  // ---------------------------------------------------------------------------
   const [requests, setRequests] = useState([]);
   const [loadingRequests, setLoadingRequests] = useState(false);
   const [selectedReqForLogs, setSelectedReqForLogs] = useState(null);
@@ -135,14 +125,14 @@ export default function App() {
   const [stoppingId, setStoppingId] = useState(null);
   const logsEndRef = useRef(null);
   const selectedReqIdRef = useRef(null);
+  // Incremental execution-log sync state for the logs modal (offset-based tailing, avoids re-downloading full logs)
+  const logsSyncRef = useRef({ reqId: null });
+  const parseScenesCacheRef = useRef(null);
   const [logViewMode, setLogViewMode] = useState('table'); // 'table' | 'raw'
   const [logFilter, setLogFilter] = useState('all'); // 'all' | 'downloads' | 'errors'
   const [logSearchQuery, setLogSearchQuery] = useState('');
   const [logStepFilter, setLogStepFilter] = useState('all'); // 'all' | 'step1' | 'step2' | 'step3' | 'step4'
 
-  // ---------------------------------------------------------------------------
-  // 6. Admin State
-  // ---------------------------------------------------------------------------
   const [adminUsers, setAdminUsers] = useState([]);
   const [loadingAdmin, setLoadingAdmin] = useState(false);
   const [expandedUserId, setExpandedUserId] = useState(null);
@@ -154,9 +144,6 @@ export default function App() {
   const [newAdminRole, setNewAdminRole] = useState('USER');
   const [adminUserMsg, setAdminUserMsg] = useState(null);
 
-  // ---------------------------------------------------------------------------
-  // 7. Data Retrieval & Export State & Handlers
-  // ---------------------------------------------------------------------------
   const RET_S1_BANDS = [
     {
       id: 'VV_Orb_tnr_cal_Tc_db.tiff',
@@ -233,7 +220,6 @@ export default function App() {
   const [retDownloadedDistricts, setRetDownloadedDistricts] = useState([]);
   const [loadingRetRegions, setLoadingRetRegions] = useState(false);
 
-  // Helper to determine active bands query parameter string
   const getSelectedBandsQuery = () => {
     let available = [];
     if (retSatellite === 'Sentinel-1') {
@@ -339,7 +325,6 @@ export default function App() {
   const [downloadWidgetMinimized, setDownloadWidgetMinimized] = useState(false);
 
   const handleDownloadZip = async () => {
-    // 1. Close modal immediately so the user's workspace is not blocked
     setShowDownloadPromptModal(false);
 
     const currentToken = token || localStorage.getItem('sdap_token');
@@ -503,9 +488,6 @@ export default function App() {
     }
   };
 
-  // ---------------------------------------------------------------------------
-  // 9. Layer Stacking Studio State & Handlers
-  // ---------------------------------------------------------------------------
   const extractBandsFromStackFilename = (filename) => {
     if (!filename) return [];
     const stem = filename.replace(/\.(tif|tiff)$/i, '');
@@ -523,14 +505,12 @@ export default function App() {
   const isExactMatchingStack = (stackItem, selectedLayers, targetDistrict, targetSeason, targetStartDate, targetEndDate) => {
     if (!stackItem || !selectedLayers || selectedLayers.length === 0) return false;
 
-    // Check district match
     if (targetDistrict && stackItem.district) {
       if (stackItem.district.trim().toLowerCase() !== targetDistrict.trim().toLowerCase()) {
         return false;
       }
     }
 
-    // Check season match if present
     if (targetSeason && stackItem.season) {
       const s1 = targetSeason.split('(')[0].trim().toLowerCase();
       const s2 = stackItem.season.split('(')[0].trim().toLowerCase();
@@ -539,7 +519,6 @@ export default function App() {
       }
     }
 
-    // Extract exact bands from layers array or filename
     let itemBands = [];
     if (Array.isArray(stackItem.layers) && stackItem.layers.length > 0) {
       itemBands = stackItem.layers.map(b => b.trim().toUpperCase()).filter(Boolean);
@@ -555,7 +534,6 @@ export default function App() {
     const bandsMatch = selBands.every(b => itemBands.includes(b)) && itemBands.every(b => selBands.includes(b));
     if (!bandsMatch) return false;
 
-    // Check date range if target dates and item dates are available
     if (targetStartDate && targetEndDate) {
       const tStart = targetStartDate.replace(/-/g, '');
       const tEnd = targetEndDate.replace(/-/g, '');
@@ -667,16 +645,22 @@ export default function App() {
     { id: 'LSWI', label: 'LSWI - Land Surface Water Index (B08 - B11)/(B08 + B11)' }
   ];
 
+  // Monotonic version counter: a stale response from an earlier Stack click must never overwrite newer state
+  const stackLoadVersionRef = useRef(0);
+
   const loadBandsAndScenesForRegion = useCallback(async (stateVal, distVal, seasonVal, startVal, endVal, specificRequestId) => {
+    const loadVersion = ++stackLoadVersionRef.current;
+    const isStale = () => loadVersion !== stackLoadVersionRef.current;
+
     if (!distVal && !stateVal && !specificRequestId) {
       setStackDownloadedBandsData({});
       setStackSelectedScenes({});
+      setLoadingStackReqFiles(false);
       return;
     }
 
     setLoadingStackReqFiles(true);
     try {
-      // 1. Fast request resolution: if specificRequestId is provided, resolve directly from state or single request GET
       let candidateRequests = [...requests];
       let matchingReq = null;
 
@@ -749,25 +733,54 @@ export default function App() {
         });
       }
 
+      if (isStale()) return;
+
       let tifs = [];
       const reqsToTry = specificRequestId ? (matchingReq ? [matchingReq] : []) : (matchingReq ? [matchingReq] : matchingList);
-      if (matchingReq || reqsToTry.length > 0) {
-        if (matchingReq) {
-          if (matchingReq.state && !stateVal) setStackState(matchingReq.state);
-          if (matchingReq.district && !distVal) setStackDistrict(matchingReq.district);
-          if (matchingReq.season) setStackSeason(matchingReq.season);
-          if (matchingReq.start_date && !startVal) setStackStartDate(matchingReq.start_date.split('T')[0]);
-          if (matchingReq.end_date && !endVal) setStackEndDate(matchingReq.end_date.split('T')[0]);
-        }
 
-        // Query candidate requests for tifs in parallel using Promise.all
-        const allTifsMap = new Map();
-        const tifsPromises = reqsToTry.map(r =>
+      // Source mode for a specific request: 'composite' => only that request's composites,
+      // 'individual' => only its per-scene /tifs rasters. Manual region search keeps legacy behavior ('region').
+      const compIntervalNorm = String((matchingReq && matchingReq.composite_interval) || '').trim().toLowerCase();
+      const sourceMode = (specificRequestId && matchingReq)
+        ? ((compIntervalNorm && compIntervalNorm !== 'none') ? 'composite' : 'individual')
+        : 'region';
+
+      const isPureS1 = matchingReq && matchingReq.satellite && matchingReq.satellite.toLowerCase().includes('sentinel-1') && !matchingReq.satellite.toLowerCase().includes('sentinel-2');
+
+      // Decide which requests get /tifs and which get /composites (each fetched exactly once, all in parallel)
+      const tifsReqs = sourceMode === 'composite' ? [] : reqsToTry;
+      let compReqs = [];
+      if (sourceMode === 'composite') {
+        compReqs = [matchingReq];
+      } else if (sourceMode === 'region' && !isPureS1) {
+        const candidateReqs = reqsToTry.length > 0 ? reqsToTry : (matchingReq ? [matchingReq] : []);
+        compReqs = candidateReqs.filter(r => !(r.satellite && r.satellite.toLowerCase().includes('sentinel-1') && !r.satellite.toLowerCase().includes('sentinel-2')));
+      }
+
+      if (matchingReq) {
+        if (matchingReq.state && !stateVal) setStackState(matchingReq.state);
+        if (matchingReq.district && !distVal) setStackDistrict(matchingReq.district);
+        if (matchingReq.season) setStackSeason(matchingReq.season);
+        if (matchingReq.start_date && !startVal) setStackStartDate(matchingReq.start_date.split('T')[0]);
+        if (matchingReq.end_date && !endVal) setStackEndDate(matchingReq.end_date.split('T')[0]);
+      }
+
+      const [tifsArrays, compResults] = await Promise.all([
+        Promise.all(tifsReqs.map(r =>
           axios.get(`${API_BASE}/requests/${r.id}/tifs`, { headers: getAuthHeader() })
             .then(res => res.data?.tifs || [])
             .catch(() => [])
-        );
-        const tifsArrays = await Promise.all(tifsPromises);
+        )),
+        Promise.all(compReqs.map(reqItem =>
+          axios.get(`${API_BASE}/requests/${reqItem.id}/composites`, { headers: getAuthHeader() })
+            .then(res => ({ reqItem, comps: res.data?.composites || res.data || [] }))
+            .catch(() => ({ reqItem, comps: [] }))
+        ))
+      ]);
+      if (isStale()) return;
+
+      if (tifsArrays.length > 0) {
+        const allTifsMap = new Map();
         tifsArrays.flat().forEach(t => {
           const k = (t.path || `${t.scene_id}_${t.band}`).toLowerCase();
           if (!allTifsMap.has(k)) {
@@ -778,7 +791,7 @@ export default function App() {
       }
 
       // If direct request tifs yielded 0 or no matchingReq, fallback to region search only when no specific request is selected
-      if (tifs.length === 0 && !specificRequestId && (distVal || stateVal)) {
+      if (tifs.length === 0 && sourceMode === 'region' && !specificRequestId && (distVal || stateVal)) {
         try {
           const retRes = await axios.get(`${API_BASE}/requests/tifs/retrieve`, {
             params: {
@@ -793,6 +806,7 @@ export default function App() {
         } catch (rErr) {
           console.warn('Could not retrieve tifs by region:', rErr);
         }
+        if (isStale()) return;
       }
 
       const grouped = {};
@@ -858,6 +872,8 @@ export default function App() {
           if (dm) sDate = `${dm[1]}-${dm[2]}-${dm[3]} to ${dm[4]}-${dm[5]}-${dm[6]}`;
         }
         const isComp = fileName.toLowerCase().includes('composite');
+        // Individual (non-composite) request: per-scene rasters only, never composite outputs
+        if (sourceMode === 'individual' && isComp) return;
 
         const sceneObj = {
           scene_id: item.scene_id || (isComp ? 'Composite' : 'Scene'),
@@ -890,26 +906,27 @@ export default function App() {
         }
       });
 
-      // Also try fetching composites for matched requests in parallel (skip optical composites for pure Sentinel-1 requests)
-      const isPureS1 = matchingReq && matchingReq.satellite && matchingReq.satellite.toLowerCase().includes('sentinel-1') && !matchingReq.satellite.toLowerCase().includes('sentinel-2');
-      if (!isPureS1) {
-        const candidateReqs = (typeof reqsToTry !== 'undefined' && reqsToTry.length > 0) ? reqsToTry : (matchingReq ? [matchingReq] : []);
-        const eligibleReqs = candidateReqs.filter(r => !(r.satellite && r.satellite.toLowerCase().includes('sentinel-1') && !r.satellite.toLowerCase().includes('sentinel-2')));
-        const compResults = await Promise.all(
-          eligibleReqs.map(reqItem =>
-            axios.get(`${API_BASE}/requests/${reqItem.id}/composites`, { headers: getAuthHeader() })
-              .then(res => ({ reqItem, comps: res.data?.composites || res.data || [] }))
-              .catch(() => ({ reqItem, comps: [] }))
-          )
-        );
+      // Individual Sentinel-1 rasters: keep only calibrated VV/VH when calibrated versions exist
+      if (sourceMode === 'individual') {
+        ['VV', 'VH'].forEach(pol => {
+          if (grouped[pol] && grouped[pol].some(s => s.is_calibrated)) {
+            grouped[pol] = grouped[pol].filter(s => s.is_calibrated);
+          }
+        });
+      }
+
+      // Merge composites fetched above (region mode: non-S1 candidates; composite mode: the selected request only)
+      if (compResults.length > 0) {
         for (const { reqItem, comps } of compResults) {
-          comps.forEach(c => {
+          (Array.isArray(comps) ? comps : []).forEach(c => {
             let b = c.index;
             if (!b && c.filename) {
               const fn = c.filename.toUpperCase();
               if (fn.includes('LSWI')) b = 'LSWI';
               else if (fn.includes('NDVI')) b = 'NDVI';
               else if (fn.includes('VV_VH') || fn.includes('VV/VH')) b = 'VV_VH';
+              else if (sourceMode === 'composite' && fn.includes('VH')) b = 'VH';
+              else if (sourceMode === 'composite' && fn.includes('VV')) b = 'VV';
               else if (fn.includes('B02') || fn.includes('_B2')) b = 'B02';
               else if (fn.includes('B03') || fn.includes('_B3')) b = 'B03';
               else if (fn.includes('B04') || fn.includes('_B4')) b = 'B04';
@@ -920,6 +937,11 @@ export default function App() {
             if (!b) b = 'NDVI';
             b = b.toUpperCase().trim();
             if (b === 'B08A') b = 'B8A';
+            if (b === 'VV/VH' || b === 'VV-VH') b = 'VV_VH';
+            if (sourceMode === 'composite') {
+              if (isReqS1Only && !['VV', 'VH', 'VV_VH'].includes(b)) return;
+              if (isReqS2Only && ['VV', 'VH', 'VV_VH'].includes(b)) return;
+            }
             if (!grouped[b]) grouped[b] = [];
             const cPath = c.path || c.output_path || c.local_delivery_path;
             const cFilename = c.filename || (cPath ? cPath.split(/[\\/]/).pop() : `Composite_${b}.tif`);
@@ -1035,7 +1057,7 @@ export default function App() {
     } catch (err) {
       console.warn('Could not fetch tifs for selected region:', err);
     } finally {
-      setLoadingStackReqFiles(false);
+      if (!isStale()) setLoadingStackReqFiles(false);
     }
   }, [requests]);
 
@@ -1333,7 +1355,6 @@ export default function App() {
       }
     ]);
 
-    // Collect all selected file paths from scenes strictly based on checked boxes
     const selectedPaths = [];
     const selectedFilesByBand = {};
 
@@ -1482,7 +1503,6 @@ export default function App() {
     }
 
     if (!isForce) {
-      // 1. Fetch latest NAS history for this district to ensure 100% up-to-date data
       let historyList = stackHistory || [];
       try {
         const cleanDistParam = (stackDistrict || '').split(',')[0].trim();
@@ -1498,7 +1518,6 @@ export default function App() {
         console.warn('Live history check before stacking skipped:', checkErr);
       }
 
-      // 2. Find ALL files where bands match stackSelectedLayers EXACTLY
       const isMatchingBands = (item) => {
         if (!item || !stackSelectedLayers || stackSelectedLayers.length === 0) return false;
 
@@ -1536,7 +1555,6 @@ export default function App() {
 
       const matchingFiles = historyList.filter(isMatchingBands);
 
-      // 3. If exact matching layer stack data exists on NAS, pop up modal with the single best matching file!
       if (matchingFiles.length > 0) {
         let bestMatch = matchingFiles[0];
 
@@ -1637,11 +1655,7 @@ export default function App() {
     }, 1500);
   };
 
-  // ---------------------------------------------------------------------------
-  // Handlers & API Calls
-  // ---------------------------------------------------------------------------
 
-  // Handle Login
   const handleLogin = async (e) => {
     e.preventDefault();
     setAuthError('');
@@ -1663,7 +1677,6 @@ export default function App() {
     }
   };
 
-  // Handle Self-Registration
   const handleRegister = async (e) => {
     e.preventDefault();
     setAuthError('');
@@ -1693,40 +1706,6 @@ export default function App() {
     }
   };
 
-  // Handle Forgot Password Reset
-  const handleResetPassword = async (e) => {
-    e.preventDefault();
-    setAuthError('');
-    setForgotSuccessMsg('');
-
-    if (forgotNewPassword.length < 6) {
-      setAuthError('New password must be at least 6 characters long.');
-      return;
-    }
-
-    if (forgotNewPassword !== forgotConfirmPassword) {
-      setAuthError('New password and confirm password do not match.');
-      return;
-    }
-
-    setAuthLoading(true);
-    try {
-      const res = await axios.post(`${API_BASE}/auth/reset-password`, {
-        email: forgotEmail,
-        new_password: forgotNewPassword,
-        confirm_password: forgotConfirmPassword
-      });
-      setForgotSuccessMsg(res.data?.message || 'Password reset successfully! Please sign in with your new password.');
-      setForgotNewPassword('');
-      setForgotConfirmPassword('');
-    } catch (err) {
-      setAuthError(formatApiError(err, 'Password reset failed. Please check the email address.'));
-    } finally {
-      setAuthLoading(false);
-    }
-  };
-
-  // Handle Logout
   const handleLogout = () => {
     localStorage.removeItem('sdap_token');
     localStorage.removeItem('sdap_user');
@@ -1739,7 +1718,6 @@ export default function App() {
   const boundariesLoadedRef = useRef(false);
   const isFetchingRequestsRef = useRef(false);
 
-  // Sync selectedReqIdRef to track selected request across poll updates
   useEffect(() => {
     selectedReqIdRef.current = selectedReqForLogs?.id || null;
   }, [selectedReqForLogs?.id]);
@@ -1774,7 +1752,6 @@ export default function App() {
       .finally(() => setLoadingBoundaries(false));
   }, [token]);
 
-  // Fetch Downloaded Regions for Data Retrieval Tab (Only States & Districts in DB/storage)
   const fetchDownloadedRegions = useCallback(async () => {
     if (!token) return;
     setLoadingRetRegions(true);
@@ -1854,7 +1831,6 @@ export default function App() {
     }
   }, [token, activeTab, requests, retDownloadedDistricts]);
 
-  // Fetch Requests List (scoped to logged-in user, or all requests for administrators)
   const fetchRequests = useCallback(async (isSilent = false) => {
     if (!token) return;
     if (isFetchingRequestsRef.current) return;
@@ -1873,7 +1849,6 @@ export default function App() {
     }
   }, [token, currentUser?.role]);
 
-  // Fetch Admin Users Directory
   const fetchAdminData = useCallback(async () => {
     if (!token || currentUser?.role !== 'ADMIN') return;
     setLoadingAdmin(true);
@@ -1887,7 +1862,6 @@ export default function App() {
     }
   }, [token, currentUser]);
 
-  // Fetch Specific User's Requests (Admin Only)
   const fetchUserRequests = useCallback(async (userId) => {
     if (!userId) return;
     setLoadingUserRequests(prev => ({ ...prev, [userId]: true }));
@@ -2367,8 +2341,58 @@ export default function App() {
     );
   };
 
+  // Reset incremental log-sync state for a request. When initialLoaded is true the first poll
+  // fetches /logs?offset=0 and replaces the text; otherwise polling waits for the initial full fetch.
+  const resetLogsSync = (req, initialLoaded) => {
+    logsSyncRef.current = {
+      reqId: req.id,
+      text: '',
+      length: 0,
+      status: req.status || null,
+      initialLoaded,
+      terminalSeen: false,
+      finalFetched: false,
+      inFlight: false,
+      meta: null,
+      metaKey: '',
+      lastMetaAt: Date.now(),
+      lastAuxAt: Date.now(),
+      tifsKey: null,
+      compsKey: null
+    };
+    return logsSyncRef.current;
+  };
+
+  // Fetch /tifs and /composites for the logs modal in parallel; only update state when contents changed
+  const refreshLogsModalAux = (reqId, sync) => {
+    sync.lastAuxAt = Date.now();
+    Promise.all([
+      axios.get(`${API_BASE}/requests/${reqId}/tifs`, { headers: getAuthHeader() })
+        .then(res => res.data?.tifs || [])
+        .catch(() => null),
+      axios.get(`${API_BASE}/requests/${reqId}/composites`, { headers: getAuthHeader() })
+        .then(res => res.data?.composites || res.data || [])
+        .catch(() => null)
+    ]).then(([tifsList, compsList]) => {
+      if (selectedReqIdRef.current !== reqId || logsSyncRef.current !== sync) return;
+      const firstLoad = sync.tifsKey === null;
+      const tifsVal = tifsList === null ? (firstLoad ? [] : null) : tifsList;
+      if (tifsVal !== null) {
+        const k = JSON.stringify(tifsVal);
+        if (k !== sync.tifsKey) { sync.tifsKey = k; setLogsModalTifs(tifsVal); }
+      }
+      const compsFirst = sync.compsKey === null;
+      const compsVal = compsList === null ? (compsFirst ? [] : null) : compsList;
+      if (compsVal !== null) {
+        const k = JSON.stringify(compsVal);
+        if (k !== sync.compsKey) { sync.compsKey = k; setLogsModalComposites(compsVal); }
+      }
+    });
+  };
+
   const openRequestStackLogs = (req) => {
     selectedReqIdRef.current = req.id;
+    resetLogsSync(req, true);
     setSelectedReqForLogs(req);
     setRequestLogTab('stacking');
     setIsLogsModalOpen(true);
@@ -2377,38 +2401,35 @@ export default function App() {
 
   const openLogsModal = (req) => {
     selectedReqIdRef.current = req.id;
+    const sync = resetLogsSync(req, false);
     setSelectedReqForLogs(req);
     setRequestLogTab('pipeline');
     setIsLogsModalOpen(true);
     fetchRequestStackLogs(req.id);
-    selectedReqIdRef.current = req.id;
-    setSelectedReqForLogs(req);
-    setIsLogsModalOpen(true);
+    // Initial full fetch (with logs) once; subsequent polls only tail /logs?offset=<length>
     axios.get(`${API_BASE}/requests/${req.id}`, { headers: getAuthHeader() })
       .then(res => {
-        if (res.data && selectedReqIdRef.current === req.id) {
+        if (logsSyncRef.current !== sync || selectedReqIdRef.current !== req.id) return;
+        if (res.data) {
+          const fullText = typeof res.data.execution_logs === 'string' ? res.data.execution_logs : '';
+          sync.text = fullText;
+          sync.length = codePointLength(fullText);
+          if (res.data.status) sync.status = res.data.status;
+          // Already-finished request: the full fetch counts as the first of the two terminal fetches
+          if (isTerminalLogStatus(sync.status)) sync.terminalSeen = true;
           setSelectedReqForLogs(res.data);
         }
+        sync.initialLoaded = true;
       })
-      .catch(() => {});
-    axios.get(`${API_BASE}/requests/${req.id}/tifs`, { headers: getAuthHeader() })
-      .then(res => {
-        if (selectedReqIdRef.current === req.id) {
-          setLogsModalTifs(res.data?.tifs || []);
-        }
-      })
-      .catch(() => setLogsModalTifs([]));
-    axios.get(`${API_BASE}/requests/${req.id}/composites`, { headers: getAuthHeader() })
-      .then(res => {
-        if (selectedReqIdRef.current === req.id) {
-          setLogsModalComposites(res.data?.composites || res.data || []);
-        }
-      })
-      .catch(() => setLogsModalComposites([]));
+      .catch(() => {
+        if (logsSyncRef.current === sync) sync.initialLoaded = true;
+      });
+    refreshLogsModalAux(req.id, sync);
   };
 
   const closeLogsModal = () => {
     selectedReqIdRef.current = null;
+    logsSyncRef.current = { reqId: null };
     setIsLogsModalOpen(false);
     setRequestLogTab('pipeline');
     setReqStackJobs([]);
@@ -2422,14 +2443,12 @@ export default function App() {
     setLogSearchQuery('');
   };
 
-  // Initial fetch of requests on login
   useEffect(() => {
     if (token) {
       fetchRequests();
     }
   }, [token, fetchRequests]);
 
-  // Initial / tab-switch fetch for admin data
   useEffect(() => {
     if (token && currentUser?.role === 'ADMIN') {
       if (activeTab === 'users') {
@@ -2447,34 +2466,109 @@ export default function App() {
       // Do NOT run background table re-fetches to prevent unnecessary DOM re-renders, shifting, or scrolling.
       if (isLogsModalOpen && selectedReqIdRef.current) {
         const targetModalId = selectedReqIdRef.current;
-        try {
-          const res = await axios.get(`${API_BASE}/requests/${targetModalId}`, { headers: getAuthHeader() });
-          if (res.data && selectedReqIdRef.current === targetModalId) {
-            setSelectedReqForLogs(res.data);
-          }
-        } catch (e) {
-          // ignore polling failure
+        let sync = logsSyncRef.current;
+        if (!sync || sync.reqId !== targetModalId) {
+          sync = resetLogsSync({ id: targetModalId, status: null }, true);
         }
-        try {
-          const tifsRes = await axios.get(`${API_BASE}/requests/${targetModalId}/tifs`, { headers: getAuthHeader() });
-          if (selectedReqIdRef.current === targetModalId) {
-            setLogsModalTifs(tifsRes.data?.tifs || []);
+        if (sync.inFlight) return; // previous tick still running
+
+        const now = Date.now();
+        const wasTerminal = isTerminalLogStatus(sync.status);
+        // Tail logs while running; once terminal, do exactly one more fetch and stop
+        const pollLogs = sync.initialLoaded && (!wasTerminal || !sync.finalFetched);
+        // Lightweight metadata (no logs): every tick while running, every ~10s once terminal (detects re-runs)
+        const pollMeta = !wasTerminal || (now - sync.lastMetaAt >= 10000);
+
+        if (pollLogs || pollMeta) {
+          const requestedOffset = sync.length;
+          sync.inFlight = true;
+          const [logsRes, metaRes] = await Promise.all([
+            pollLogs
+              ? axios.get(`${API_BASE}/requests/${targetModalId}/logs`, { params: { offset: requestedOffset }, headers: getAuthHeader() })
+                  .then(r => r.data)
+                  .catch(e => ({ __error: e }))
+              : Promise.resolve(null),
+            pollMeta
+              ? axios.get(`${API_BASE}/requests/${targetModalId}`, { params: { include_logs: false }, headers: getAuthHeader() })
+                  .then(r => r.data)
+                  .catch(() => null)
+              : Promise.resolve(null)
+          ]);
+          sync.inFlight = false;
+          if (selectedReqIdRef.current !== targetModalId || logsSyncRef.current !== sync) return;
+
+          const prevStatus = sync.status;
+          let textChanged = false;
+          let metaChanged = false;
+
+          if (logsRes && !logsRes.__error) {
+            const chunk = typeof logsRes.chunk === 'string' ? logsRes.chunk : '';
+            if (logsRes.reset || requestedOffset === 0) {
+              if (chunk !== sync.text) { sync.text = chunk; textChanged = true; }
+              sync.length = logsRes.reset ? codePointLength(chunk) : (typeof logsRes.length === 'number' ? logsRes.length : codePointLength(chunk));
+            } else {
+              if (chunk) { sync.text += chunk; textChanged = true; }
+              sync.length = typeof logsRes.length === 'number' ? logsRes.length : requestedOffset + codePointLength(chunk);
+            }
+            if (logsRes.status) sync.status = logsRes.status;
+          } else if (logsRes && logsRes.__error && logsRes.__error.response?.status === 404) {
+            // Fallback for backends without the /logs endpoint: one full fetch
+            try {
+              const full = await axios.get(`${API_BASE}/requests/${targetModalId}`, { headers: getAuthHeader() });
+              if (selectedReqIdRef.current !== targetModalId || logsSyncRef.current !== sync) return;
+              const fullText = typeof full.data?.execution_logs === 'string' ? full.data.execution_logs : '';
+              if (fullText !== sync.text) { sync.text = fullText; textChanged = true; }
+              sync.length = codePointLength(fullText);
+              if (full.data?.status) sync.status = full.data.status;
+            } catch (e) {
+              // ignore polling failure
+            }
           }
-        } catch (e) {
-          // ignore tifs polling failure
-        }
-        try {
-          const compRes = await axios.get(`${API_BASE}/requests/${targetModalId}/composites`, { headers: getAuthHeader() });
-          if (selectedReqIdRef.current === targetModalId) {
-            setLogsModalComposites(compRes.data?.composites || compRes.data || []);
+
+          if (metaRes && typeof metaRes === 'object') {
+            const { execution_logs: _ignoredLogs, ...meta } = metaRes;
+            sync.lastMetaAt = now;
+            const metaKey = JSON.stringify(meta);
+            if (metaKey !== sync.metaKey) {
+              sync.metaKey = metaKey;
+              sync.meta = meta;
+              metaChanged = true;
+            }
+            if (!pollLogs && meta.status) sync.status = meta.status;
           }
-        } catch (e) {
-          // ignore composites polling failure
+
+          const isTerminalNow = isTerminalLogStatus(sync.status);
+          if (!isTerminalNow) {
+            sync.terminalSeen = false;
+            sync.finalFetched = false;
+          } else if (pollLogs && logsRes && !logsRes.__error) {
+            if (sync.terminalSeen) sync.finalFetched = true;
+            else sync.terminalSeen = true;
+          }
+
+          const statusChanged = sync.status !== prevStatus;
+          if (textChanged || metaChanged || statusChanged) {
+            const nextText = sync.text;
+            const nextMeta = metaChanged ? sync.meta : null;
+            const nextStatus = sync.status;
+            setSelectedReqForLogs(prev => {
+              if (!prev || prev.id !== targetModalId) return prev;
+              const next = nextMeta ? { ...prev, ...nextMeta } : { ...prev };
+              if (textChanged) next.execution_logs = nextText;
+              if (nextStatus) next.status = nextStatus;
+              return next;
+            });
+          }
+
+          // /tifs + /composites: only every ~10s while running, or when status changed / finished
+          const auxDue = !(isTerminalNow && sync.finalFetched && !statusChanged) && (now - sync.lastAuxAt >= 10000);
+          if (statusChanged || auxDue) {
+            refreshLogsModalAux(targetModalId, sync);
+          }
         }
         return; // Don't run background table re-fetches while user is inspecting logs in modal
       }
 
-      // 2. Normal background polling when modal is closed (using isSilent=true to avoid loading state flickering)
       fetchRequests(true);
       if (currentUser?.role === 'ADMIN') {
         if (activeTab === 'users') {
@@ -2620,11 +2714,6 @@ export default function App() {
   }, [isLogsModalOpen, requestLogTab, selectedReqForLogs?.id, reqStackJobs, fetchRequestStackLogs]);
 
 
-  // ---------------------------------------------------------------------------
-  // Realistic Dynamic Storage & Step-Based Duration Estimation Logic (SRS 8.3)
-  // Calibrated to real-world AWS S3 network throughput, ESA SNAP SAR calibration,
-  // cloud-masked spectral index extraction, and multi-tile district mosaicking.
-  // ---------------------------------------------------------------------------
   const calculateEstimatedStorage = () => {
     const start = new Date(startDate);
     const end = new Date(endDate);
@@ -2661,7 +2750,7 @@ export default function App() {
       scenesEstimate = s2Scenes;
     }
 
-    // ── Multi-Request & Server Queue Load Factor ──
+    // Multi-Request & Server Queue Load Factor
     const activePipelineRequests = (requests || []).filter(r => {
       const st = (r.status || '').toUpperCase();
       return st === 'RUNNING' || st === 'PROCESSING' || st === 'QUEUED' || st === 'PENDING' || st === 'IN_PROGRESS';
@@ -2672,7 +2761,7 @@ export default function App() {
     const queueCompositeFactor = 1.0 + (queueCount * 0.30);
     const queueDiscoveryFactor = 1.0 + (queueCount * 0.15);
 
-    // ── Step-by-Step Realistic Execution Timings (Profiled on Real NAS / S3 Workloads) ──
+    // Step-by-Step Realistic Execution Timings (Profiled on Real NAS / S3 Workloads)
 
     // Step 1: Gap Check & Scene Discovery (Querying AWS S3, held scene cataloging & NAS audit)
     // Auditing ~40-80 candidate scenes across tiles takes ~2.5 to 5 minutes
@@ -2814,7 +2903,6 @@ export default function App() {
     }
   }, [token]);
 
-  // Sync daily quota when entering new_request tab or on login
   useEffect(() => {
     if (token) fetchDailyQuota();
   }, [token, activeTab, fetchDailyQuota]);
@@ -2905,7 +2993,6 @@ export default function App() {
   };
 
 
-  // Re-run / Retry Handler
   const handleRerun = async (reqId) => {
     setRerunningId(reqId);
     try {
@@ -2914,6 +3001,15 @@ export default function App() {
       if (selectedReqForLogs && selectedReqForLogs.id === reqId) {
         setSelectedReqForLogs(res.data);
       }
+      const sync = logsSyncRef.current;
+      if (sync && sync.reqId === reqId) {
+        // Resume log tailing from scratch (next poll fetches /logs?offset=0 and replaces the text)
+        if (res.data?.status) sync.status = res.data.status;
+        sync.length = 0;
+        sync.initialLoaded = true;
+        sync.terminalSeen = false;
+        sync.finalFetched = false;
+      }
     } catch (err) {
       alert(formatApiError(err, 'Error rerunning pipeline.'));
     } finally {
@@ -2921,7 +3017,6 @@ export default function App() {
     }
   };
 
-  // Stop / Cancel Pipeline Execution Handler
   const handleStop = async (reqId) => {
     if (!window.confirm(`Are you sure you want to stop the execution of request #${reqId}?`)) return;
     setStoppingId(reqId);
@@ -2931,6 +3026,13 @@ export default function App() {
       if (selectedReqForLogs && selectedReqForLogs.id === reqId) {
         setSelectedReqForLogs(res.data);
       }
+      const sync = logsSyncRef.current;
+      if (sync && sync.reqId === reqId) {
+        // Ensure the trailing stop messages are still tailed (final fetches after terminal status)
+        if (res.data?.status) sync.status = res.data.status;
+        sync.terminalSeen = false;
+        sync.finalFetched = false;
+      }
     } catch (err) {
       alert(formatApiError(err, 'Error stopping request pipeline.'));
     } finally {
@@ -2938,7 +3040,6 @@ export default function App() {
     }
   };
 
-  // Admin Approve Handler
   const handleApproveStatus = async (reqId, newStatus) => {
     try {
       await axios.patch(`${API_BASE}/requests/${reqId}/status?status_value=${newStatus}`, {}, { headers: getAuthHeader() });
@@ -2949,7 +3050,6 @@ export default function App() {
     }
   };
 
-  // Admin Create User Handler
   const handleCreateUser = async (e) => {
     e.preventDefault();
     setAdminUserMsg(null);
@@ -2971,7 +3071,24 @@ export default function App() {
     }
   };
 
-  // Admin Delete User Handler
+  const handleResetUserPassword = async (userId, userEmail) => {
+    const newPassword = window.prompt(`Set a new password for "${userEmail}" (minimum 6 characters).
+
+Share it with the user securely.`);
+    if (newPassword === null) return;
+    if (newPassword.trim().length < 6) {
+      alert('Password must be at least 6 characters long.');
+      return;
+    }
+    setAdminUserMsg(null);
+    try {
+      await axios.patch(`${API_BASE}/users/${userId}/password`, { new_password: newPassword.trim() }, { headers: getAuthHeader() });
+      setAdminUserMsg({ type: 'success', text: `Password for "${userEmail}" updated successfully.` });
+    } catch (err) {
+      setAdminUserMsg({ type: 'error', text: formatApiError(err, 'Failed to reset password.') });
+    }
+  };
+
   const handleDeleteUser = async (userId, userEmail) => {
     if (userId === currentUser?.id || userEmail === currentUser?.email) {
       alert("Administrators cannot delete their own active account.");
@@ -2991,7 +3108,6 @@ export default function App() {
     }
   };
 
-  // Filtered Districts based on selectedState (case-insensitive & trimmed)
   const availableDistricts = selectedState
     ? districtsList.filter(d => {
         const sName = typeof d === 'object' && d ? (d.state_name || '') : '';
@@ -2999,7 +3115,6 @@ export default function App() {
       })
     : [];
 
-  // Filtered requests list
   const filteredRequests = requests.filter(r => {
     const matchesStatus = statusFilter === 'ALL' || r.status === statusFilter;
     const q = searchTerm.toLowerCase();
@@ -3012,7 +3127,6 @@ export default function App() {
     return matchesStatus && matchesSearch;
   });
 
-  // Helper for Status Badge styling
   const renderStatusBadge = (statusStr) => {
     switch (statusStr) {
       case 'ACCEPTED':
@@ -3032,7 +3146,6 @@ export default function App() {
     }
   };
 
-  // Format log lines into clean individual elements
   const renderLogContent = (rawLogs) => {
     if (!rawLogs || rawLogs.trim().length === 0) {
       return <div className="log-line log-line-info">Initializing pipeline log recorder... No logs written yet.</div>;
@@ -3056,6 +3169,12 @@ export default function App() {
       return <div key={idx} className={className}>{line}</div>;
     });
   };
+
+  // Memoized raw log terminal content: re-split/classify only when the log text (or view) changes
+  const memoizedRawLogContent = useMemo(
+    () => (isLogsModalOpen && logViewMode !== 'table' ? renderLogContent(selectedReqForLogs?.execution_logs) : null),
+    [isLogsModalOpen, logViewMode, selectedReqForLogs?.execution_logs]
+  );
 
   // Dynamically parse acquisition scenes, execution configs & tile scene insights from raw execution logs & verified TIFs
   const parseAcquisitionScenes = (rawLogs, selectedReq, verifiedTifs = []) => {
@@ -3118,11 +3237,9 @@ export default function App() {
       const lines = activeLogs.split(/\r?\n/).map(l => l.trim());
 
       for (const line of lines) {
-        // Extract timestamp: [YYYY-MM-DD HH:MM:SS] or HH:MM:SS
         const tsMatch = line.match(/^\[(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})\]/) || line.match(/^(\d{2}:\d{2}:\d{2})/);
         const timestamp = tsMatch ? (tsMatch[1] || tsMatch[0]) : '';
 
-        // 1. Extract Pipeline Execution Stages & Steps
         const stageM = line.match(/\[(STAGE\s*\d(?:\/\d)?\s*[^\]]*)\]/i) || line.match(/(STEP\s*\d+:\s*[^.]*)/i);
         if (stageM) {
           const stageText = stageM[1].trim();
@@ -3135,7 +3252,6 @@ export default function App() {
           }
         }
 
-        // 2. Extract Gap Check summary & target district
         const gapDistM = line.match(/(?:Gap Check & Scene Search for|querying database for tiles overlapping)\s*['"]?([^'"]+)['"]?/i);
         if (gapDistM) gapSummary.targetDistrict = gapDistM[1].trim();
 
@@ -3162,7 +3278,6 @@ export default function App() {
         const missM = line.match(/Missing from archive:\s*(\d+)/i);
         if (missM) gapSummary.missing = parseInt(missM[1]);
 
-        // 3. Extract Config Info from header lines
         const distM = line.match(/District:\s*([^\s|]+(?:\s+[^\s|]+)*)/i);
         if (distM) configInfo.district = distM[1].trim();
 
@@ -3184,7 +3299,6 @@ export default function App() {
         const compM = line.match(/Composite:\s*([^\s|]+)/i);
         if (compM) configInfo.composite = compM[1].trim();
 
-        // 4. Parse Tile Audit & Storage Status lines
         const tileAuditM = line.match(/\[TILE STATUS:\s*([^\]]+)\]\s*Tile\s+'?([A-Za-z0-9_]+)'?:\s*(.*)/i);
         if (tileAuditM) {
           const statusTag = tileAuditM[1].trim();
@@ -3205,7 +3319,6 @@ export default function App() {
           if (tileName !== 'S1_SAR' || hasS1) tilesSet.add(tileName);
         }
 
-        // 5. Extract MGRS / S1 Tiles identified
         const tilesMatch = line.match(/Tiles:\s*\[([^\]]+)\]/i) || line.match(/Tiles identified:\s*\[([^\]]+)\]/i);
         if (tilesMatch) {
           tilesMatch[1].replace(/['"]/g, '').split(',').forEach(t => {
@@ -3341,7 +3454,6 @@ export default function App() {
               if (!scenesMap[folderName].bands.includes('VH')) scenesMap[folderName].bands.push('VH');
             }
 
-            // Extract all bands mentioned in the summary list e.g. B02.tif: 201.6MB, B03.tif: ...
             const bandMatches = line.matchAll(/([A-Za-z0-9_]+)\.tiff?(?::\s*([\d.]+\s*MB))?/gi);
             for (const bm of bandMatches) {
               let bName = bm[1].toUpperCase().trim();
@@ -3572,7 +3684,6 @@ export default function App() {
           });
         }
 
-        // 12. Parse failed or error scenes
         const failMatch = line.match(/Scene\s+['"]?(S[12][A-Za-z0-9]_[0-9A-Za-z_]+)['"]?\s+(?:incomplete|download failed)|Failed fetching.*['"]?(S[12][A-Za-z0-9]_[0-9A-Za-z_]+)['"]?/i);
         if (failMatch) {
           const folderName = failMatch[1] || failMatch[2];
@@ -3592,7 +3703,6 @@ export default function App() {
           }
         }
 
-        // 13. General scene matching for pre-existing or cached scenes
         const sceneMatch = line.match(/\b(S[12][A-Za-z0-9]_[0-9A-Za-z_]+)/i);
         if (sceneMatch) {
           const folderName = sceneMatch[1];
@@ -3823,7 +3933,6 @@ export default function App() {
     };
   };
 
-  // Helper: Clean folder name by stripping any network UNC path (\\172.16.16.52\...) or local directory
   const cleanFolderName = (str) => {
     if (!str) return '—';
     let s = String(str).trim();
@@ -3851,6 +3960,17 @@ export default function App() {
   };
   const lightKpiLabelStyle = { fontSize: '0.74rem', fontWeight: 600, color: '#64748b', marginBottom: '0.2rem' };
 
+  // Single-entry cache: the full-log regex parse only re-runs when logs text, request object or verified TIFs change
+  const parseAcquisitionScenesCached = (rawLogs, selectedReq, verifiedTifs = []) => {
+    const c = parseScenesCacheRef.current;
+    if (c && c.rawLogs === rawLogs && c.selectedReq === selectedReq && c.verifiedTifs === verifiedTifs) {
+      return c.result;
+    }
+    const result = parseAcquisitionScenes(rawLogs, selectedReq, verifiedTifs);
+    parseScenesCacheRef.current = { rawLogs, selectedReq, verifiedTifs, result };
+    return result;
+  };
+
   const renderLogTableView = (rawLogs, selectedReq, verifiedTifs = [], backendComposites = []) => {
     try {
     const {
@@ -3862,7 +3982,7 @@ export default function App() {
       progressPct,
       gapSummary = {},
       warningsList = []
-    } = parseAcquisitionScenes(rawLogs, selectedReq, verifiedTifs);
+    } = parseAcquisitionScenesCached(rawLogs, selectedReq, verifiedTifs);
 
     const reqSat = selectedReq?.satellite || '';
     const isReqS1Only = reqSat.includes('Sentinel-1') && !reqSat.includes('Sentinel-2');
@@ -3919,7 +4039,6 @@ export default function App() {
       });
     };
 
-    // Step 1: Target bands needed for a scene
     const getTargetBandsForScene = (sc) => {
       const isS1 = sc.satellite?.startsWith('S1') || sc.folder?.startsWith('S1') || sc.tile === 'S1_SAR';
       if (isS1) {
@@ -3928,7 +4047,6 @@ export default function App() {
       return ['B02', 'B03', 'B04', 'B08', 'B8A', 'B11', 'SCL', 'TCI'];
     };
 
-    // Step 2: Strictly raw spectral bands ONLY (no NDVI, no LSWI, no SAR calibrated dB products)
     const getRawBandsForScene = (sc) => {
       const isS1 = sc.satellite?.startsWith('S1') || sc.folder?.startsWith('S1') || sc.tile === 'S1_SAR';
       if (isS1) {
@@ -3953,7 +4071,6 @@ export default function App() {
       return [];
     };
 
-    // Step 3: Strictly surface reflectance indices ONLY (NDVI, LSWI) or SAR Calibrated Products (VV_dB, VH_dB, VV_VH)
     const getIndicesBandsForScene = (sc) => {
       const isS1 = sc.satellite?.startsWith('S1') || sc.folder?.startsWith('S1') || sc.tile === 'S1_SAR';
       if (isS1) {
@@ -4087,7 +4204,6 @@ export default function App() {
             const cStart = fmtCompact(curr);
             const cEnd = fmtCompact(wEnd);
 
-            // Find all files in backend composites for this window
             const matchingComposites = (compositesList || []).filter(c => {
               const fn = (c.filename || '').toLowerCase();
               const dateMatch = (fn.includes(cStart) || fn.includes(wStartStr.replace(/-/g, ''))) &&
@@ -4097,7 +4213,6 @@ export default function App() {
 
             matchingComposites.forEach(c => usedBackendFiles.add(c.filename));
 
-            // Check if there was a missing optical rasters warning for this window in raw logs
             const windowWarnings = warningsList.filter(w =>
               w.type === 'NO_RASTERS' &&
               (w.scene?.includes(wStartStr) || w.message?.includes(wStartStr)) &&
@@ -4321,7 +4436,6 @@ export default function App() {
       );
     };
 
-    // Step 1 Scene Row
     const renderStep1SceneRow = (sc, idx) => {
       const isCached = sc.status === 'COMPLETE' || idx < gapAlreadyHeld;
       const statusText = isCached ? 'ALREADY HELD (CACHED)' : 'AVAILABLE ON S3';
@@ -4383,7 +4497,6 @@ export default function App() {
       );
     };
 
-    // Step 2 Scene Row (Strictly Raw Spectral Bands Only)
     const renderStep2SceneRow = (sc, idx) => {
       const isDownloading = sc.status === 'DOWNLOADING';
       const isComplete = sc.status === 'COMPLETE';
@@ -4543,7 +4656,6 @@ export default function App() {
       );
     };
 
-    // Step 3 Scene Row (Strictly Indices Only: NDVI, LSWI or SAR Calibrated deliverables)
     const renderStep3SceneRow = (sc, idx) => {
       const isS1 = sc.satellite?.startsWith('S1') || sc.folder?.startsWith('S1') || sc.tile === 'S1_SAR';
       const isComplete = sc.status === 'COMPLETE' || sc.hasSarCalibrated || selectedReq?.status === 'COMPLETED';
@@ -4699,7 +4811,6 @@ export default function App() {
       );
     };
 
-    // Step 4 Temporal Composite Row
     const renderStep4Row = (row, idx) => {
       const isComplete = row.status === 'COMPLETE';
       const isProcessing = row.status === 'PROCESSING';
@@ -4982,11 +5093,9 @@ export default function App() {
       );
     };
 
-    // Collect all unified pipeline issues & warnings across scenes, composites, and execution logs
     const allIssueItems = [];
     const seenIssueKeys = new Set();
 
-    // 1. Missing bands / failed / skipped scenes from displayScenes
     displayScenes.forEach(sc => {
       const hasMissingBands = sc.missingBands && sc.missingBands.length > 0;
       const isFailed = sc.status === 'FAILED' || sc.isFailedDownload;
@@ -5024,7 +5133,6 @@ export default function App() {
       }
     });
 
-    // 2. Step 4 skipped/warning rows (e.g. heavy cloud cover / no rasters)
     step4Rows.forEach((r, rIdx) => {
       if (r.status === 'SKIPPED (CLOUDS)' || r.warning) {
         const key = `step4_${r.date}_${rIdx}`;
@@ -5045,7 +5153,6 @@ export default function App() {
       }
     });
 
-    // 3. Any additional warnings from warningsList (execution logs)
     warningsList.forEach((w, wIdx) => {
       const key = `warn_${w.scene}_${w.message}`;
       const matchingSc = allIssueItems.find(it => it.folder === w.scene || (it.details && it.details.includes(w.scene)));
@@ -5065,7 +5172,6 @@ export default function App() {
       }
     });
 
-    // Extract or format the exact pipeline request configuration line from logs / request parameters
     const reqHeaderM = (rawLogs || '').match(/(\[\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\]\s+INFO:sdap\.universal_pipeline:\s+Range:.*)/i);
     const firstTsM = (rawLogs || '').match(/^\[(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})\]/m);
     const requestTimestamp = reqHeaderM
@@ -5080,7 +5186,6 @@ export default function App() {
     const requestMaxCloud = selectedReq?.max_cloud_cover !== undefined ? `${parseFloat(selectedReq.max_cloud_cover).toFixed(1)}%` : '—';
     const requestComposite = (selectedReq?.composite_interval || 'NONE').toUpperCase();
 
-    // Check which steps were requested and reached in real time
     const hasCompositeInterval = Boolean(
       selectedReq?.composite_interval &&
       selectedReq.composite_interval.toLowerCase() !== 'none' &&
@@ -5185,7 +5290,6 @@ export default function App() {
     return (
       <div style={{ display: 'flex', flexDirection: 'column', gap: '0.85rem', padding: '0', backgroundColor: '#ffffff' }}>
 
-        {/* 0. Request Basic Configuration & Parameters Banner */}
         <div style={{
           backgroundColor: '#ffffff',
           borderRadius: '0.5rem',
@@ -5236,14 +5340,12 @@ export default function App() {
           </div>
         </div>
 
-        {/* 1. Four KPI Metric Cards (Total Scenes | Complete | Tiles Covered | Bands Needed) */}
         <div style={{
           display: 'grid',
           gridTemplateColumns: 'repeat(4, 1fr)',
           gap: '0.75rem',
           margin: '0.15rem 0'
         }}>
-          {/* Card 1: Total Scenes */}
           <div style={lightKpiCardStyle}>
             <div style={lightKpiLabelStyle}>Total Scenes</div>
             <div style={{ fontSize: '1.4rem', fontWeight: 800, color: '#0f172a' }}>
@@ -5251,7 +5353,6 @@ export default function App() {
             </div>
           </div>
 
-          {/* Card 2: Complete */}
           <div style={lightKpiCardStyle}>
             <div style={lightKpiLabelStyle}>Complete</div>
             <div style={{ fontSize: '1.4rem', fontWeight: 800, color: '#16a34a' }}>
@@ -5259,7 +5360,6 @@ export default function App() {
             </div>
           </div>
 
-          {/* Card 3: Tiles Covered */}
           <div style={lightKpiCardStyle}>
             <div style={lightKpiLabelStyle}>Tiles Covered</div>
             <div style={{ fontSize: '1.4rem', fontWeight: 800, color: '#2563eb' }}>
@@ -5267,7 +5367,6 @@ export default function App() {
             </div>
           </div>
 
-          {/* Card 4: Bands Needed */}
           <div style={lightKpiCardStyle}>
             <div style={lightKpiLabelStyle}>Bands Needed</div>
             <div style={{ fontSize: '1.4rem', fontWeight: 800, color: '#2563eb' }}>
@@ -5276,7 +5375,6 @@ export default function App() {
           </div>
         </div>
 
-        {/* 2. Acquisition Progress Bar */}
         <div style={{ display: 'flex', flexDirection: 'column', gap: '0.25rem', margin: '0' }}>
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
             <span style={{ fontSize: '0.82rem', fontWeight: 600, color: '#475569' }}>Acquisition Progress</span>
@@ -5352,10 +5450,8 @@ export default function App() {
           })}
         </div>
 
-        {/* Dedicated Step-1 Gap Check Summary Card when Step 1 or All Steps is selected */}
         {(activeStepFilter === 'all' || activeStepFilter === 'step1') && renderGapCheckSummaryCard()}
 
-        {/* 3. Section Header: Acquisition Scenes Breakdown / Warnings Breakdown */}
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', margin: '0.15rem 0 0 0' }}>
           <span style={{ fontSize: '1.05rem', fontWeight: 800, color: '#0f172a' }}>
             {activeStepFilter === 'warnings' ? 'Acquisition Warnings & Missing Deliverables' : 'Acquisition Scenes Breakdown'}
@@ -5377,7 +5473,6 @@ export default function App() {
           </div>
         </div>
 
-        {/* 4. Table Structure: Auto-fitting with fixed layout and responsive fields */}
         <div style={{
           backgroundColor: '#ffffff',
           border: '1px solid #e2e8f0',
@@ -5409,7 +5504,6 @@ export default function App() {
                 </tr>
               ) : (
                 <>
-                  {/* STEP 1: Discovery & Gap Check */}
                   {(activeStepFilter === 'all' || activeStepFilter === 'step1') && (
                     <>
                       {renderStepHeader(
@@ -5437,7 +5531,6 @@ export default function App() {
                     </>
                   )}
 
-                  {/* STEP 3: SAR Calibration & Terrain Correction (S1) or Indices & Masking (S2) */}
                   {hasReachedStep3 && (activeStepFilter === 'all' || activeStepFilter === 'step3') && (
                     <>
                       {renderStepHeader(
@@ -5469,7 +5562,6 @@ export default function App() {
                     </>
                   )}
 
-                  {/* STEP 5: Multi-Band Layer Stacking Studio Deliverables */}
                   {((['COMPLETED', 'HELD', 'SUCCESS'].includes(selectedReq?.status) || (selectedReq?.stacking_count && selectedReq.stacking_count > 0)) && (activeStepFilter === 'all' || activeStepFilter === 'step5')) && (
                     <>
                       {(() => {
@@ -5598,7 +5690,6 @@ export default function App() {
                     </>
                   )}
 
-                  {/* Pipeline Stopped Notice if user stopped before later steps */}
                   {selectedReq?.status === 'STOPPED' && !hasReachedStep2 && (
                     <tr>
                       <td colSpan={6} style={{ padding: '0.9rem 1rem', textAlign: 'center', backgroundColor: '#fef2f2', color: '#991b1b', borderTop: '1px solid #fecaca' }}>
@@ -5618,7 +5709,6 @@ export default function App() {
                     </tr>
                   )}
 
-                  {/* WARNINGS STEP: Shown clearly when user clicks on Warnings */}
                   {activeStepFilter === 'warnings' && (
                     <>
                       {renderStepHeader(
@@ -5664,9 +5754,6 @@ export default function App() {
   };
 
 
-  // ===========================================================================
-  // RENDER: Unauthenticated View (Login / Register / Forgot Password)
-  // ===========================================================================
   if (!token || !currentUser) {
     return (
       <div style={{
@@ -5686,7 +5773,6 @@ export default function App() {
           border: '1px solid #e2e8f0',
           padding: '2rem'
         }}>
-          {/* Brand Header with Satellite Logo */}
           <div style={{ textAlign: 'center', marginBottom: '1.5rem' }}>
             <div style={{
               display: 'inline-flex',
@@ -5707,7 +5793,6 @@ export default function App() {
             <p style={{ fontSize: '0.85rem', color: '#64748b', margin: 0 }}>Satellite Data Acquisition & Processing Platform</p>
           </div>
 
-          {/* Navigation Mode Header */}
           {authMode !== 'forgot' ? (
             <div style={{
               display: 'flex',
@@ -5765,7 +5850,7 @@ export default function App() {
               </h3>
               <button
                 type="button"
-                onClick={() => { setAuthMode('login'); setAuthError(''); setForgotSuccessMsg(''); }}
+                onClick={() => { setAuthMode('login'); setAuthError(''); }}
                 style={{
                   display: 'inline-flex',
                   alignItems: 'center',
@@ -5797,7 +5882,6 @@ export default function App() {
             </div>
           )}
 
-          {/* ==================== SIGN IN FORM ==================== */}
           {authMode === 'login' && (
             <form onSubmit={handleLogin}>
               <div style={{ marginBottom: '1rem' }}>
@@ -5819,7 +5903,6 @@ export default function App() {
                 />
               </div>
 
-              {/* Password Input with Show/Hide Toggle */}
               <div style={{ marginBottom: '0.5rem' }}>
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.35rem' }}>
                   <label style={{ fontSize: '0.8rem', fontWeight: 600, color: '#334155' }}>Password</label>
@@ -5892,7 +5975,6 @@ export default function App() {
             </form>
           )}
 
-          {/* ==================== REGISTER FORM ==================== */}
           {authMode === 'register' && (
             <form onSubmit={handleRegister}>
               <div style={{ marginBottom: '1rem' }}>
@@ -5933,7 +6015,6 @@ export default function App() {
                 />
               </div>
 
-              {/* Password with Show/Hide Toggle */}
               <div style={{ marginBottom: '1.25rem' }}>
                 <label style={{ display: 'block', fontSize: '0.8rem', fontWeight: 600, color: '#334155', marginBottom: '0.35rem' }}>Password (min 6 characters)</label>
                 <div style={{ position: 'relative' }}>
@@ -5996,171 +6077,38 @@ export default function App() {
             </form>
           )}
 
-          {/* ==================== FORGOT PASSWORD FORM ==================== */}
           {authMode === 'forgot' && (
-            <form onSubmit={handleResetPassword}>
-              {forgotSuccessMsg ? (
-                <div style={{ textAlign: 'center', padding: '1rem 0' }}>
-                  <div style={{
-                    backgroundColor: '#dcfce7',
-                    color: '#166534',
-                    padding: '0.85rem',
-                    borderRadius: '0.5rem',
-                    fontSize: '0.85rem',
-                    border: '1px solid #bbf7d0',
-                    marginBottom: '1.25rem'
-                  }}>
-                    {forgotSuccessMsg}
-                  </div>
-                  <button
-                    type="button"
-                    onClick={() => { setAuthMode('login'); setForgotSuccessMsg(''); }}
-                    style={{
-                      width: '100%',
-                      backgroundColor: '#2563eb',
-                      color: '#ffffff',
-                      fontWeight: 600,
-                      fontSize: '0.9rem',
-                      padding: '0.65rem',
-                      border: 'none',
-                      borderRadius: '0.375rem',
-                      cursor: 'pointer'
-                    }}
-                  >
-                    Return to Sign In
-                  </button>
-                </div>
-              ) : (
-                <>
-                  <div style={{ marginBottom: '1rem' }}>
-                    <label style={{ display: 'block', fontSize: '0.8rem', fontWeight: 600, color: '#334155', marginBottom: '0.35rem' }}>
-                      Account Email Address
-                    </label>
-                    <input
-                      type="email"
-                      required
-                      value={forgotEmail}
-                      onChange={(e) => setForgotEmail(e.target.value)}
-                      placeholder="admin@sdap.niruthi.in"
-                      style={{
-                        width: '100%',
-                        padding: '0.6rem 0.75rem',
-                        borderRadius: '0.375rem',
-                        border: '1px solid #cbd5e1',
-                        fontSize: '0.9rem',
-                        outline: 'none'
-                      }}
-                    />
-                  </div>
-
-                  <div style={{ marginBottom: '1rem' }}>
-                    <label style={{ display: 'block', fontSize: '0.8rem', fontWeight: 600, color: '#334155', marginBottom: '0.35rem' }}>
-                      New Password (min 6 characters)
-                    </label>
-                    <div style={{ position: 'relative' }}>
-                      <input
-                        type={showPassword ? 'text' : 'password'}
-                        required
-                        minLength={6}
-                        value={forgotNewPassword}
-                        onChange={(e) => setForgotNewPassword(e.target.value)}
-                        placeholder="••••••••"
-                        style={{
-                          width: '100%',
-                          padding: '0.6rem 2.5rem 0.6rem 0.75rem',
-                          borderRadius: '0.375rem',
-                          border: '1px solid #cbd5e1',
-                          fontSize: '0.9rem',
-                          outline: 'none'
-                        }}
-                      />
-                      <button
-                        type="button"
-                        onClick={() => setShowPassword(!showPassword)}
-                        title={showPassword ? 'Hide password' : 'Show password'}
-                        style={{
-                          position: 'absolute',
-                          right: '0.65rem',
-                          top: '50%',
-                          transform: 'translateY(-50%)',
-                          border: 'none',
-                          background: 'none',
-                          color: '#64748b',
-                          cursor: 'pointer',
-                          padding: '0.2rem',
-                          display: 'flex',
-                          alignItems: 'center'
-                        }}
-                      >
-                        {showPassword ? <EyeOff size={18} /> : <Eye size={18} />}
-                      </button>
-                    </div>
-                  </div>
-
-                  <div style={{ marginBottom: '1.25rem' }}>
-                    <label style={{ display: 'block', fontSize: '0.8rem', fontWeight: 600, color: '#334155', marginBottom: '0.35rem' }}>
-                      Confirm New Password
-                    </label>
-                    <div style={{ position: 'relative' }}>
-                      <input
-                        type={showPassword ? 'text' : 'password'}
-                        required
-                        minLength={6}
-                        value={forgotConfirmPassword}
-                        onChange={(e) => setForgotConfirmPassword(e.target.value)}
-                        placeholder="••••••••"
-                        style={{
-                          width: '100%',
-                          padding: '0.6rem 2.5rem 0.6rem 0.75rem',
-                          borderRadius: '0.375rem',
-                          border: '1px solid #cbd5e1',
-                          fontSize: '0.9rem',
-                          outline: 'none'
-                        }}
-                      />
-                      <button
-                        type="button"
-                        onClick={() => setShowPassword(!showPassword)}
-                        title={showPassword ? 'Hide password' : 'Show password'}
-                        style={{
-                          position: 'absolute',
-                          right: '0.65rem',
-                          top: '50%',
-                          transform: 'translateY(-50%)',
-                          border: 'none',
-                          background: 'none',
-                          color: '#64748b',
-                          cursor: 'pointer',
-                          padding: '0.2rem',
-                          display: 'flex',
-                          alignItems: 'center'
-                        }}
-                      >
-                        {showPassword ? <EyeOff size={18} /> : <Eye size={18} />}
-                      </button>
-                    </div>
-                  </div>
-
-                  <button
-                    type="submit"
-                    disabled={authLoading}
-                    style={{
-                      width: '100%',
-                      backgroundColor: '#2563eb',
-                      color: '#ffffff',
-                      fontWeight: 600,
-                      fontSize: '0.9rem',
-                      padding: '0.65rem',
-                      border: 'none',
-                      borderRadius: '0.375rem',
-                      cursor: 'pointer'
-                    }}
-                  >
-                    {authLoading ? 'Resetting Password...' : 'Reset Password'}
-                  </button>
-                </>
-              )}
-            </form>
+            <div style={{ textAlign: 'center', padding: '0.5rem 0 0.25rem' }}>
+              <div style={{
+                backgroundColor: '#eff6ff',
+                color: '#1e3a8a',
+                padding: '0.95rem',
+                borderRadius: '0.5rem',
+                fontSize: '0.88rem',
+                border: '1px solid #bfdbfe',
+                marginBottom: '1.25rem',
+                lineHeight: 1.5
+              }}>
+                Forgot your password? Please contact a System Administrator. They can set a new password for your account from the User Management screen.
+              </div>
+              <button
+                type="button"
+                onClick={() => { setAuthMode('login'); setAuthError(''); }}
+                style={{
+                  width: '100%',
+                  backgroundColor: '#2563eb',
+                  color: '#ffffff',
+                  fontWeight: 600,
+                  fontSize: '0.9rem',
+                  padding: '0.65rem',
+                  border: 'none',
+                  borderRadius: '0.375rem',
+                  cursor: 'pointer'
+                }}
+              >
+                Return to Sign In
+              </button>
+            </div>
           )}
 
         </div>
@@ -6168,13 +6116,9 @@ export default function App() {
     );
   }
 
-  // ===========================================================================
-  // RENDER: Main Authenticated Dashboard Layout
-  // ===========================================================================
   return (
     <div style={{ minHeight: '100vh', display: 'flex', flexDirection: 'column', backgroundColor: '#f8fafc' }}>
       
-      {/* Top Header Bar */}
       <header style={{
         backgroundColor: '#ffffff',
         borderBottom: '1px solid #e2e8f0',
@@ -6206,7 +6150,6 @@ export default function App() {
           </div>
         </div>
 
-        {/* User Badge & Logout */}
         <div style={{ display: 'flex', alignItems: 'center', gap: '1rem' }}>
           <div style={{
             display: 'flex',
@@ -6255,10 +6198,8 @@ export default function App() {
         </div>
       </header>
 
-      {/* Main Container */}
       <div style={{ flex: 1, display: 'flex', flexDirection: 'column', maxWidth: '1400px', width: '100%', margin: '0 auto', padding: '1.5rem' }}>
         
-        {/* Navigation Tabs */}
         <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', borderBottom: '1px solid #e2e8f0', marginBottom: '1.5rem' }}>
           <button
             onClick={() => setActiveTab('requests')}
@@ -6366,13 +6307,9 @@ export default function App() {
           </button>
         </div>
 
-        {/* ========================================================================= */}
-        {/* TAB 1: Requests & Pipeline Logs Table View */}
-        {/* ========================================================================= */}
         {activeTab === 'requests' && (
           <div style={{ display: 'flex', flexDirection: 'column', gap: '1.25rem' }}>
             
-            {/* Filter & Search Bar */}
             <div style={{
               backgroundColor: '#ffffff',
               padding: '1rem 1.25rem',
@@ -6451,7 +6388,6 @@ export default function App() {
               </div>
             </div>
 
-            {/* Requests Table Card */}
             <div style={{
               backgroundColor: '#ffffff',
               borderRadius: '0.5rem',
@@ -6725,9 +6661,6 @@ export default function App() {
           </div>
         )}
 
-        {/* ========================================================================= */}
-        {/* TAB 2: Submit New Request Form */}
-        {/* ========================================================================= */}
         {activeTab === 'new_request' && (
           <div style={{ maxWidth: '850px', margin: '0 auto', width: '100%' }}>
             <div style={{
@@ -6797,7 +6730,6 @@ export default function App() {
 
               <form onSubmit={handleShowConfirm} style={{ display: 'flex', flexDirection: 'column', gap: '1.25rem' }}>
                 
-                {/* Title */}
                 <div>
                   <label style={{ display: 'block', fontSize: '0.8rem', fontWeight: 600, color: '#334155', marginBottom: '0.35rem' }}>
                     Request Title / Label <span style={{ color: '#ef4444' }}>*</span>
@@ -6812,7 +6744,6 @@ export default function App() {
                   />
                 </div>
 
-                {/* Area Type + Season Row */}
                 <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: '1rem' }}>
                   <div>
                     <label style={{ display: 'block', fontSize: '0.8rem', fontWeight: 600, color: '#334155', marginBottom: '0.35rem' }}>
@@ -6845,7 +6776,6 @@ export default function App() {
                   </div>
                 </div>
 
-                {/* Region & Administrative Boundary Selection */}
                 <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(240px, 1fr))', gap: '1rem' }}>
                   <div>
                     <label style={{ display: 'block', fontSize: '0.8rem', fontWeight: 600, color: '#334155', marginBottom: '0.35rem' }}>
@@ -6896,7 +6826,6 @@ export default function App() {
                   </div>
                 </div>
 
-                {/* Date Range Selection */}
                 <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(240px, 1fr))', gap: '1rem' }}>
                   <div>
                     <label style={{ display: 'block', fontSize: '0.8rem', fontWeight: 600, color: '#334155', marginBottom: '0.35rem' }}>
@@ -6947,7 +6876,6 @@ export default function App() {
                   </div>
                 </div>
 
-                {/* Satellite Constellation (Multi-Select Checkboxes) */}
                 <div>
                   <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.5rem' }}>
                     <label style={{ display: 'block', fontSize: '0.8rem', fontWeight: 600, color: '#334155' }}>
@@ -7025,7 +6953,6 @@ export default function App() {
                   </div>
                 </div>
 
-                {/* Spectral Indices (Sentinel-2) */}
                 {selectedSatellites.includes('Sentinel-2') && (
                   <div>
                     <label style={{ display: 'block', fontSize: '0.8rem', fontWeight: 600, color: '#334155', marginBottom: '0.5rem' }}>
@@ -7048,7 +6975,6 @@ export default function App() {
                   </div>
                 )}
 
-                {/* Composite Interval + Level Row */}
                 <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: '1rem' }}>
                   <div>
                     <label style={{ display: 'block', fontSize: '0.8rem', fontWeight: 600, color: '#334155', marginBottom: '0.35rem' }}>
@@ -7084,11 +7010,9 @@ export default function App() {
                   </div>
                 </div>
 
-                {/* Dynamic Estimated Storage & Pipeline Step Duration Box */}
                 <div style={{ backgroundColor: willBeRejected ? '#fef2f2' : willRequireApproval ? '#fffbeb' : '#f0fdf4', border: `1px solid ${willBeRejected ? '#fca5a5' : willRequireApproval ? '#fde68a' : '#bbf7d0'}`, borderRadius: '0.5rem', padding: '1rem 1.25rem' }}>
                   <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: '1rem' }}>
                     <div style={{ display: 'flex', alignItems: 'center', gap: '1.75rem', flexWrap: 'wrap' }}>
-                      {/* Storage Estimate */}
                       <div>
                         <div style={{ display: 'flex', alignItems: 'center', gap: '0.35rem', fontSize: '0.8rem', fontWeight: 600, color: '#64748b', marginBottom: '0.25rem' }}>
                           <HardDrive size={14} color="#2563eb" /> Estimated Storage Requirement
@@ -7101,7 +7025,6 @@ export default function App() {
                         </div>
                       </div>
 
-                      {/* Step-Based Pipeline Duration Estimate */}
                       <div style={{ borderLeft: '1px solid #cbd5e1', paddingLeft: '1.5rem' }}>
                         <div style={{ display: 'flex', alignItems: 'center', gap: '0.45rem', fontSize: '0.8rem', fontWeight: 600, color: '#64748b', marginBottom: '0.25rem' }}>
                           <Clock size={14} color="#d97706" /> Estimated Processing Duration
@@ -7182,14 +7105,12 @@ export default function App() {
                   </div>
                 </div>
 
-                {/* Date error summary */}
                 {formDateError && (
                   <div style={{ padding: '0.6rem 0.85rem', backgroundColor: '#fef2f2', border: '1px solid #fca5a5', borderRadius: '0.375rem', fontSize: '0.82rem', color: '#991b1b', display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
                     <AlertTriangle size={14} /> {formDateError}
                   </div>
                 )}
 
-                {/* Submit — opens confirmation modal */}
                 <button
                   type="submit"
                   disabled={submittingReq || !!formDateError || willBeRejected || Boolean(dailyQuota && !dailyQuota.is_admin && dailyQuota.remaining_today <= 0)}
@@ -7214,7 +7135,6 @@ export default function App() {
                 </button>
               </form>
 
-              {/* ── Pre-Submit Confirmation Modal (SRS 8.3) ── */}
               {showConfirmModal && confirmPayload && (
                 <div style={{ position: 'fixed', inset: 0, backgroundColor: 'rgba(0,0,0,0.4)', zIndex: 9999, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '1rem' }}>
                   <div style={{ backgroundColor: '#ffffff', borderRadius: '0.75rem', padding: '2rem', maxWidth: '520px', width: '100%', boxShadow: '0 20px 40px rgba(0,0,0,0.15)', border: '1px solid #e2e8f0' }}>
@@ -7270,13 +7190,9 @@ export default function App() {
           </div>
         )}
 
-        {/* ========================================================================= */}
-        {/* TAB 3B: System User Directory & Access Controls (Dedicated Admin Page) */}
-        {/* ========================================================================= */}
         {activeTab === 'users' && currentUser.role === 'ADMIN' && (
           <div style={{ display: 'flex', flexDirection: 'column', gap: '1.5rem' }}>
 
-            {/* User Management & Per-User Requests/Logs Section */}
             <div style={{
               backgroundColor: '#ffffff',
               borderRadius: '0.75rem',
@@ -7302,7 +7218,6 @@ export default function App() {
                 </div>
               )}
 
-              {/* Create User Sub-Form */}
               <form onSubmit={handleCreateUser} style={{
                 display: 'grid',
                 gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))',
@@ -7363,7 +7278,6 @@ export default function App() {
                 </button>
               </form>
 
-              {/* Users Directory Table */}
               <div style={{ overflowX: 'auto', border: '1px solid #e2e8f0', borderRadius: '0.5rem' }}>
                 <table style={{ width: '100%', borderCollapse: 'collapse', textAlign: 'left', fontSize: '0.85rem' }}>
                   <thead>
@@ -7458,6 +7372,27 @@ export default function App() {
 
                                   <button
                                     type="button"
+                                    onClick={() => handleResetUserPassword(u.id, u.email)}
+                                    title={`Set a new password for ${u.email}`}
+                                    style={{
+                                      display: 'inline-flex',
+                                      alignItems: 'center',
+                                      gap: '0.25rem',
+                                      padding: '0.35rem 0.6rem',
+                                      backgroundColor: '#eff6ff',
+                                      color: '#1d4ed8',
+                                      border: '1px solid #bfdbfe',
+                                      borderRadius: '0.375rem',
+                                      fontSize: '0.78rem',
+                                      fontWeight: 600,
+                                      cursor: 'pointer'
+                                    }}
+                                  >
+                                    <KeyRound size={14} /> Reset Password
+                                  </button>
+
+                                  <button
+                                    type="button"
                                     onClick={() => handleDeleteUser(u.id, u.email)}
                                     disabled={u.id === currentUser?.id || u.email === currentUser?.email}
                                     title={u.id === currentUser?.id || u.email === currentUser?.email ? "Cannot delete your own active administrator account" : `Delete user account (${u.email})`}
@@ -7481,7 +7416,6 @@ export default function App() {
                               </td>
                             </tr>
 
-                            {/* Accordion: User Requests & Execution Logs Sub-Panel */}
                             {isExpanded && (
                               <tr style={{ borderBottom: '2px solid #cbd5e1' }}>
                                 <td colSpan={7} style={{ padding: '1rem 1.25rem', backgroundColor: '#f8fafc' }}>
@@ -7564,7 +7498,6 @@ export default function App() {
                                                 </td>
                                                 <td style={{ padding: '0.6rem 0.75rem', textAlign: 'right', whiteSpace: 'nowrap' }}>
                                                   <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'flex-end', gap: '0.4rem', flexWrap: 'nowrap' }}>
-                                                    {/* View Execution Logs */}
                                                     <button
                                                       onClick={() => openLogsModal(req)}
                                                       title="View Pipeline Execution Logs"
@@ -7683,7 +7616,6 @@ export default function App() {
                                                       </>
                                                     )}
 
-                                                    {/* Approve if Hold for Approval */}
                                                     {req.status === 'HOLD_FOR_APPROVAL' && (
                                                       <button
                                                         onClick={async () => {
@@ -7705,7 +7637,6 @@ export default function App() {
                                                       </button>
                                                     )}
 
-                                                    {/* Stop if Processing */}
                                                     {req.status === 'PROCESSING' && (
                                                       <button
                                                         onClick={async () => {
@@ -7728,7 +7659,6 @@ export default function App() {
                                                       </button>
                                                     )}
 
-                                                    {/* Rerun if not currently running */}
                                                     {req.status !== 'PROCESSING' && (
                                                       <button
                                                         onClick={async () => {
@@ -7773,13 +7703,9 @@ export default function App() {
           </div>
         )}
 
-        {/* ========================================================================= */}
-        {/* TAB 4: Downloaded Data Retrieval Form & GeoTIFF Raster Inspector */}
-        {/* ========================================================================= */}
         {activeTab === 'retrieve_data' && (
           <div style={{ display: 'flex', flexDirection: 'column', gap: '1.5rem' }}>
             
-            {/* Form Card */}
             <div style={{
               backgroundColor: '#ffffff',
               borderRadius: '0.75rem',
@@ -7852,7 +7778,6 @@ export default function App() {
                   </select>
                 </div>
 
-                {/* Satellite Select */}
                 <div>
                   <label style={{ display: 'block', fontSize: '0.8rem', fontWeight: 600, color: '#334155', marginBottom: '0.35rem' }}>
                     Satellite Sensor
@@ -7868,7 +7793,6 @@ export default function App() {
                   </select>
                 </div>
 
-                {/* Temporal Composite Interval */}
                 <div>
                   <label style={{ display: 'block', fontSize: '0.8rem', fontWeight: 600, color: '#334155', marginBottom: '0.35rem' }}>
                     Temporal Composite Interval {retSelectedBands.length > 0 && <span style={{ color: '#2563eb', fontSize: '0.72rem', fontWeight: 700 }}>• Active</span>}
@@ -7893,7 +7817,6 @@ export default function App() {
                   </select>
                 </div>
 
-                {/* Start Date */}
                 <div>
                   <label style={{ display: 'block', fontSize: '0.8rem', fontWeight: 600, color: '#334155', marginBottom: '0.35rem' }}>
                     Start Date Bounds
@@ -7906,7 +7829,6 @@ export default function App() {
                   />
                 </div>
 
-                {/* End Date */}
                 <div>
                   <label style={{ display: 'block', fontSize: '0.8rem', fontWeight: 600, color: '#334155', marginBottom: '0.35rem' }}>
                     End Date Bounds
@@ -7919,7 +7841,6 @@ export default function App() {
                   />
                 </div>
 
-                {/* Spectral / SAR Band Checkboxes (Filtered by Satellite) */}
                 <div style={{ gridColumn: '1 / -1', marginTop: '0.35rem' }}>
                   <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '0.5rem', flexWrap: 'wrap', gap: '0.5rem' }}>
                     <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
@@ -8093,10 +8014,8 @@ export default function App() {
                     </div>
                   )}
 
-                  {/* Both Sensors (ALL) */}
                   {retSatellite === 'ALL' && (
                     <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
-                      {/* Sentinel-1 Group */}
                       <div style={{
                         padding: '0.75rem',
                         backgroundColor: '#ffffff',
@@ -8156,7 +8075,6 @@ export default function App() {
                         </div>
                       </div>
 
-                      {/* Sentinel-2 Group */}
                       <div style={{
                         padding: '0.75rem',
                         backgroundColor: '#ffffff',
@@ -8301,7 +8219,6 @@ export default function App() {
                 )}
               </div>
 
-              {/* Status & Notification Banner */}
               {retNotice && (
                 <div style={{
                   marginTop: '1rem',
@@ -8347,7 +8264,6 @@ export default function App() {
               )}
             </div>
 
-            {/* NAS Data Available Prompt Modal */}
             {showDownloadPromptModal && retResults && retResults.total_tifs > 0 && (
               <div style={{
                 position: 'fixed',
@@ -8372,7 +8288,6 @@ export default function App() {
                   overflow: 'hidden',
                   border: '1px solid #bfdbfe'
                 }}>
-                  {/* Header */}
                   <div style={{
                     backgroundColor: '#eff6ff',
                     borderBottom: '1px solid #dbeafe',
@@ -8410,7 +8325,6 @@ export default function App() {
                     </button>
                   </div>
 
-                  {/* Body Content */}
                   <div style={{ padding: '1.5rem' }}>
                     <div style={{
                       backgroundColor: '#f8fafc',
@@ -8493,7 +8407,6 @@ export default function App() {
                       )}
                     </div>
 
-                    {/* Question to User */}
                     <div style={{ textAlign: 'center', marginBottom: '1.25rem' }}>
                       <p style={{ fontSize: '1.05rem', fontWeight: 700, color: '#0f172a', margin: 0 }}>
                         Data is available on NAS. Do you want to download this data?
@@ -8503,7 +8416,6 @@ export default function App() {
                       </p>
                     </div>
 
-                    {/* Modal Action Buttons */}
                     <div style={{ display: 'flex', gap: '0.75rem', justifyContent: 'flex-end' }}>
                       <button
                         type="button"
@@ -8548,7 +8460,6 @@ export default function App() {
               </div>
             )}
 
-            {/* Retrieval Results Display Card */}
             {retResults && (
               <div style={{
                 backgroundColor: '#ffffff',
@@ -8559,7 +8470,6 @@ export default function App() {
                 flexDirection: 'column',
                 gap: '1.25rem'
               }}>
-                {/* Summary Stats Header */}
                 <div style={{
                   backgroundColor: '#eff6ff',
                   borderRadius: '0.5rem',
@@ -8610,7 +8520,6 @@ export default function App() {
                   </div>
                 </div>
 
-                {/* Action Toolbar & NAS Status */}
                 <div style={{
                   display: 'flex',
                   alignItems: 'center',
@@ -8667,9 +8576,6 @@ export default function App() {
               </div>
             )}
 
-            {/* ========================================================================= */}
-            {/* Existing Layer Stacks on NAS Archive (Filter & Direct Download Form)       */}
-            {/* ========================================================================= */}
             <div style={{
               backgroundColor: '#ffffff',
               borderRadius: '0.75rem',
@@ -8683,7 +8589,6 @@ export default function App() {
                 </h2>
               </div>
 
-              {/* Filter Controls Grid */}
               <div style={{
                 display: 'grid',
                 gridTemplateColumns: 'repeat(auto-fit, minmax(210px, 1fr))',
@@ -8694,7 +8599,6 @@ export default function App() {
                 border: '1px solid #e2e8f0',
                 marginBottom: '1.25rem'
               }}>
-                {/* State / Region Select */}
                 <div>
                   <label style={{ display: 'block', fontSize: '0.8rem', fontWeight: 600, color: '#334155', marginBottom: '0.35rem' }}>
                     State / Region
@@ -8715,7 +8619,6 @@ export default function App() {
                   </select>
                 </div>
 
-                {/* Target District Select */}
                 <div>
                   <label style={{ display: 'block', fontSize: '0.8rem', fontWeight: 600, color: '#334155', marginBottom: '0.35rem' }}>
                     Target District *
@@ -8738,7 +8641,6 @@ export default function App() {
                   </select>
                 </div>
 
-                {/* Crop / Meteorological Season Select */}
                 <div>
                   <label style={{ display: 'block', fontSize: '0.8rem', fontWeight: 600, color: '#334155', marginBottom: '0.35rem' }}>
                     Crop / Meteorological Season
@@ -8777,7 +8679,6 @@ export default function App() {
                   </select>
                 </div>
 
-                {/* Start Date */}
                 <div>
                   <label style={{ display: 'block', fontSize: '0.8rem', fontWeight: 600, color: '#334155', marginBottom: '0.35rem' }}>
                     Start Date
@@ -8790,7 +8691,6 @@ export default function App() {
                   />
                 </div>
 
-                {/* End Date */}
                 <div>
                   <label style={{ display: 'block', fontSize: '0.8rem', fontWeight: 600, color: '#334155', marginBottom: '0.35rem' }}>
                     End Date
@@ -8804,7 +8704,6 @@ export default function App() {
                 </div>
               </div>
 
-              {/* Action Buttons */}
               <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem', flexWrap: 'wrap' }}>
                 <button
                   type="button"
@@ -8848,7 +8747,6 @@ export default function App() {
                 </button>
               </div>
 
-              {/* Notice Banner */}
               {stackArchiveNotice && (
                 <div style={{
                   marginTop: '1.25rem',
@@ -9021,13 +8919,9 @@ export default function App() {
           </div>
         )}
 
-        {/* ========================================================================= */}
-        {/* TAB: Layer Stacking Studio */}
-        {/* ========================================================================= */}
         {activeTab === 'layer_stacking' && (
           <div style={{ display: 'flex', flexDirection: 'column', gap: '1.5rem' }}>
             
-            {/* Header Card */}
             <div style={{
               backgroundColor: '#ffffff',
               borderRadius: '0.75rem',
@@ -9040,7 +8934,6 @@ export default function App() {
                 </h2>
               </div>
 
-              {/* Notice Banner */}
               {stackNotice && (
                 <div style={{
                   padding: '0.85rem 1.25rem',
@@ -9065,7 +8958,6 @@ export default function App() {
                 </div>
               )}
 
-              {/* Controls Grid */}
               <div style={{
                 display: 'grid',
                 gridTemplateColumns: 'repeat(auto-fit, minmax(210px, 1fr))',
@@ -9076,7 +8968,6 @@ export default function App() {
                 border: '1px solid #e2e8f0',
                 marginBottom: '1.25rem'
               }}>
-                {/* State Select */}
                 <div>
                   <label style={{ display: 'block', fontSize: '0.8rem', fontWeight: 600, color: '#334155', marginBottom: '0.35rem' }}>
                     State / Region
@@ -9117,7 +9008,6 @@ export default function App() {
                   </select>
                 </div>
 
-                {/* District Select */}
                 <div>
                   <label style={{ display: 'block', fontSize: '0.8rem', fontWeight: 600, color: '#334155', marginBottom: '0.35rem' }}>
                     Target District <span style={{ color: '#ef4444' }}>*</span>
@@ -9165,7 +9055,6 @@ export default function App() {
                   </select>
                 </div>
 
-                {/* Season Select */}
                 <div>
                   <label style={{ display: 'block', fontSize: '0.8rem', fontWeight: 600, color: '#334155', marginBottom: '0.35rem' }}>
                     Crop / Meteorological Season
@@ -9187,7 +9076,6 @@ export default function App() {
                   </select>
                 </div>
 
-                {/* Start Date */}
                 <div>
                   <label style={{ display: 'block', fontSize: '0.8rem', fontWeight: 600, color: '#334155', marginBottom: '0.35rem' }}>
                     Start Date
@@ -9206,7 +9094,6 @@ export default function App() {
                   />
                 </div>
 
-                {/* End Date */}
                 <div>
                   <label style={{ display: 'block', fontSize: '0.8rem', fontWeight: 600, color: '#334155', marginBottom: '0.35rem' }}>
                     End Date
@@ -9226,7 +9113,6 @@ export default function App() {
                 </div>
               </div>
 
-              {/* Auto-loading status indicator */}
               {loadingStackReqFiles && (
                 <div style={{
                   padding: '0.65rem 1rem',
@@ -9245,7 +9131,6 @@ export default function App() {
                 </div>
               )}
 
-              {/* Order-Preserved Stack Sequence Visualizer */}
               <div style={{
                 marginBottom: '1.5rem',
                 padding: '1rem 1.25rem',
@@ -9349,7 +9234,6 @@ export default function App() {
                 )}
               </div>
 
-              {/* Band and Index Checkbox Groups (1. Indices, 2. SAR, 3. Optical) */}
               {(() => {
                 const renderLayerCard = (item, groupColor, groupBgLight, groupBorderLight) => {
                   const isChecked = stackSelectedLayers.includes(item.id);
@@ -9413,7 +9297,6 @@ export default function App() {
                         </div>
                       </div>
 
-                      {/* Downloaded scenes list when band/index is selected */}
                       {isChecked && (
                         <div style={{
                           backgroundColor: '#f8fafc',
@@ -9679,7 +9562,6 @@ export default function App() {
                       </div>
                     )}
                     <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(300px, 1fr))', gap: '1.25rem', marginBottom: '1.5rem' }}>
-                      {/* 1. Derived Spectral Indices (FIRST) */}
                       <div style={{ border: '1px solid #bfdbfe', borderRadius: '0.5rem', padding: '1rem', backgroundColor: '#fbfcfe' }}>
                         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '0.75rem', borderBottom: '1px solid #dbeafe', paddingBottom: '0.5rem' }}>
                           <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
@@ -9700,7 +9582,6 @@ export default function App() {
                         </div>
                       </div>
 
-                      {/* 2. SAR Radar Polarizations (SECOND) */}
                       <div style={{ border: '1px solid #fde68a', borderRadius: '0.5rem', padding: '1rem', backgroundColor: '#fffdfa' }}>
                         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '0.75rem', borderBottom: '1px solid #fef3c7', paddingBottom: '0.5rem' }}>
                           <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
@@ -9721,7 +9602,6 @@ export default function App() {
                         </div>
                       </div>
 
-                      {/* 3. Optical Spectral Bands (THIRD) */}
                       <div style={{ border: '1px solid #bbf7d0', borderRadius: '0.5rem', padding: '1rem', backgroundColor: '#fafffd' }}>
                         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '0.75rem', borderBottom: '1px solid #dcfce7', paddingBottom: '0.5rem' }}>
                           <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
@@ -9746,7 +9626,6 @@ export default function App() {
                 );
               })()}
 
-              {/* NAS Verification Banner (Informational: Input bands available on NAS) */}
               {(() => {
                 if (!stackDistrict || stackSelectedLayers.length === 0) return null;
 
@@ -9780,7 +9659,6 @@ export default function App() {
                 return null;
               })()}
 
-              {/* Execution Actions & Output Preview */}
               <div style={{
                 display: 'flex',
                 alignItems: 'center',
@@ -9856,7 +9734,6 @@ export default function App() {
 
             </div>
 
-            {/* Live Real-Time Layer Stacking Execution Console */}
             {(stackLoading || stackLogs.length > 0 || stackTaskId) && (
               <div style={{
                 backgroundColor: '#ffffff',
@@ -9867,7 +9744,6 @@ export default function App() {
                 display: 'flex',
                 flexDirection: 'column'
               }}>
-                {/* Active Concurrent Stacking Tasks Bar */}
                 {Object.keys(activeStackTasks).length > 0 && (
                   <div style={{
                     backgroundColor: '#f1f5f9',
@@ -9933,7 +9809,6 @@ export default function App() {
                     })}
                   </div>
                 )}
-                {/* Console Header */}
                 <div style={{
                   backgroundColor: '#f8fafc',
                   padding: '0.75rem 1.25rem',
@@ -9972,7 +9847,6 @@ export default function App() {
                     </div>
                   </div>
 
-                  {/* View Mode & Actions */}
                   <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', flexWrap: 'wrap' }}>
                     <div style={{ display: 'inline-flex', backgroundColor: '#f1f5f9', borderRadius: '0.375rem', padding: '2px', border: '1px solid #cbd5e1' }}>
                       <button
@@ -10075,7 +9949,6 @@ export default function App() {
                   </div>
                 </div>
 
-                {/* KPI Metrics Summary Bar */}
                 {(() => {
                   const total = stackLogs.length;
                   const infoCnt = stackLogs.filter(l => l.level === 'INFO').length;
@@ -10116,7 +9989,6 @@ export default function App() {
                   );
                 })()}
 
-                {/* Filter and Search Bar */}
                 <div style={{
                   padding: '0.5rem 1.25rem',
                   backgroundColor: '#ffffff',
@@ -10127,7 +9999,6 @@ export default function App() {
                   gap: '0.75rem',
                   flexWrap: 'wrap'
                 }}>
-                  {/* Filter Pills */}
                   <div style={{ display: 'flex', alignItems: 'center', gap: '0.35rem', flexWrap: 'wrap' }}>
                     {[
                       { key: 'all', label: `All (${stackLogs.length})` },
@@ -10160,7 +10031,6 @@ export default function App() {
                     })}
                   </div>
 
-                  {/* Search Input */}
                   <div style={{ position: 'relative', minWidth: '220px', flex: '1', maxWidth: '360px' }}>
                     <Search size={13} style={{ position: 'absolute', left: '0.6rem', top: '50%', transform: 'translateY(-50%)', color: '#94a3b8' }} />
                     <input
@@ -10198,7 +10068,6 @@ export default function App() {
                   </div>
                 </div>
 
-                {/* Live Progress Bar */}
                 <div style={{ width: '100%', height: '4px', backgroundColor: '#f1f5f9', overflow: 'hidden' }}>
                   <div style={{
                     width: `${Math.min(100, Math.max(0, stackProgress))}%`,
@@ -10208,7 +10077,6 @@ export default function App() {
                   }} />
                 </div>
 
-                {/* Log Content Area */}
                 {(() => {
                   const filteredLogs = stackLogs.filter(l => {
                     if (stackLogFilter === 'info' && l.level !== 'INFO') return false;
@@ -10370,7 +10238,6 @@ export default function App() {
                   );
                 })()}
 
-                {/* Console Footer */}
                 <div style={{
                   padding: '0.45rem 1.25rem',
                   backgroundColor: '#f8fafc',
@@ -10392,7 +10259,6 @@ export default function App() {
               </div>
             )}
 
-            {/* Success Result Card */}
             {stackResult && (
               <div style={{
                 backgroundColor: '#ffffff',
@@ -10509,7 +10375,6 @@ export default function App() {
               </div>
             )}
 
-            {/* Link to GeoTIFF Retrieval & NAS Archive tab */}
             <div style={{
               backgroundColor: '#f8fafc',
               borderRadius: '0.75rem',
@@ -10555,9 +10420,6 @@ export default function App() {
 
       </div>
 
-      {/* ========================================================================= */}
-      {/* MODAL 1: Execution Logs Terminal Viewer */}
-      {/* ========================================================================= */}
       {isLogsModalOpen && selectedReqForLogs && (
         <div className="modal-overlay" onClick={closeLogsModal}>
           <div className="modal-content" onClick={(e) => e.stopPropagation()} style={{
@@ -10575,7 +10437,6 @@ export default function App() {
             boxShadow: '0 25px 50px -12px rgba(15, 23, 42, 0.25)'
           }}>
             
-            {/* Modal Header: Clean white background with black text & blue accents */}
             <div style={{
               padding: '1.25rem 1.5rem 0.75rem 1.5rem',
               display: 'flex',
@@ -10733,7 +10594,6 @@ export default function App() {
               </div>
             </div>
 
-            {/* Top-Level Log Category Tabs: Pipeline vs Stacking */}
             <div style={{
               display: 'flex',
               alignItems: 'center',
@@ -10812,7 +10672,6 @@ export default function App() {
 
             {requestLogTab === 'pipeline' && (
               <>
-            {/* View Toolbar: Mode Switcher, Filters & Search */}
             <div style={{
               padding: '0.5rem 1.5rem',
               backgroundColor: '#f8fafc',
@@ -10823,7 +10682,6 @@ export default function App() {
               alignItems: 'center',
               justifyContent: 'space-between'
             }}>
-              {/* Left: View Mode Toggle */}
               <div style={{ display: 'flex', alignItems: 'center', gap: '0.6rem' }}>
                 <div style={{ display: 'inline-flex', backgroundColor: '#f1f5f9', borderRadius: '0.375rem', padding: '3px', border: '1px solid #e2e8f0' }}>
                   <button
@@ -10867,7 +10725,6 @@ export default function App() {
                 </div>
               </div>
 
-              {/* Right: Search Filter Input */}
               {logViewMode === 'table' && (
                 <div style={{ position: 'relative', width: '230px' }}>
                   <Search size={13} style={{ position: 'absolute', left: '0.65rem', top: '50%', transform: 'translateY(-50%)', color: '#64748b' }} />
@@ -10899,7 +10756,6 @@ export default function App() {
               )}
             </div>
 
-            {/* Modal Body: Switch between Table View and Raw Terminal View */}
             <div style={{
               padding: '1rem 1.25rem',
               backgroundColor: '#ffffff',
@@ -10922,7 +10778,7 @@ export default function App() {
                   padding: '1rem 1.25rem',
                   overflowY: 'auto'
                 }}>
-                  {renderLogContent(selectedReqForLogs.execution_logs)}
+                  {memoizedRawLogContent}
                   <div ref={logsEndRef} />
                 </div>
               )}
@@ -10944,7 +10800,6 @@ export default function App() {
               </div>
             )}
 
-            {/* Modal Footer Controls */}
             <div style={{
               padding: '0.85rem 1.5rem',
               borderTop: '1px solid #e2e8f0',
@@ -11023,30 +10878,23 @@ export default function App() {
         </div>
       )}
 
-      {/* ========================================================================= */}
-      {/* MODAL: Acquisition Warnings & Missing Items Inspection */}
-      {/* ========================================================================= */}
       {showWarningModal && selectedReqForLogs && (() => {
         const {
           scenes = [],
           gapSummary = {},
           warningsList = []
-        } = parseAcquisitionScenes(selectedReqForLogs.execution_logs, selectedReqForLogs, logsModalTifs);
+        } = parseAcquisitionScenesCached(selectedReqForLogs.execution_logs, selectedReqForLogs, logsModalTifs);
 
         const districtName = selectedReqForLogs.district || selectedReqForLogs.state || 'Selected AOI';
 
-        // 1. Scenes with Missing Bands
         const missingBandsScenes = scenes.filter(s => s.missingBands && s.missingBands.length > 0);
 
-        // 2. Out-of-bounds or Skipped Scenes
         const skippedScenes = scenes.filter(s =>
           s.status === 'SKIPPED' || (s.warning && (s.warning.includes('bounds') || s.warning.includes('0 valid')))
         );
 
-        // 3. Failed Scenes
         const failedScenes = scenes.filter(s => s.status === 'FAILED');
 
-        // 4. Queued / Missing Scenes from Archive Gap Check
         const gapMissingCount = gapSummary.missing || 0;
         const pendingScenes = scenes.filter(s => s.status === 'PENDING' || s.status === 'DOWNLOADING');
 
@@ -11160,7 +11008,6 @@ export default function App() {
                 boxShadow: '0 25px 50px -12px rgba(15, 23, 42, 0.35)'
               }}
             >
-              {/* Modal Header */}
               <div style={{
                 padding: '1.1rem 1.5rem',
                 borderBottom: '1px solid #e2e8f0',
@@ -11211,10 +11058,8 @@ export default function App() {
                 </button>
               </div>
 
-              {/* Modal Body */}
               <div style={{ padding: '1.25rem 1.5rem', overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: '1rem' }}>
 
-                {/* 3 KPI Summary Cards */}
                 <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '0.75rem' }}>
                   <div style={{
                     backgroundColor: '#fef2f2',
@@ -11268,7 +11113,6 @@ export default function App() {
                   </div>
                 </div>
 
-                {/* Filter notification if single scene was clicked */}
                 {selectedWarningScene && (
                   <div style={{
                     backgroundColor: '#eff6ff',
@@ -11302,7 +11146,6 @@ export default function App() {
                   </div>
                 )}
 
-                {/* Table of Missing Items / Warnings: EXACT 6 columns matching user request */}
                 <div style={{
                   backgroundColor: '#ffffff',
                   border: '1px solid #e2e8f0',
@@ -11414,7 +11257,6 @@ export default function App() {
 
               </div>
 
-              {/* Modal Footer */}
               <div style={{
                 padding: '0.85rem 1.5rem',
                 borderTop: '1px solid #e2e8f0',
@@ -11446,9 +11288,6 @@ export default function App() {
         );
       })()}
 
-      {/* ========================================================================= */}
-      {/* MODAL 2: Storage Calculation Explanation */}
-      {/* ========================================================================= */}
       {showStorageModal && (
         <div className="modal-overlay">
           <div className="modal-content" style={{ maxWidth: '550px' }}>
@@ -11493,9 +11332,6 @@ export default function App() {
         </div>
       )}
 
-      {/* ========================================================================= */}
-      {/* MODAL 3: Layer Stack Execution & Verification Logs Viewer */}
-      {/* ========================================================================= */}
       {selectedStackForLogs && (
         <div className="modal-overlay" onClick={() => setSelectedStackForLogs(null)}>
           <div className="modal-content" onClick={(e) => e.stopPropagation()} style={{
@@ -11511,7 +11347,6 @@ export default function App() {
             overflow: 'hidden',
             boxShadow: '0 25px 50px -12px rgba(15, 23, 42, 0.25)'
           }}>
-            {/* Modal Header */}
             <div style={{
               padding: '1.15rem 1.5rem 0.85rem 1.5rem',
               display: 'flex',
@@ -11592,7 +11427,6 @@ export default function App() {
               </div>
             </div>
 
-            {/* Toolbar: Table / Terminal Toggle + Level Filters + Search */}
             <div style={{
               padding: '0.6rem 1.5rem',
               backgroundColor: '#f8fafc',
@@ -11681,7 +11515,6 @@ export default function App() {
               </div>
             </div>
 
-            {/* Modal Body */}
             {(() => {
               const rawLogs = Array.isArray(selectedStackForLogs.logs) ? selectedStackForLogs.logs : [];
               const filteredModalLogs = rawLogs.filter((log) => {
@@ -11783,7 +11616,6 @@ export default function App() {
               );
             })()}
 
-            {/* Modal Footer */}
             <div style={{
               padding: '0.65rem 1.5rem',
               backgroundColor: '#f8fafc',
@@ -11816,9 +11648,6 @@ export default function App() {
         </div>
       )}
 
-      {/* ========================================================================= */}
-      {/* MODAL 4: Existing Layer Stack Found on NAS (Direct Download vs Re-Generate) */}
-      {/* ========================================================================= */}
       {exactStackMatchModal && (() => {
         const modalFiles = exactStackMatchModal.files || (exactStackMatchModal.filename ? [exactStackMatchModal] : []);
         const totalMb = modalFiles
@@ -11845,7 +11674,6 @@ export default function App() {
                 backgroundColor: '#ffffff'
               }}
             >
-              {/* Modal Header */}
               <div style={{
                 padding: '1.25rem 1.5rem',
                 backgroundColor: '#eff6ff',
@@ -11883,7 +11711,6 @@ export default function App() {
                 </button>
               </div>
 
-              {/* Body Content */}
               <div style={{ padding: '1.5rem' }}>
                 <div style={{
                   backgroundColor: '#f8fafc',
@@ -11915,7 +11742,6 @@ export default function App() {
                     </div>
                   </div>
 
-                  {/* Summary Bar */}
                   <div style={{
                     marginTop: '1rem',
                     paddingTop: '0.75rem',
@@ -11934,7 +11760,6 @@ export default function App() {
                     </div>
                   </div>
 
-                  {/* File List with Checkboxes */}
                   <div style={{
                     marginTop: '0.85rem',
                     paddingTop: '0.75rem',
@@ -11992,7 +11817,6 @@ export default function App() {
                   </div>
                 </div>
 
-                {/* Question to User */}
                 <div style={{ textAlign: 'center', marginBottom: '1.25rem' }}>
                   <p style={{ fontSize: '1.05rem', fontWeight: 700, color: '#0f172a', margin: 0 }}>
                     Data is available on NAS. Do you want to download this data?
@@ -12002,7 +11826,6 @@ export default function App() {
                   </p>
                 </div>
 
-                {/* Modal Action Buttons */}
                 <div style={{ display: 'flex', gap: '0.75rem', justifyContent: 'flex-end' }}>
                   <button
                     type="button"
@@ -12057,7 +11880,6 @@ export default function App() {
         );
       })()}
 
-      {/* Dedicated Modal: Stacked Files & Download for a Specific Request */}
       {stackFilesModalReq && (() => {
         const req = stackFilesModalReq;
         const files = req.stacked_files || [];
@@ -12090,7 +11912,6 @@ export default function App() {
                 overflow: 'hidden'
               }}
             >
-              {/* Modal Header */}
               <div style={{
                 padding: '1.25rem 1.5rem',
                 borderBottom: '1px solid #e2e8f0',
@@ -12159,7 +11980,6 @@ export default function App() {
                 </button>
               </div>
 
-              {/* Modal Body */}
               <div style={{ padding: '1.25rem 1.5rem', overflowY: 'auto', flex: '1 1 auto', display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
                 <div style={{ fontSize: '0.82rem', color: '#475569' }}>
                   The following multi-band GeoTIFF layer stack files are archived on NAS storage for this request:
@@ -12246,7 +12066,6 @@ export default function App() {
                 )}
               </div>
 
-              {/* Modal Footer */}
               <div style={{
                 padding: '0.85rem 1.5rem',
                 borderTop: '1px solid #e2e8f0',
@@ -12318,7 +12137,6 @@ export default function App() {
         );
       })()}
 
-      {/* Floating Persistent Background Download Status Widget */}
       {downloadProgress && (
         <div style={{
           position: 'fixed',
@@ -12368,7 +12186,6 @@ export default function App() {
             </div>
           ) : (
             <div>
-              {/* Header */}
               <div style={{
                 padding: '0.75rem 1rem',
                 backgroundColor: downloadProgress.status === 'completed' ? '#f0fdf4' : downloadProgress.status === 'error' ? '#fef2f2' : '#eff6ff',
@@ -12432,7 +12249,6 @@ export default function App() {
                 </div>
               </div>
 
-              {/* Body */}
               <div style={{ padding: '0.9rem 1rem' }}>
                 <div style={{
                   fontSize: '0.78rem',
@@ -12454,7 +12270,6 @@ export default function App() {
 
                 {downloadProgress.status === 'downloading' && (
                   <div>
-                    {/* Animated Progress Bar */}
                     <div style={{
                       width: '100%',
                       height: '7px',

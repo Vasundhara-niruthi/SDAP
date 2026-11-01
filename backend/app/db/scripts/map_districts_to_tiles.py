@@ -1,25 +1,6 @@
-"""
-=============================================================================
-SDAP District to Sentinel-2 Tile Spatial Mapping & PostgreSQL Importer
-=============================================================================
-Location: backend/scripts/map_districts_to_tiles.py
+"""Map districts to Sentinel-2 MGRS tiles and load the result into 'district_tiles_mapping'.
 
-Description:
-    Performs spatial intersection (STRtree indexing) between all 768 district
-    geometries in India and Sentinel-2 MGRS grid tiles.
-    Generates and uploads the mapping to the 'district_tiles_mapping' table in PostgreSQL.
-
-Table Schema:
-    district_tiles_mapping (
-        id SERIAL PRIMARY KEY,
-        district_id INTEGER NOT NULL,
-        district_uid VARCHAR(50),
-        district_name VARCHAR(100),
-        tile_id VARCHAR(50) NOT NULL,
-        created_at TIMESTAMP WITHOUT TIME ZONE DEFAULT NOW(),
-        CONSTRAINT uq_district_tile UNIQUE (district_id, tile_id)
-    )
-=============================================================================
+Uses STRtree-indexed spatial intersection between district geometries and the S2 grid.
 """
 
 import os
@@ -29,7 +10,7 @@ import time
 import logging
 from typing import List, Dict, Any
 
-# Ensure backend root is registered in Python path
+# Make the backend root importable
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from shapely.geometry import shape
@@ -37,7 +18,6 @@ from shapely.strtree import STRtree
 from sqlalchemy import create_engine, text
 from app.core.config import settings
 
-# Configure Logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("sdap.district_tile_mapper")
 

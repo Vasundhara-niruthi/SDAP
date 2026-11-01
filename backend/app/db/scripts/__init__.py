@@ -1,17 +1,11 @@
-"""
-=============================================================================
-SDAP Database Scripts Package
-=============================================================================
-Location: backend/app/db/scripts/__init__.py
+"""SDAP Database Scripts Package
 
-Description:
-    Operational and ETL scripts for:
-    - Shapefile and boundary polygon ingestion (GADM / Survey of India)
-    - Spatial intersections and District-to-Tile mapping
-    - Boundary name normalization and enrichment
-    - Satellite acquisition data downloading and verification
-    - GeoTIFF raster retrieval and index processing
-=============================================================================
+Operational and ETL scripts for:
+- Shapefile and boundary polygon ingestion (GADM / Survey of India)
+- Spatial intersections and District-to-Tile mapping
+- Boundary name normalization and enrichment
+- Satellite acquisition data downloading and verification
+- GeoTIFF raster retrieval and index processing
 """
 
 __all__ = [

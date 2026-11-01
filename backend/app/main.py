@@ -1,4 +1,4 @@
-from sqlalchemy import text
+from sqlalchemy import func
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
@@ -21,22 +21,28 @@ async def lifespan(app: FastAPI):
     """
     logger.info("Initializing SDAP Server tables in PostgreSQL...")
     try:
-        # Create tables if they do not exist
         Base.metadata.create_all(bind=engine)
         logger.info("PostgreSQL Database tables created/verified successfully.")
 
-        # Ensure default admin account exists and has valid credentials
+        # Ensure the default admin account exists (create-only; never overwrite an existing password)
         try:
             from app.db import SessionLocal
             from app.db.models.sdap_models import UserModel
-            from app.core.security import hash_password, verify_password
-            import os
+            from app.core.security import hash_password
             with SessionLocal() as db_session:
-                admin_email = os.getenv("DEFAULT_ADMIN_EMAIL", "admin@sdap.niruthi.in").strip().lower()
-                admin_pass = os.getenv("DEFAULT_ADMIN_PASSWORD", "admin123")
-                admin_name = os.getenv("DEFAULT_ADMIN_NAME", "SDAP System Administrator")
-                admin = db_session.query(UserModel).filter(UserModel.email.ilike(admin_email)).first()
-                if not admin:
+                admin_email = (settings.DEFAULT_ADMIN_EMAIL or "admin@sdap.niruthi.in").strip().lower()
+                admin_pass = (settings.DEFAULT_ADMIN_PASSWORD or "").strip()
+                admin_name = (settings.DEFAULT_ADMIN_NAME or "SDAP System Administrator").strip()
+                admin = db_session.query(UserModel).filter(func.lower(UserModel.email) == admin_email).first()
+                if admin:
+                    logger.info(f"Default admin account present: {admin_email} (password left unchanged)")
+                elif not admin_pass:
+                    logger.warning(
+                        f"Default admin account '{admin_email}' does not exist and DEFAULT_ADMIN_PASSWORD "
+                        "is not set; skipping admin creation. Set DEFAULT_ADMIN_PASSWORD in backend/.env "
+                        "and restart to create it."
+                    )
+                else:
                     db_session.add(UserModel(
                         email=admin_email,
                         full_name=admin_name,
@@ -46,12 +52,6 @@ async def lifespan(app: FastAPI):
                     ))
                     db_session.commit()
                     logger.info(f"Default admin user created: {admin_email}")
-                else:
-                    if not verify_password(admin_pass, admin.hashed_password) or not admin.is_active:
-                        admin.hashed_password = hash_password(admin_pass)
-                        admin.is_active = True
-                        db_session.commit()
-                        logger.info(f"Default admin user credentials verified/updated: {admin_email}")
         except Exception as admin_err:
             logger.warning(f"Admin seeding check deferred or failed: {admin_err}")
         
@@ -76,13 +76,12 @@ app = FastAPI(
 # CORS Configuration for React Frontend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=settings.cors_origins_list,  # explicit list; never '*' with credentials (CORS_ORIGINS env)
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Include API v1 Router
 app.include_router(api_router, prefix=settings.API_V1_STR)
 
 

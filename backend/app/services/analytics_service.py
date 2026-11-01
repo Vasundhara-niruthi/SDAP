@@ -1,10 +1,9 @@
 import logging
-from typing import Dict, Any, Optional, List
-from datetime import datetime, date
+from typing import Dict, Any, Optional
 from sqlalchemy.orm import Session
 from sqlalchemy import func
 
-from app.models.sdap_models import RequestModel, BandFileModel, UserModel
+from app.db.models import RequestModel, BandFileModel, UserModel
 
 logger = logging.getLogger("sdap.analytics")
 
@@ -15,16 +14,9 @@ def get_daily_storage_analytics(
     end_date: Optional[str] = None
 ) -> Dict[str, Any]:
     """
-    Computes comprehensive daily storage metrics across all satellite acquisition requests
-    and actual downloaded rasters. Restricted to Administrator access.
-    
-    Returns:
-      - summary: Aggregate KPIs (total requests, total GB, peak day, daily average).
-      - status_breakdown: Storage occupied by each request status.
-      - satellite_breakdown: Storage occupied by Sentinel-2 vs Sentinel-1.
-      - timeline: Day-by-day chronological breakdown of storage, requests, and files.
+    Daily storage metrics across requests and downloaded rasters (admin only).
+    Returns summary KPIs, status_breakdown, satellite_breakdown and a per-day timeline.
     """
-    # 1. Base query for requests with optional date filters
     req_query = db.query(
         func.date(RequestModel.created_at).label("day"),
         RequestModel.id,
@@ -47,7 +39,6 @@ def get_daily_storage_analytics(
 
     req_rows = req_query.order_by(RequestModel.created_at.desc()).all()
 
-    # 2. Query actual downloaded band files grouped by download date
     bf_query = db.query(
         func.date(BandFileModel.downloaded_at).label("day"),
         func.count(BandFileModel.id).label("file_count"),
@@ -70,7 +61,6 @@ def get_daily_storage_analytics(
         for r in bf_rows if r.day
     }
 
-    # 3. Assemble daily timeline
     timeline: Dict[str, Dict[str, Any]] = {}
 
     status_totals: Dict[str, float] = {}
@@ -120,7 +110,7 @@ def get_daily_storage_analytics(
             "created_at": r.created_at.strftime("%Y-%m-%d %H:%M") if r.created_at else ""
         })
 
-    # Include days with band files even if no new request was submitted on that date
+    # Include days that only have band files
     for d_str, bf_data in bf_dict.items():
         if d_str not in timeline:
             timeline[d_str] = {
@@ -134,10 +124,10 @@ def get_daily_storage_analytics(
                 "requests": []
             }
 
-    # Sort timeline chronologically descending (newest first)
+    # Newest first
     sorted_days = sorted(timeline.values(), key=lambda x: x["date"], reverse=True)
 
-    # Compute running cumulative storage (ascending then reverse back)
+    # Running cumulative storage (computed ascending)
     chronological = sorted(sorted_days, key=lambda x: x["date"])
     cum_req = 0.0
     cum_phys = 0.0
@@ -149,7 +139,6 @@ def get_daily_storage_analytics(
         day["satellites"] = sorted(list(day["satellites"]))
         day["districts"] = sorted(list(day["districts"]))
 
-    # Summary KPIs
     total_physical_gb = sum(b["gb"] for b in bf_dict.values())
     total_files = sum(b["count"] for b in bf_dict.values())
     active_days_count = len(sorted_days)

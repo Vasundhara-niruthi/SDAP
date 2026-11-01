@@ -1,13 +1,7 @@
-"""
-=============================================================================
-SDAP Sentinel Metadata Repository (Reusable Database Queries)
-=============================================================================
-Location: backend/app/db/repositories/sentinel_repo.py
+"""SDAP Sentinel Metadata Repository (Reusable Database Queries)
 
-Description:
-    Reusable database queries for Sentinel-1 and Sentinel-2 scene metadata,
-    tile coverage, and district-to-tile spatial mappings.
-=============================================================================
+Reusable database queries for Sentinel-1 and Sentinel-2 scene metadata,
+tile coverage, and district-to-tile spatial mappings.
 """
 
 from typing import List, Optional

@@ -1,7 +1,7 @@
 from pydantic import BaseModel, EmailStr, Field
 from typing import Optional
 from datetime import datetime
-from app.models.sdap_models import UserRole
+from app.db.models import UserRole
 
 
 class UserCreate(BaseModel):
@@ -30,10 +30,8 @@ class LoginRequest(BaseModel):
     password: str
 
 
-class PasswordResetRequest(BaseModel):
-    email: EmailStr
+class AdminPasswordReset(BaseModel):
     new_password: str = Field(..., min_length=6, example="NewUser@123456")
-    confirm_password: str = Field(..., min_length=6, example="NewUser@123456")
 
 
 class TokenResponse(BaseModel):

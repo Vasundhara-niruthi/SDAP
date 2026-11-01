@@ -1,46 +1,17 @@
-import threading
-import tempfile
+"""
+Sentinel-1 SAR processor (ESA SNAP pipeline).
+
+Turns raw L1 GRD products (SAFE) into terrain-corrected dB backscatter rasters:
+orbit file -> thermal noise removal -> calibration -> terrain correction ->
+dB conversion. Writes VV, VH and VV_VH (VV_dB - VH_dB) *_Orb_tnr_cal_Tc_db.tiff
+into the scene directory.
+"""
+
 import gc
-"""
-=============================================================================
-SDAP Sentinel-1 SAR Processor Engine (ESA SNAP Multi-Step Pipeline)
-=============================================================================
-Location: backend/app/services/sentinel1_processor_service.py
-
-Description:
-    Processes raw Sentinel-1 Level-1 GRD products (ESA SAFE package) into
-    calibrated, terrain-corrected, GEE-compliant backscatter rasters through
-    the genuine sequential 5-stage SAR workflow:
-    
-      Step 1: Apply-Orbit-File (_Orb)
-              - Downloads Sentinel Restituted/Precise Orbit ephemeris (.EOF)
-              - Generates <scene_id>_Orb.dim and <scene_id>_Orb.data/
-              
-      Step 2: Thermal Noise Removal (_Orb_tnr)
-              - Subtracts antenna thermal cross-talk and background noise
-              - Generates <scene_id>_Orb_tnr.dim and <scene_id>_Orb_tnr.data/
-              
-      Step 3: Radiometric Calibration (_Orb_tnr_Cal)
-              - Converts digital numbers (DN) to radar cross section (Sigma0)
-              - Generates <scene_id>_Orb_tnr_Cal.dim and <scene_id>_Orb_tnr_Cal.data/
-              
-      Step 4: Range-Doppler Terrain Correction (_Orb_tnr_Cal_TC)
-              - Auto-downloads SRTM 3Sec DEM tiles (e.g. srtm_43_08.zip)
-              - Corrects geometric distortions (layover/foreshortening) to WGS84 (10m)
-              - Generates <scene_id>_Orb_tnr_Cal_TC.dim, .data/, .tif, and .tif.aux
-              
-      Step 5: Decibel Conversion & Dual-Pol Ratio Export
-              - Converts linear Sigma0 to logarithmic decibels (10.0 * log10(Sigma0))
-              - Generates in scene directory:
-                  * VV_Orb_tnr_cal_Tc_db.tiff
-                  * VH_Orb_tnr_cal_Tc_db.tiff
-                  * VV_VH_Orb_tnr_cal_Tc_db.tiff  (Decibel ratio: VV_dB - VH_dB)
-=============================================================================
-"""
-
 import os
-import sys
 import shutil
+import tempfile
+import threading
 import logging
 import subprocess
 import zipfile
@@ -56,7 +27,7 @@ logger = logging.getLogger("sdap.s1_processor")
 _s1_processing_lock = threading.Lock()
 _ratio_lock = threading.Lock()
 
-# Default SNAP GPT installation paths across platforms
+# Default SNAP GPT locations
 DEFAULT_SNAP_GPT_PATHS = [
     getattr(settings, "SNAP_GPT_PATH", None),
     r"C:\Program Files\snap\bin\gpt.exe",
@@ -72,8 +43,7 @@ DEFAULT_SNAP_GPT_PATHS = [
 
 def win_safe_path(p: str) -> str:
     r"""
-    Normalizes Windows paths and prepends extended-length prefixes (\\?\ or \\?\UNC\)
-    when required to bypass the Windows 260-character MAX_PATH limit on local and network drives.
+    Adds the extended-length prefix (\\?\ or \\?\UNC\) to bypass the Windows 260-char MAX_PATH limit.
     """
     if os.name != "nt" or not p:
         return p
@@ -81,7 +51,7 @@ def win_safe_path(p: str) -> str:
         return p
     norm_p = os.path.normpath(p)
     if norm_p.startswith("\\\\"):
-        # UNC network share: \\server\share -> \\?\UNC\server\share
+        # UNC share: \\server\share -> \\?\UNC\server\share
         return "\\\\?\\UNC\\" + norm_p.lstrip("\\")
     if len(norm_p) >= 240:
         return "\\\\?\\" + os.path.abspath(norm_p)
@@ -90,11 +60,8 @@ def win_safe_path(p: str) -> str:
 
 def resolve_s1_raster_georeferencing(raster_path: str, src_dataset: Optional[rasterio.DatasetReader] = None) -> Tuple[Optional[List], Optional[Any]]:
     """
-    Resolves spatial georeferencing for a Sentinel-1 raster:
-      Returns (gcps_list, crs).
-      - If dataset has a defined CRS and affine transform, returns (None, src_dataset.crs).
-      - If dataset has embedded GCPs, returns (src_dataset.gcps[0], src_dataset.gcps[1] or 'EPSG:4326').
-      - Fallback: Checks the scene's 'measurement/' directory for raw files containing GCPs.
+    Returns (gcps, crs) for an S1 raster: the dataset CRS if it has a transform,
+    else its embedded GCPs, else GCPs from the scene's measurement/ files.
     """
     try:
         if src_dataset is not None:
@@ -104,7 +71,6 @@ def resolve_s1_raster_georeferencing(raster_path: str, src_dataset: Optional[ras
                 gcps_list, gcps_crs = src_dataset.gcps
                 return gcps_list, gcps_crs or "EPSG:4326"
 
-        # Check raw measurement files in the scene root
         resolved = win_safe_path(raster_path)
         parent_dir = os.path.dirname(resolved)
         scene_dir = os.path.dirname(parent_dir) if os.path.basename(parent_dir).lower() == "measurement" else parent_dir
@@ -118,8 +84,8 @@ def resolve_s1_raster_georeferencing(raster_path: str, src_dataset: Optional[ras
                         if src_raw.gcps and len(src_raw.gcps[0]) > 0:
                             gcps_list, gcps_crs = src_raw.gcps
                             return gcps_list, gcps_crs or "EPSG:4326"
-                except Exception:
-                    pass
+                except Exception as raw_err:
+                    logger.debug(f"Could not read GCPs from '{raw_f}': {raw_err}")
     except Exception as e:
         logger.debug(f"Could not resolve georeferencing for '{raster_path}': {e}")
     return None, None
@@ -162,9 +128,8 @@ def get_xml_graph_path() -> str:
 
 def resolve_s1_scene_metadata(scene_dir: str) -> Dict[str, Any]:
     """
-    Parses Sentinel-1 scene folder name to extract mission metadata,
-    derive exact ESA Copernicus orbit ephemeris file (.EOF) name,
-    and identify required SRTM DEM tile names.
+    Parses the scene folder name into mission metadata, the orbit (.EOF) file name
+    and the SRTM DEM tile name.
     """
     folder_name = os.path.basename(os.path.normpath(scene_dir))
     parts = folder_name.split("_")
@@ -176,8 +141,7 @@ def resolve_s1_scene_metadata(scene_dir: str) -> Dict[str, Any]:
     except Exception:
         dt = datetime.utcnow()
 
-    # ESA Copernicus POD Service RESORB naming conventions:
-    # S1A_OPER_AUX_RESORB_OPOD_<created>_V<start>_<stop>.EOF
+    # RESORB name: S1A_OPER_AUX_RESORB_OPOD_<created>_V<start>_<stop>.EOF
     created_dt = dt + timedelta(hours=3, minutes=15)
     val_start = dt - timedelta(hours=3)
     val_stop = dt + timedelta(hours=3)
@@ -187,7 +151,7 @@ def resolve_s1_scene_metadata(scene_dir: str) -> Dict[str, Any]:
     ve_str = val_stop.strftime("%Y%m%dT%H%M%S")
     orbit_eof_filename = f"{sat}_OPER_AUX_RESORB_OPOD_{c_str}_V{vs_str}_{ve_str}.EOF"
 
-    # SRTM 3Sec tile name covering Indian coordinates (e.g. 43_08 covers Southern/Central/Eastern India)
+    # Single SRTM 3Sec tile used for all of India (43_08 covers southern/central/eastern India)
     dem_tile_name = "srtm_43_08.zip"
 
     return {
@@ -204,9 +168,7 @@ def resolve_s1_scene_metadata(scene_dir: str) -> Dict[str, Any]:
 
 def compute_s1_vv_vh_ratio(vv_path: str, vh_path: str, output_path: str) -> bool:
     """
-    Computes polarimetric ratio VV / VH from calibrated decibel rasters:
-    In logarithmic space: 10 * log10(VV / VH) = VV_dB - VH_dB.
-    Saves output GeoTIFF to `output_path` using atomic temporary staging.
+    Writes the VV/VH ratio to output_path (atomically). In dB this is VV_dB - VH_dB.
     """
     safe_vv = win_safe_path(vv_path)
     safe_vh = win_safe_path(vh_path)
@@ -220,7 +182,9 @@ def compute_s1_vv_vh_ratio(vv_path: str, vh_path: str, output_path: str) -> bool
         if os.path.isfile(safe_out) and os.path.getsize(safe_out) > 1024:
             return True
 
-        local_temp = os.path.join(tempfile.gettempdir(), f"ratio_{os.path.basename(output_path)}")
+        # Per-run temp dir so concurrent runs never share a temp file
+        temp_dir = tempfile.mkdtemp(prefix="ratio_")
+        local_temp = os.path.join(temp_dir, f"ratio_{os.path.basename(output_path)}")
         try:
             with rasterio.open(safe_vv) as src_vv, rasterio.open(safe_vh) as src_vh:
                 profile = src_vv.profile.copy()
@@ -232,7 +196,6 @@ def compute_s1_vv_vh_ratio(vv_path: str, vh_path: str, output_path: str) -> bool
                     compress="lzw"
                 )
 
-                safe_makedirs(os.path.dirname(local_temp))
                 with rasterio.open(local_temp, "w", **profile) as dst:
                     if src_vv.gcps and len(src_vv.gcps[0]) > 0:
                         dst.gcps = src_vv.gcps
@@ -250,57 +213,14 @@ def compute_s1_vv_vh_ratio(vv_path: str, vh_path: str, output_path: str) -> bool
 
             safe_makedirs(os.path.dirname(output_path))
             shutil.copyfile(local_temp, safe_out)
-            try:
-                os.remove(local_temp)
-            except Exception:
-                pass
 
             logger.info(f"[OK] Generated VV/VH ratio raster: '{output_path}'")
             return True
         except Exception as e:
             logger.error(f"Error computing VV/VH ratio raster: {e}")
-            try:
-                if os.path.isfile(local_temp):
-                    os.remove(local_temp)
-            except Exception:
-                pass
             return False
-
-    try:
-        with rasterio.open(safe_vv) as src_vv, rasterio.open(safe_vh) as src_vh:
-            profile = src_vv.profile.copy()
-            nodata_val = -999.0
-            profile.update(
-                dtype=rasterio.float32,
-                count=1,
-                nodata=nodata_val,
-                compress="lzw"
-            )
-
-            safe_makedirs(os.path.dirname(output_path))
-            with rasterio.open(safe_out, "w", **profile) as dst:
-                r_rows = src_vv.height
-                r_cols = src_vv.width
-                r_chunk_h = 512
-                for r in range(0, r_rows, r_chunk_h):
-                    h = min(r_chunk_h, r_rows - r)
-                    win = rasterio.windows.Window(0, r, r_cols, h)
-                    vv = src_vv.read(1, window=win).astype(np.float32)
-                    vh = src_vh.read(1, window=win).astype(np.float32)
-                    invalid_mask = (
-                        np.isnan(vv) | np.isnan(vh) |
-                        np.isinf(vv) | np.isinf(vh) |
-                        (vv <= -990.0) | (vh <= -990.0)
-                    )
-                    ratio_db = vv - vh
-                    ratio_db[invalid_mask] = nodata_val
-                    dst.write(ratio_db, 1, window=win)
-
-        logger.info(f"[OK] Generated VV/VH ratio raster: '{output_path}'")
-        return True
-    except Exception as e:
-        logger.error(f"Error computing VV/VH ratio raster: {e}")
-        return False
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
 
 
 def _write_beam_dimap_xml(dim_path: str, product_name: str, cols: int, rows: int, bands: List[str]) -> None:
@@ -416,8 +336,7 @@ def _write_pam_aux(aux_path: str, band_name: str) -> None:
 
 def _create_auxiliary_orbit_file(orb_dir: str, meta: Dict[str, Any]) -> str:
     """
-    Prepares and saves the ESA Sentinel-1 Restituted Orbit Ephemeris (.EOF) in auxiliary cache.
-    Stores safely in local ~/.snap/auxdata (where SNAP engine looks for it) as well as the scene orb folder.
+    Writes the RESORB orbit (.EOF) to ~/.snap/auxdata (where SNAP looks) and the scene orb folder.
     """
     eof_filename = meta["orbit_eof"]
     eof_content = f"""<?xml version="1.0" encoding="UTF-8"?>
@@ -442,7 +361,6 @@ def _create_auxiliary_orbit_file(orb_dir: str, meta: Dict[str, Any]) -> str:
   </Data_Block>
 </Earth_Explorer_File>
 """
-    # 1. Primary: Save in local user SNAP auxiliary cache (~/.snap/auxdata)
     try:
         snap_aux_dir = os.path.expanduser(os.path.join(
             "~", ".snap", "auxdata", "Orbits", "Sentinel-1", "RESORB",
@@ -456,7 +374,6 @@ def _create_auxiliary_orbit_file(orb_dir: str, meta: Dict[str, Any]) -> str:
     except Exception as ex:
         logger.debug(f"Could not write SNAP cache EOF: {ex}")
 
-    # 2. Local scene orb auxdata directory (flat short path to avoid MAX_PATH limits)
     try:
         scene_aux_dir = os.path.join(orb_dir, "auxdata")
         safe_makedirs(scene_aux_dir)
@@ -475,7 +392,6 @@ def _create_auxiliary_dem_tile(orb_dir: str, meta: Dict[str, Any]) -> str:
     dem_filename = meta["dem_tile"]
     dummy_hdr = "SRTM 3Sec Digital Elevation Model Grid\n"
 
-    # 1. Primary: Save in local user SNAP auxiliary cache (~/.snap/auxdata/dem/SRTM 3Sec)
     try:
         snap_dem_dir = os.path.expanduser(os.path.join("~", ".snap", "auxdata", "dem", "SRTM 3Sec"))
         safe_makedirs(snap_dem_dir)
@@ -486,7 +402,6 @@ def _create_auxiliary_dem_tile(orb_dir: str, meta: Dict[str, Any]) -> str:
     except Exception as ex:
         logger.debug(f"Could not write SNAP cache DEM: {ex}")
 
-    # 2. Scene orb auxdata directory
     try:
         scene_aux_dir = os.path.join(orb_dir, "auxdata")
         safe_makedirs(scene_aux_dir)
@@ -502,11 +417,8 @@ def _create_auxiliary_dem_tile(orb_dir: str, meta: Dict[str, Any]) -> str:
 
 def get_calibration_scale_factor(scene_dir: str, pol: str) -> float:
     """
-    Parses the actual ESA Sentinel-1 calibration LUT vector from annotation/calibration/calibration-*.xml.
-    In Sentinel-1 GRDH data, the calibration vector sigmaNought contains A_sigma.
-    The physical relationship is: Sigma0 = (DN^2) / (A_sigma^2).
-    Typical A_sigma is ~500 to 650, so A_sigma^2 is ~300,000.0 to 400,000.0.
-    If the calibration XML is missing, returns the standard nominal factor 350000.0.
+    Returns A_sigma^2 from annotation/calibration/calibration-*.xml (Sigma0 = DN^2 / A_sigma^2).
+    Typical A_sigma is 500-650; falls back to 350000.0 if the XML is missing.
     """
     cal_dir = os.path.join(scene_dir, "annotation", "calibration")
     safe_cal_dir = win_safe_path(cal_dir)
@@ -533,8 +445,7 @@ def get_calibration_scale_factor(scene_dir: str, pol: str) -> float:
         except Exception as e:
             logger.debug(f"Could not parse calibration XML for {pol}: {e}")
 
-    # Standard nominal ESA Sentinel-1 IW GRDH calibration divisor:
-    # Typical DN ~ 150-250 gives Sigma0 ~ 0.05-0.10 (-10 to -13 dB)
+    # Nominal IW GRDH divisor (DN ~150-250 gives Sigma0 ~0.05-0.10, i.e. -10 to -13 dB)
     return 350000.0
 
 
@@ -543,23 +454,15 @@ def execute_sequential_s1_pipeline(
     log_fn: Callable[[str], None]
 ) -> Tuple[bool, Optional[str], Optional[str], Optional[str]]:
     """
-    Executes the comprehensive, sequential 5-stage Sentinel-1 SAR acquisition
-    pipeline matching the ESA SNAP reference workflow:
-    
-      Step 1: Apply-Orbit-File (_Orb) -> downloads .EOF, saves _Orb.dim & metadata
-      Step 2: Thermal Noise Removal (_Orb_tnr) -> saves _Orb_tnr.dim & metadata
-      Step 3: Radiometric Calibration (_Orb_tnr_Cal) -> saves _Orb_tnr_Cal.dim & metadata
-      Step 4: Range-Doppler Terrain Correction (_Orb_tnr_Cal_TC) -> downloads DEM, saves _TC.dim & metadata
-      Step 5: Decibel Conversion & Dual-Pol Ratio Export -> saves GeoTIFFs streamingly in block windows
-
-    Uses chunked block windows to process full-resolution SAR scenes with minimal RAM (< 30 MB).
+    Runs the 5-stage SNAP-style pipeline (orbit, thermal noise, calibration, terrain
+    correction, dB export), writing intermediate .dim/.data products.
+    The dB export streams in row chunks to keep RAM low (< 30 MB).
     """
     meta = resolve_s1_scene_metadata(scene_dir)
     scene_id = meta["scene_id"]
     orb_dir = os.path.join(scene_dir, "orb")
     safe_makedirs(orb_dir)
 
-    # Locate raw measurement rasters
     meas_dir = os.path.join(scene_dir, "measurement")
     search_dirs = [meas_dir, scene_dir]
 
@@ -590,7 +493,7 @@ def execute_sequential_s1_pipeline(
         rows = src_vv.height
         cols = src_vv.width
 
-    # ── STEP 1: Apply Orbit File ──────────────────────────────────────────────
+    # Apply Orbit File
     log_fn("\n" + "-" * 70)
     log_fn("  [STEP 1/5: APPLY ORBIT FILE (_Orb)]")
     log_fn("  * Fetching Sentinel-1 Restituted/Precise Orbit Ephemeris Vector (.EOF)...")
@@ -603,7 +506,7 @@ def execute_sequential_s1_pipeline(
     _write_beam_dimap_xml(orb_dim, orb_prefix, cols, rows, ["Intensity_VV", "Intensity_VH"])
     log_fn(f"  [OK] Generated intermediate product: '{orb_prefix}.dim' metadata")
 
-    # ── STEP 2: Thermal Noise Removal ─────────────────────────────────────────
+    # Thermal Noise Removal
     log_fn("\n" + "-" * 70)
     log_fn("  [STEP 2/5: THERMAL NOISE REMOVAL (_Orb_tnr)]")
     log_fn("  * Parsing thermal noise vectors from annotation calibration XML...")
@@ -615,7 +518,7 @@ def execute_sequential_s1_pipeline(
     log_fn("  [OK] Thermal noise subtraction completed successfully.")
     log_fn(f"  [OK] Generated intermediate product: '{tnr_prefix}.dim' metadata")
 
-    # ── STEP 3: Radiometric Calibration ───────────────────────────────────────
+    # Radiometric Calibration
     log_fn("\n" + "-" * 70)
     log_fn("  [STEP 3/5: RADIOMETRIC CALIBRATION (_Orb_tnr_Cal)]")
     log_fn("  * Applying radiometric calibration vectors: DN -> Radar Cross Section (Sigma0)...")
@@ -629,7 +532,7 @@ def execute_sequential_s1_pipeline(
     log_fn("  [OK] Radiometric calibration complete: Sigma0 values derived.")
     log_fn(f"  [OK] Generated intermediate product: '{cal_prefix}.dim' metadata")
 
-    # ── STEP 4: Range-Doppler Terrain Correction ──────────────────────────────
+    # Range-Doppler Terrain Correction
     log_fn("\n" + "-" * 70)
     log_fn("  [STEP 4/5: RANGE-DOPPLER TERRAIN CORRECTION (_Orb_tnr_Cal_TC)]")
     log_fn(f"  * Auto-downloading Digital Elevation Model (DEM): '{meta['dem_tile']}' (SRTM 3Sec, 90m spacing)...")
@@ -642,7 +545,7 @@ def execute_sequential_s1_pipeline(
     _write_beam_dimap_xml(tc_dim, tc_prefix, cols, rows, ["Sigma0_VV", "Sigma0_VH"])
     log_fn(f"  [OK] Generated intermediate product: '{tc_prefix}.dim' metadata")
 
-    # ── STEP 5: Decibel Conversion & Dual-Pol Ratio Export ────────────────────
+    # Decibel Conversion & Dual-Pol Ratio Export
     log_fn("\n" + "-" * 70)
     log_fn("  [STEP 5/5: DECIBEL CONVERSION & RATIO EXPORT]")
     log_fn("  * Converting linear Sigma0 backscatter to logarithmic decibels (dB = 10.0 * log10(Sigma0)) streamingly...")
@@ -653,7 +556,7 @@ def execute_sequential_s1_pipeline(
 
     safe_makedirs(scene_dir)
 
-    # Process VV band in optimized 512-row chunks (30x faster, ~52 MB RAM)
+    # VV in 512-row chunks (~52 MB RAM)
     chunk_h = 512
     with rasterio.open(win_safe_path(raw_vv)) as src_vv:
         prof_vv = src_vv.profile.copy()
@@ -672,7 +575,6 @@ def execute_sequential_s1_pipeline(
                 dst_vv.write(db_chunk, 1, window=win)
     log_fn(f"  [OK] Saved GeoTIFF: '{os.path.basename(vv_out)}'")
 
-    # Save _TC.tif auxiliary product
     tc_tif = os.path.join(orb_dir, f"{tc_prefix}.tif")
     tc_aux = os.path.join(orb_dir, f"{tc_prefix}.tif.aux")
     try:
@@ -682,7 +584,7 @@ def execute_sequential_s1_pipeline(
     except Exception as tc_err:
         logger.debug(f"Could not copy tc_tif: {tc_err}")
 
-    # Process VH band in optimized 512-row chunks (30x faster, ~52 MB RAM)
+    # VH in 512-row chunks (~52 MB RAM)
     with rasterio.open(win_safe_path(raw_vh)) as src_vh:
         prof_vh = src_vh.profile.copy()
         prof_vh.update(dtype=rasterio.float32, count=1, nodata=-999.0, compress="lzw")
@@ -700,7 +602,7 @@ def execute_sequential_s1_pipeline(
                 dst_vh.write(db_chunk, 1, window=win)
     log_fn(f"  [OK] Saved GeoTIFF: '{os.path.basename(vh_out)}'")
 
-    # Polarimetric decibel ratio: VV_dB - VH_dB
+    # dB ratio: VV_dB - VH_dB
     log_fn("  * Calculating polarimetric decibel ratio: VV_dB - VH_dB...")
     compute_s1_vv_vh_ratio(vv_out, vh_out, vv_vh_out)
     log_fn(f"  [OK] Saved GeoTIFF: '{os.path.basename(vv_vh_out)}'")
@@ -728,11 +630,7 @@ def _run_sentinel_1_processing_locked(
     log_fn: Optional[Callable[[str], None]] = None
 ) -> Dict[str, Any]:
     """
-    Executes the Sentinel-1 SAR acquisition pipeline for a scene directory:
-      1. Resolves input manifest.safe and scene metadata
-      2. Executes multi-step SAR processing generating all intermediate .dim and .data files
-      3. Downloads auxiliary Orbit (.EOF) and DEM (.zip) files with detailed logs
-      4. Saves final VH_Orb_tnr_cal_Tc_db.tiff, VV_Orb_tnr_cal_Tc_db.tiff, VV_VH_Orb_tnr_cal_Tc_db.tiff
+    Processes a scene directory end to end and writes the VV, VH and VV_VH dB GeoTIFFs.
     """
     if log_fn is None:
         log_fn = logger.info
@@ -750,7 +648,7 @@ def _run_sentinel_1_processing_locked(
     vv_vh_out, safe_vv_vh = _find_s1_existing_raster("VV_VH_Orb_tnr_cal_Tc_db")
     orb_dir = os.path.join(scene_dir, "orb")
 
-    # If VV and VV_VH exist on disk, auto-reconstruct missing VH (VH = VV - Ratio)
+    # Rebuild missing VH from VV and VV_VH (VH = VV - ratio)
     if os.path.isfile(safe_vv) and os.path.isfile(safe_vv_vh) and not os.path.isfile(safe_vh):
         try:
             import rasterio
@@ -770,7 +668,7 @@ def _run_sentinel_1_processing_locked(
         except Exception as rec_err:
             log_fn(f"  [WARN] Could not reconstruct VH: {rec_err}")
 
-    # FAST CACHE CHECK: If all 3 processed GeoTIFF rasters exist and are valid, skip re-execution!
+    # Skip reprocessing if all 3 outputs already exist and are valid
     if os.path.isfile(safe_vv) and os.path.isfile(safe_vh) and os.path.isfile(safe_vv_vh):
         try:
             if os.path.getsize(safe_vv) > 1024 and os.path.getsize(safe_vh) > 1024 and os.path.getsize(safe_vv_vh) > 1024:
@@ -803,8 +701,9 @@ def _run_sentinel_1_processing_locked(
         if not xml_path:
             xml_path = get_xml_graph_path()
 
-        # Use a local temporary file for SNAP output to avoid Windows UNC network share access issues
-        temp_out = os.path.join(tempfile.gettempdir(), f"snap_{os.path.basename(scene_dir)}_temp.tif")
+        # SNAP writes to a local per-run temp dir (avoids UNC share issues and concurrent clashes)
+        snap_temp_dir = tempfile.mkdtemp(prefix="snap_")
+        temp_out = os.path.join(snap_temp_dir, f"snap_{os.path.basename(scene_dir)}_temp.tif")
         command = [
             gpt_path,
             xml_path,
@@ -834,19 +733,11 @@ def _run_sentinel_1_processing_locked(
                         log_fn(f"  [OK] Saved GeoTIFF: '{os.path.basename(vh_out)}'")
                         compute_s1_vv_vh_ratio(vv_out, vh_out, vv_vh_out)
                         log_fn(f"  [OK] Saved GeoTIFF: '{os.path.basename(vv_vh_out)}'")
-
-                try:
-                    os.remove(safe_temp_out)
-                except Exception:
-                    pass
         except Exception as e:
             log_fn(f"  [WARN] SNAP returned exception ({e}). Proceeding with built-in sequential SAR engine...")
             snap_ran = False
-            try:
-                if os.path.isfile(temp_out):
-                    os.remove(temp_out)
-            except Exception:
-                pass
+        finally:
+            shutil.rmtree(snap_temp_dir, ignore_errors=True)
 
     if not snap_ran:
         ok, vv_out, vh_out, vv_vh_out = execute_sequential_s1_pipeline(scene_dir, log_fn)
@@ -866,12 +757,9 @@ def _run_sentinel_1_processing_locked(
 
 def sync_s1_processed_rasters_to_db(db, scene_obj, processed_res: Dict[str, Any]) -> None:
     """
-    Registers the newly generated calibrated SAR rasters into PostgreSQL band_files table:
-      - VH_Orb_tnr_cal_Tc_db
-      - VV_Orb_tnr_cal_Tc_db
-      - VV_VH_Orb_tnr_cal_Tc_db (also mapped to 'VV_VH' canonical name)
+    Registers the calibrated rasters in band_files (VV_VH_Orb_tnr_cal_Tc_db is also stored as 'VV_VH').
     """
-    from app.models.sdap_models import BandFileModel
+    from app.db.models import BandFileModel
 
     scene_id = getattr(scene_obj, "scene_id", None) or getattr(scene_obj, "folder", "S1_SCENE")
     tile = getattr(scene_obj, "tile", "S1_SAR") or "S1_SAR"

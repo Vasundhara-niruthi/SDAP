@@ -1,13 +1,7 @@
-"""
-=============================================================================
-SDAP User & Role Seeding Module
-=============================================================================
-Location: backend/app/db/seeds/user_seeds.py
+"""SDAP User & Role Seeding Module
 
-Description:
-    Seeds default administrative and user accounts, provisions roles, and
-    performs user directory audits.
-=============================================================================
+Seeds default administrative and user accounts, provisions roles, and
+performs user directory audits.
 """
 
 import logging
@@ -15,15 +9,14 @@ import os
 from collections import defaultdict
 from typing import Any, Dict, List, Optional
 
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
+from app.core.config import settings
 from app.db.models.sdap_models import UserModel, RequestModel
 from app.core.security import hash_password
 
 logger = logging.getLogger("sdap.db.seeds.user_seeds")
-
-# Admin fallback default (development only). Override via DEFAULT_ADMIN_PASSWORD in .env.
-_DEFAULT_ADMIN_PASSWORD = "admin123"
 
 
 class UserDataMigration:
@@ -35,8 +28,9 @@ class UserDataMigration:
     def _seed_user(self, email: str, full_name: str, password: str,
                    role: str, label: str) -> UserModel:
         """Create the user if the email does not exist yet; otherwise return it."""
+        email = (email or "").strip().lower()
         logger.info(f"Checking {label} account ({email})...")
-        user = self.db.query(UserModel).filter(UserModel.email == email).first()
+        user = self.db.query(UserModel).filter(func.lower(UserModel.email) == email).first()
 
         if not user:
             try:
@@ -65,15 +59,23 @@ class UserDataMigration:
         email: Optional[str] = None,
         full_name: Optional[str] = None,
         password: Optional[str] = None,
-    ) -> UserModel:
-        """Ensures the primary System Administrator account exists."""
-        email = email or os.getenv("DEFAULT_ADMIN_EMAIL", "admin@sdap.niruthi.in")
-        full_name = full_name or os.getenv("DEFAULT_ADMIN_NAME", "SDAP System Administrator")
-        password = password or os.getenv("DEFAULT_ADMIN_PASSWORD", _DEFAULT_ADMIN_PASSWORD)
+    ) -> Optional[UserModel]:
+        """Ensures the primary System Administrator account exists (create-only).
 
-        if password == _DEFAULT_ADMIN_PASSWORD:
-            logger.warning("Using built-in default admin password. "
-                           "Set DEFAULT_ADMIN_PASSWORD before deploying to production.")
+        Requires DEFAULT_ADMIN_PASSWORD (no built-in fallback); skips creation with a
+        warning when it is not configured and the admin does not already exist.
+        """
+        email = (email or settings.DEFAULT_ADMIN_EMAIL or "admin@sdap.niruthi.in").strip().lower()
+        full_name = full_name or settings.DEFAULT_ADMIN_NAME or "SDAP System Administrator"
+        password = password or settings.DEFAULT_ADMIN_PASSWORD
+
+        if not password:
+            existing = self.db.query(UserModel).filter(func.lower(UserModel.email) == email).first()
+            if existing:
+                logger.info(f"[EXISTS] System Administrator account verified: {email}")
+                return existing
+            logger.warning("Skipping admin seeding: DEFAULT_ADMIN_PASSWORD is not set in .env/environment.")
+            return None
 
         return self._seed_user(email, full_name, password, "ADMIN", "System Administrator")
 

@@ -1,14 +1,8 @@
-"""
-=============================================================================
-SDAP Administrative Boundaries API Routes
-=============================================================================
-Location: backend/app/routes/boundaries.py
+"""SDAP Administrative Boundaries API Routes
 
-Description:
-    Exposes endpoints to query official State and District boundaries directly
-    from PostgreSQL tables ('state_boundaries' and 'district_boundaries') using
-    the centralized BoundaryRepository.
-=============================================================================
+Exposes endpoints to query official State and District boundaries directly
+from PostgreSQL tables ('state_boundaries' and 'district_boundaries') using
+the centralized BoundaryRepository.
 """
 
 from typing import List, Optional, Dict, Any

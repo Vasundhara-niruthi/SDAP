@@ -1,20 +1,7 @@
 #!/usr/bin/env python3
-"""
-=============================================================================
-SDAP Sentinel-1 SAR Processing Engine (Remote Sensing Team Pipeline)
-=============================================================================
-Location: backend/scripts/Sentinel_1_Processing.py
+"""Process raw Sentinel-1 GRD products (manifest.safe) with ESA SNAP GPT or the Python SAR engine.
 
-Description:
-    Processes raw Sentinel-1 Level-1 GRD products (manifest.safe) using either
-    the ESA SNAP GPT engine (grd_to_gee_db.xml) or the calibrated high-precision
-    Python SAR radiometric engine.
-
-    Outputs all 3 verified, calibrated negative decibel GeoTIFFs:
-      - VV_Orb_tnr_cal_Tc_db.tiff  (Co-pol Sigma0 in dB)
-      - VH_Orb_tnr_cal_Tc_db.tiff  (Cross-pol Sigma0 in dB)
-      - VV_VH_Orb_tnr_cal_Tc_db.tiff  (Dual-Pol Ratio: VV_dB - VH_dB)
-=============================================================================
+Writes calibrated dB GeoTIFFs: VV, VH and VV_VH (VV_dB - VH_dB).
 """
 
 import os
@@ -23,7 +10,7 @@ import argparse
 import subprocess
 import logging
 
-# Ensure backend root is on sys.path
+# Make the backend root importable
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 BACKEND_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, ".."))
 if BACKEND_ROOT not in sys.path:

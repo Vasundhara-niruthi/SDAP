@@ -1,14 +1,8 @@
-"""
-=============================================================================
-SDAP PostGIS Administrative Boundary Models
-=============================================================================
-Location: backend/app/db/models/boundaries.py
+"""SDAP PostGIS Administrative Boundary Models
 
-Description:
-    SQLAlchemy ORM models for PostGIS administrative boundaries:
-    - StateBoundaryModel ('state_boundaries')
-    - DistrictBoundaryModel ('district_boundaries')
-=============================================================================
+SQLAlchemy ORM models for PostGIS administrative boundaries:
+- StateBoundaryModel ('state_boundaries')
+- DistrictBoundaryModel ('district_boundaries')
 """
 
 from datetime import datetime

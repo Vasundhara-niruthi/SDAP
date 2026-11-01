@@ -1,29 +1,7 @@
-"""
-=============================================================================
-SDAP Optical Cloud Removal & Spectral Indices Processor (SRS 8.4.1 & 8.4.3)
-=============================================================================
-Location: backend/scripts/cloud_removal_and_indices.py
+"""Cloud-masked NDVI and LSWI from Sentinel-2 L2A bands (B04, B08, B11, SCL).
 
-Description:
-    Computes cloud-masked NDVI and LSWI spectral indices from downloaded
-    Sentinel-2 Level-2A bands (B04, B08, B11, SCL).
-
-    1. Spatial Grid Alignment:
-       Resamples 20m bands (B11 SWIR, SCL Cloud Mask) to match the 10m grid
-       (B04 Red, B08 NIR) exactly (10980x10980) using rasterio reprojection.
-    2. Cloud & Shadow Masking (SRS 8.4.1):
-       Uses SCL (Scene Classification Layer) to mask out classes 3, 8, 9, 10
-       (Cloud Shadows, Med/High Cloud, Thin Cirrus).
-    3. Radiometric Offset Correction:
-       Applies Sentinel-2 baseline 04.00+ processing baseline offset if applicable.
-    4. Index Calculations:
-       - NDVI: (NIR - RED) / (NIR + RED)
-       - LSWI: (NIR - SWIR) / (NIR + SWIR)
-    5. Output Generation:
-       Saves compressed (LZW) GeoTIFF rasters for ONLY 'NDVI.tif' and 'LSWI.tif'.
-    6. Returns:
-       (ndvi_path, lswi_path, clear_coverage_percentage)
-=============================================================================
+Resamples the 20m bands to the 10m grid, masks SCL classes 3, 8, 9, 10, and saves
+only NDVI.tif and LSWI.tif (LZW). Returns (ndvi_path, lswi_path, clear_coverage_pct).
 """
 
 import os

@@ -1,14 +1,8 @@
-"""
-=============================================================================
-SDAP Main API Router Aggregator
-=============================================================================
-Location: backend/app/routes/api.py
+"""SDAP Main API Router Aggregator
 
-Description:
-    Aggregates modular route handlers for Health, Authentication, User Management,
-    Satellite Acquisition Requests, Boundaries, Rasters, and Layer Stacking into
-    a single FastAPI APIRouter.
-=============================================================================
+Aggregates modular route handlers for Health, Authentication, User Management,
+Satellite Acquisition Requests, Boundaries, Rasters, and Layer Stacking into
+a single FastAPI APIRouter.
 """
 
 from fastapi import APIRouter

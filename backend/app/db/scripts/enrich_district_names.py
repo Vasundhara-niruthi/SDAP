@@ -1,16 +1,7 @@
-"""
-=============================================================================
-SDAP Full Administrative Boundary Processor & Real Name Synchronizer
-=============================================================================
-Location: backend/scripts/enrich_district_names.py
+"""Assign real State/District names to the 768 districts in 'All_India_Distwise_UID.shp'.
 
-Description:
-    Processes all 768 district geometries from 'All_India_Distwise_UID.shp',
-    assigns official, real State and District names (including Telangana, Ladakh,
-    Odisha, Uttarakhand, etc.), updates PostgreSQL tables (district_boundaries,
-    state_boundaries, country_boundaries, district_tiles_mapping), and refreshes
-    all GeoJSON files in backend/data/boundaries/.
-=============================================================================
+Updates the boundary and district_tiles_mapping tables and refreshes the GeoJSON files
+in backend/data/boundaries/.
 """
 
 import os
@@ -20,7 +11,7 @@ import time
 import logging
 from typing import Dict, Any, List
 
-# Ensure backend root is registered in Python path
+# Make the backend root importable
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from shapely.geometry import shape, mapping
@@ -29,7 +20,6 @@ from shapely.strtree import STRtree
 from sqlalchemy import create_engine, text
 from app.core.config import settings
 
-# Configure Logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("sdap.full_boundary_processor")
 

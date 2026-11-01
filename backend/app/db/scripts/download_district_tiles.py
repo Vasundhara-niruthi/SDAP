@@ -1,27 +1,12 @@
-"""
-=============================================================================
-SDAP Universal District & State Satellite Acquisition & Processing Pipeline
-=============================================================================
-Location: backend/scripts/download_district_tiles.py
+"""Acquisition and processing pipeline for any district or state in 'district_tiles_mapping'.
 
-Description:
-    Generic, dynamic master script to perform tile lookup for ANY district or state
-    present in 'district_tiles_mapping', perform AWS S3 gap check, atomic scene downloading,
-    SCL cloud masking, full-tile index calculation, reprojection, mosaicing, and delivery clipping.
-
-    Follows SRS 8.1.1 - Database-Mediated Module Handoff:
-    Each stage writes its output to ProcessJobModel before the next stage begins,
-    enabling restart-without-repeat and full status visibility at any point.
-
-    FAST-SKIP CHECKS (DB + NAS):
-      Stage 2: scene already on NAS (required bands present + raster verified) -> no download.
-      Stage 3: NDVI/LSWI (or VV_VH) already on NAS + verified -> no recomputation,
-               DB band_file records are (re)synced.
+Stages: S3 gap check, scene download, cloud masking and indices, compositing, delivery clip.
+Each stage records its output in ProcessJobModel so a run can restart without repeating work,
+and scenes/indices already present and verified on NAS are skipped.
 
 Usage:
     python scripts/download_district_tiles.py --district "Khammam" --start-date "2025-01-01" --end-date "2025-01-31"
     python scripts/download_district_tiles.py --state "Telangana" --start-date "2025-01-01" --end-date "2025-01-31"
-=============================================================================
 """
 
 import os
@@ -37,8 +22,8 @@ from sqlalchemy import text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from app.core.config import settings
-from app.core.database import SessionLocal
-from app.models.sdap_models import SceneModel, RequestModel, ProcessJobModel
+from app.db import SessionLocal
+from app.db.models import SceneModel, RequestModel, ProcessJobModel
 from app.services.gap_check_service import perform_gap_check, get_all_mapped_districts, get_tiles_for_state
 from app.services.downloader_service import download_and_verify_scene, ensure_nas_connection, prune_empty_dirs
 from app.db.scripts.cloud_removal_and_indices import process_and_save_indices
@@ -65,7 +50,7 @@ except ImportError:  # pragma: no cover
 
 # Band-file model is optional at import time; the DB sync helper degrades gracefully.
 try:
-    from app.models.sdap_models import BandFileModel
+    from app.db.models import BandFileModel
 except ImportError:  # pragma: no cover
     BandFileModel = None
 
@@ -77,9 +62,6 @@ REQUIRED_S2_BANDS = ("B04", "B08", "B11", "SCL")
 REQUIRED_S1_BANDS = ("VV", "VH")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Helpers
-# ─────────────────────────────────────────────────────────────────────────────
 
 def append_request_log(db_session, req_id: int, message: str, level: str = "INFO"):
     """Appends a log entry persistently to RequestModel.execution_logs in PostgreSQL."""
@@ -88,7 +70,7 @@ def append_request_log(db_session, req_id: int, message: str, level: str = "INFO
     try:
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         log_line = f"[{timestamp}] {level}:sdap.universal_pipeline:{message}\n"
-        from app.core.database import engine
+        from app.db import engine
         with engine.connect() as conn:
             conn.execute(
                 text("UPDATE requests SET execution_logs = COALESCE(execution_logs, '') || :line WHERE id = :id"),
@@ -444,9 +426,6 @@ def _sync_cached_scene_band_files(db, scene_obj, s_dir: str):
         logger.warning(f"Could not sync cached band files for {scene_obj.scene_id}: {e}")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Main Pipeline
-# ─────────────────────────────────────────────────────────────────────────────
 
 def run_district_acquisition_pipeline(
     district_name: str,
@@ -502,9 +481,7 @@ def run_district_acquisition_pipeline(
         append_request_log(db, request_id, f"  {header_sub}")
         append_request_log(db, request_id, banner_top)
 
-        # ────────────────────────────────────────────────
         # STAGE 1 - Gap Check (SRS M2)  [DB check]
-        # ────────────────────────────────────────────────
         if _is_request_stopped(db, request_id):
             append_request_log(db, request_id, "[STOPPED] Pipeline halted before gap check because request was cancelled.", level="WARNING")
             return False
@@ -616,9 +593,7 @@ def run_district_acquisition_pipeline(
         append_request_log(db, request_id, "  ✓ Stage 1 Complete: Gap Check verified.")
         _update_job(db, gap_job, "COMPLETED")
 
-        # ────────────────────────────────────────────────
         # STAGE 2 - Download (SRS M3 + M4)  [DB + NAS fast check]
-        # ────────────────────────────────────────────────
         if _is_request_stopped(db, request_id):
             append_request_log(db, request_id, "[STOPPED] Pipeline halted before download stage because request was cancelled.", level="WARNING")
             return False
@@ -659,14 +634,14 @@ def run_district_acquisition_pipeline(
         tile_downloaded_count = {t: 0 for t in tiles}
         held_scenes = []           # SceneModel objects that are complete (downloaded or NAS-cached)
 
-        # ── Concurrent Background Prefetching Pipeline (3 simultaneous downloads) ──
+        # Prefetch up to 3 scenes concurrently
         MAX_PARALLEL_SCENES = 3
         prefetch_pool = ThreadPoolExecutor(max_workers=MAX_PARALLEL_SCENES)
         prefetch_futures = {}  # { scene_id: (future, sc_dict) }
         next_prefetch_idx = [0]
 
         def _bg_download_scene(sc_item):
-            from app.core.database import SessionLocal
+            from app.db import SessionLocal
             th_db = SessionLocal()
             try:
                 s_id_bg = sc_item["scene_id"]
@@ -732,7 +707,7 @@ def run_district_acquisition_pipeline(
                 logger.info(dl_msg)
                 append_request_log(db, request_id, dl_msg)
 
-                # ---- FAST CHECK: is the scene already complete on NAS? ----
+                # Fast path: scene already complete on NAS
                 s_is_s1 = _is_s1(sc, satellite)
                 s_dir = _resolve_scene_dir(sc, satellite, district_name=district_name)
                 cached, _, problem = _scene_cached_on_nas(s_dir, s_is_s1)
@@ -764,7 +739,7 @@ def run_district_acquisition_pipeline(
                 if problem and os.path.isdir(s_dir):
                     append_request_log(db, request_id, f"     • NAS copy incomplete ({problem}); downloading.")
 
-                # ---- Check if background prefetch stream was already fetching this scene ----
+                # Reuse the prefetch stream if it already started this scene-
                 was_prefetched = False
                 if s_id in prefetch_futures:
                     fut_entry, _ = prefetch_futures.pop(s_id)
@@ -856,9 +831,7 @@ def run_district_acquisition_pipeline(
             )
         append_request_log(db, request_id, "=" * 78)
 
-        # ────────────────────────────────────────────────
         # SENTINEL-1 SAR CALIBRATION & TERRAIN CORRECTION (ESA SNAP Engine)
-        # ────────────────────────────────────────────────
         if "Sentinel-1" in satellite:
             if _is_request_stopped(db, request_id):
                 append_request_log(db, request_id, "[STOPPED] Pipeline halted before Sentinel-1 processing because request was cancelled.", level="WARNING")
@@ -918,9 +891,7 @@ def run_district_acquisition_pipeline(
 
             append_request_log(db, request_id, "=" * 78)
 
-        # ────────────────────────────────────────────────
         # STAGE 3 - Spectral Index Calculation (SRS 8.4.1 & 8.4.3)  [Optical Sentinel-2 Only]
-        # ────────────────────────────────────────────────
         indices_computed = 0
         indices_skipped = 0
         index_errors = 0
@@ -984,7 +955,7 @@ def run_district_acquisition_pipeline(
                 scene_dir = _resolve_scene_dir(sc_item, satellite, district_name=district_name)
                 band_paths = _list_band_paths(scene_dir)
 
-                # ---------- Optical: NDVI + LSWI ----------
+                # Optical: NDVI + LSWI
                 ndvi_path = os.path.join(scene_dir, "NDVI.tif")
                 lswi_path = os.path.join(scene_dir, "LSWI.tif")
 
@@ -1053,9 +1024,7 @@ def run_district_acquisition_pipeline(
             else:
                 _update_job(db, proc_job, "COMPLETED")
 
-        # ────────────────────────────────────────────────
         # STAGE 4 - Temporal Compositing & District Delivery (SRS 8.4 & 8.5)
-        # ────────────────────────────────────────────────
         if composite_interval and composite_interval.lower() not in ("none", "null", "false", "0"):
             if _is_request_stopped(db, request_id):
                 append_request_log(db, request_id, "[STOPPED] Pipeline halted before compositing because request was cancelled.", level="WARNING")
@@ -1156,9 +1125,6 @@ def run_district_acquisition_pipeline(
         db.close()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Batch & State-Level Processing
-# ─────────────────────────────────────────────────────────────────────────────
 
 def process_all_districts_in_db(start_date: str, end_date: str, satellite: str = "Sentinel-2"):
     """Iterates through all mapped districts in district_tiles_mapping and runs the pipeline."""

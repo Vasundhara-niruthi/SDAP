@@ -1,13 +1,7 @@
-"""
-=============================================================================
-SDAP Database Repositories Package
-=============================================================================
-Location: backend/app/db/repositories/__init__.py
+"""SDAP Database Repositories Package
 
-Description:
-    Exposes reusable query repositories for administrative boundaries,
-    requests, Sentinel metadata, and user accounts.
-=============================================================================
+Exposes reusable query repositories for administrative boundaries,
+requests, Sentinel metadata, and user accounts.
 """
 
 from app.db.repositories.boundary_repo import BoundaryRepository

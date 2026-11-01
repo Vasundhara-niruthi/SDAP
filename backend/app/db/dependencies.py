@@ -1,13 +1,7 @@
-"""
-=============================================================================
-SDAP FastAPI Database Session Dependencies
-=============================================================================
-Location: backend/app/db/dependencies.py
+"""SDAP FastAPI Database Session Dependencies
 
-Description:
-    Provides the get_db() FastAPI dependency yielding request-scoped
-    database sessions with guaranteed cleanup.
-=============================================================================
+Provides the get_db() FastAPI dependency yielding request-scoped
+database sessions with guaranteed cleanup.
 """
 
 from typing import Generator

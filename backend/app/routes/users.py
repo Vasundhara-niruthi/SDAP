@@ -1,13 +1,7 @@
-"""
-=============================================================================
-SDAP User Management API Routes
-=============================================================================
-Location: backend/app/routes/users.py
+"""SDAP User Management API Routes
 
-Description:
-    Admin-only user CRUD, role assignments, user request listings,
-    work telemetry breakdown, and storage analytics.
-=============================================================================
+Admin-only user CRUD, role assignments, user request listings,
+work telemetry breakdown, and storage analytics.
 """
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -15,10 +9,10 @@ from sqlalchemy.orm import Session, joinedload
 from sqlalchemy import func
 from typing import List, Optional
 
-from app.core.database import get_db
+from app.db import get_db
 from app.core.security import get_current_admin, hash_password
-from app.models.sdap_models import UserModel, RequestModel
-from app.schemas.user_schema import UserCreate, UserResponse
+from app.db.models import UserModel, RequestModel
+from app.schemas.user_schema import UserCreate, UserResponse, AdminPasswordReset
 from app.schemas.request_schema import RequestResponse
 
 router = APIRouter()
@@ -33,17 +27,18 @@ def create_user(
     """
     Admin-only endpoint to create new user accounts and assign roles (ADMIN / USER).
     """
-    existing = db.query(UserModel).filter(UserModel.email == user_in.email).first()
+    clean_email = user_in.email.strip().lower() if user_in.email else ""
+    existing = db.query(UserModel).filter(func.lower(UserModel.email) == clean_email).first()
     if existing:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"User with email '{user_in.email}' already exists"
+            detail=f"User with email '{clean_email}' already exists"
         )
 
     db_user = UserModel(
-        email=user_in.email,
-        full_name=user_in.full_name,
-        hashed_password=hash_password(user_in.password),
+        email=clean_email,
+        full_name=user_in.full_name.strip() if user_in.full_name else "",
+        hashed_password=hash_password(user_in.password.strip()),
         role=user_in.role.upper() if user_in.role else "USER",
         is_active=True
     )
@@ -127,6 +122,23 @@ def update_user_role(
     )
 
 
+@router.patch("/{user_id}/password", summary="Set User Password (Admin Only)")
+def admin_reset_user_password(
+    user_id: int,
+    body: AdminPasswordReset,
+    db: Session = Depends(get_db),
+    admin: UserModel = Depends(get_current_admin)
+):
+    """Admin-only: set a new password for a user who has forgotten theirs."""
+    user = db.query(UserModel).filter(UserModel.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User account not found")
+
+    user.hashed_password = hash_password(body.new_password.strip())
+    db.commit()
+    return {"message": f"Password for '{user.email}' updated. Share the new password with the user securely."}
+
+
 @router.get("/{user_id}/requests", response_model=List[RequestResponse], summary="List Requests of Specific User (Admin Only)")
 def get_user_requests(
     user_id: int,
@@ -149,7 +161,10 @@ def get_user_requests(
     ).all()
 
     from app.routes.requests import build_request_response
-    return [build_request_response(r) for r in user_requests]
+    from app.services.stacker_service import get_layer_stacks_for_requests_bulk
+    # Bulk-resolve stack info once instead of one lookup per request (avoids N+1)
+    bulk_stack_info = get_layer_stacks_for_requests_bulk(user_requests, db=db)
+    return [build_request_response(r, stack_info=bulk_stack_info.get(r.id), db=db) for r in user_requests]
 
 
 @router.delete("/{user_id}", status_code=status.HTTP_204_NO_CONTENT, summary="Delete User Account (Admin Only)")
@@ -172,7 +187,7 @@ def delete_user(
     if not user:
         raise HTTPException(status_code=404, detail="User account not found")
 
-    from app.models.sdap_models import ProcessJobModel, TileSceneMetadataModel, Sentinel1SceneMetadataModel
+    from app.db.models import ProcessJobModel, TileSceneMetadataModel, Sentinel1SceneMetadataModel
     # Cascade clean up associated process jobs and user requests
     user_reqs = db.query(RequestModel.id).filter(RequestModel.user_id == user_id).all()
     req_ids = [r[0] for r in user_reqs]
@@ -200,7 +215,7 @@ def get_work_breakdown(
     """
     Admin-only endpoint to retrieve structured work telemetry and satellite request metrics per user.
     """
-    from app.db.migrations.user_data import UserDataMigration
+    from app.db.seeds.user_seeds import UserDataMigration
     migration_mgr = UserDataMigration(db)
     return {
         "audit": migration_mgr.audit_user_directory(),

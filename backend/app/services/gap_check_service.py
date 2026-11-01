@@ -1,23 +1,14 @@
 """
-=============================================================================
-SDAP Gap Check & Scene Search Service (SRS M2)
-=============================================================================
-Location: backend/app/services/gap_check_service.py
+Gap check and scene search (SRS M2).
 
-Description:
-    Performs tile resolution for selected districts via 'district_tiles_mapping',
-    queries AWS Open Data S3 (sentinel-cogs) for available scenes within the requested
-    date range, checks the PostgreSQL database for already held files, and produces
-    the list of genuinely missing scenes to download.
-=============================================================================
+Resolves tiles per district, lists available S2/S1 scenes on AWS, and audits the
+database and NAS to produce the list of scenes still missing.
 """
 
 import os
-import sys
 import json
 import logging
 from datetime import datetime
-from datetime import datetime, timedelta
 from typing import List, Dict, Any, Optional
 from concurrent.futures import ThreadPoolExecutor
 
@@ -29,12 +20,11 @@ from sqlalchemy.orm import Session
 from sqlalchemy import text
 
 from app.core.config import settings
-from app.models.sdap_models import SceneModel, BandFileModel, TileSceneMetadataModel, Sentinel1SceneMetadataModel
+from app.db.models import SceneModel, TileSceneMetadataModel, Sentinel1SceneMetadataModel
 from app.services.downloader_service import ensure_nas_connection
 
 logger = logging.getLogger("sdap.gap_check")
 
-BUCKET = "sentinel-cogs"
 S2_BUCKET = getattr(settings, "AWS_SENTINEL_COGS_BUCKET", "sentinel-cogs")
 S2_REGION = getattr(settings, "AWS_COGS_REGION", "us-west-2")
 s3_s2_client = boto3.client(
@@ -88,8 +78,8 @@ def get_tiles_for_state(db: Session, state_name: str) -> List[str]:
 
 def get_tiles_for_district(db: Session, district_name: str, state_name: Optional[str] = None) -> List[str]:
     """
-    Resolves Sentinel-2 tile IDs for a given district name from district_tiles_mapping.
-    Supports optional state_name filtering and fuzzy/alias matching (e.g. Angul / Anugul).
+    Resolves S2 tile IDs for a district from district_tiles_mapping, with optional
+    state filter and fuzzy matching (e.g. Angul / Anugul).
     """
     query = "SELECT DISTINCT tile_id FROM district_tiles_mapping WHERE LOWER(district_name) = LOWER(:d_name)"
     params = {"d_name": district_name.strip()}
@@ -102,7 +92,7 @@ def get_tiles_for_district(db: Session, district_name: str, state_name: Optional
     tiles = [r[0] for r in rows]
 
     if not tiles and state_name:
-        # Try district without state in case state name had slight variation
+        # Retry without state in case its spelling differs
         rows = db.execute(
             text("SELECT DISTINCT tile_id FROM district_tiles_mapping WHERE LOWER(district_name) = LOWER(:d_name)"),
             {"d_name": district_name.strip()}
@@ -110,7 +100,7 @@ def get_tiles_for_district(db: Session, district_name: str, state_name: Optional
         tiles = [r[0] for r in rows]
 
     if not tiles:
-        # Fallback search matching partial district name (handles Angul vs Anugul, etc.)
+        # Partial name match (Angul vs Anugul)
         clean_name = district_name.strip()
         rows = db.execute(
             text("SELECT DISTINCT tile_id FROM district_tiles_mapping WHERE district_name ILIKE :d_like;"),
@@ -119,7 +109,7 @@ def get_tiles_for_district(db: Session, district_name: str, state_name: Optional
         tiles = [r[0] for r in rows]
 
     if not tiles and state_name:
-        # Fallback to state tiles if district not specifically matched
+        # Fall back to state tiles
         tiles = get_tiles_for_state(db, state_name)
 
     logger.info(f"Resolved {len(tiles)} tile(s) for district '{district_name}' (State: {state_name}): {tiles}")
@@ -129,8 +119,7 @@ def get_tiles_for_district(db: Session, district_name: str, state_name: Optional
 
 def get_s2_cloud_cover(s3_client, bucket: str, sc_prefix: str, folder: str) -> float:
     """
-    Fetches 'eo:cloud_cover' or 'cloud_cover' percentage from S3 scene JSON or stac.json.
-    Returns float cloud cover percentage (0.0 to 100.0). Defaults to 0.0 if not found.
+    Reads cloud cover (0-100) from the scene JSON or stac.json; 0.0 if absent.
     """
     try:
         prefix_clean = sc_prefix.rstrip('/')
@@ -142,8 +131,8 @@ def get_s2_cloud_cover(s3_client, bucket: str, sc_prefix: str, folder: str) -> f
             return float(props['eo:cloud_cover'])
         if 'cloud_cover' in props:
             return float(props['cloud_cover'])
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug(f"No scene JSON cloud cover for '{folder}': {e}")
 
     try:
         prefix_clean = sc_prefix.rstrip('/')
@@ -155,19 +144,17 @@ def get_s2_cloud_cover(s3_client, bucket: str, sc_prefix: str, folder: str) -> f
             return float(props['eo:cloud_cover'])
         if 'cloud_cover' in props:
             return float(props['cloud_cover'])
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug(f"No stac.json cloud cover for '{folder}': {e}")
 
     return 0.0
 
 
 def search_aws_scenes_for_tile(tile_id: str, start_date: str, end_date: str) -> List[Dict[str, Any]]:
     """
-    Searches AWS S3 for available Sentinel-2 scenes for a given tile ID
-    between start_date and end_date (YYYY-MM-DD format).
-    Prioritizes Sentinel-2 COGs (sentinel-cogs in us-west-2, GeoTIFF) with fallback to sentinel-s2-l2a.
+    Lists S2 scenes on AWS for a tile between start_date and end_date (YYYY-MM-DD).
+    Prefers sentinel-cogs (us-west-2), falling back to sentinel-s2-l2a, and attaches cloud cover.
     Layout: sentinel-s2-l2a-cogs/[utm]/[lat]/[sq]/[year]/[month]/[folder]/
-    Attaches cloud_cover percentage metadata from S3 JSON.
     """
     if len(tile_id) < 5:
         return []
@@ -188,7 +175,6 @@ def search_aws_scenes_for_tile(tile_id: str, start_date: str, end_date: str) -> 
     cur_year = start_dt.year
 
     while cur_year <= end_dt.year:
-        # 1. Search Sentinel COGs bucket (sentinel-cogs)
         s3_prefix = f"sentinel-s2-l2a-cogs/{utm_zone_raw}/{latitude_band}/{grid_square}/{cur_year}/"
         try:
             resp = s3_s2_client.list_objects_v2(Bucket=S2_BUCKET, Prefix=s3_prefix, Delimiter="/")
@@ -230,7 +216,7 @@ def search_aws_scenes_for_tile(tile_id: str, start_date: str, end_date: str) -> 
         except Exception as err:
             logger.warning(f"Error querying S3 for tile {tile_id} prefix {s3_prefix}: {err}")
 
-        # If no scenes found in COGs, fallback to sentinel-s2-l2a registry
+        # No COG scenes: fall back to sentinel-s2-l2a
         if not available_scenes:
             alt_prefix = f"tiles/{utm_zone}/{latitude_band}/{grid_square}/{cur_year}/"
             try:
@@ -272,7 +258,6 @@ def search_aws_scenes_for_tile(tile_id: str, start_date: str, end_date: str) -> 
 
         cur_year += 1
 
-    # Attach cloud cover percentage in parallel
     if available_scenes:
         def _attach(sc: Dict[str, Any]) -> Dict[str, Any]:
             cld = get_s2_cloud_cover(s3_s2_client, S2_BUCKET, sc.get("prefix", ""), sc.get("folder", ""))
@@ -293,11 +278,8 @@ def search_aws_scenes_for_s1(
     db: Optional[Session] = None
 ) -> List[Dict[str, Any]]:
     """
-    Searches AWS S3 for Sentinel-1 GRD SAR scenes that geographically intersect the requested district.
-    Supports all states and districts across India using spatial STAC and DAAC services.
-    Primary: Earth Search STAC API with district bounding box.
-    Secondary: Alaska Satellite Facility (ASF) DAAC API with district centroid point.
-    Guarantees only genuine intersecting radar scenes are returned; never returns out-of-bounds scenes.
+    Lists S1 GRD scenes intersecting the district.
+    Primary: Earth Search STAC (district bbox); fallback: ASF DAAC (district centroid).
     """
     s_clean = start_date.split("T")[0]
     e_clean = end_date.split("T")[0]
@@ -320,7 +302,7 @@ def search_aws_scenes_for_s1(
         except Exception as e:
             logger.warning(f"Could not compute geometry bounds for district '{district_name}': {e}")
 
-    # Strategy 1: Earth Search STAC API (fast, authoritative AWS S3 GRD catalog covering all of India)
+    # Earth Search STAC (authoritative AWS GRD catalog)
     if district_bbox:
         try:
             stac_url = "https://earth-search.aws.element84.com/v1/search"
@@ -341,11 +323,10 @@ def search_aws_scenes_for_s1(
                         continue
                     seen_granules.add(g_name)
 
-                    # Extract sensing date
                     props = feat.get("properties", {})
                     dt_str = props.get("datetime", "")[:10] or s_clean
 
-                    # Extract S3 prefix from asset URLs or construct canonical path
+                    # S3 prefix from asset URLs, else canonical path
                     vh_asset = feat.get("assets", {}).get("vh", {})
                     vh_href = vh_asset.get("href", "")
                     s3_prefix = ""
@@ -385,7 +366,7 @@ def search_aws_scenes_for_s1(
         except Exception as err:
             logger.warning(f"Earth Search STAC query for Sentinel-1 failed: {err}")
 
-    # Strategy 2: Alaska Satellite Facility (ASF) DAAC API (Secondary spatial fallback)
+    # ASF DAAC fallback
     if centroid_pt:
         try:
             asf_url = "https://api.daac.asf.alaska.edu/services/search/param"
@@ -441,9 +422,7 @@ def search_aws_scenes_for_s1(
 
 def _band_files_exist_on_disk(scene_dir: str, bands: List[str]) -> bool:
     """
-    Returns True only if ALL required band TIF files physically exist in
-    scene_dir with size > 0 bytes. Checks .tif and .tiff extensions only.
-    An empty or partial folder → False → triggers re-download.
+    True only if every required band .tif/.tiff exists in scene_dir and is non-empty.
     """
     if not os.path.isdir(scene_dir):
         return False
@@ -461,12 +440,8 @@ def _band_files_exist_on_disk(scene_dir: str, bands: List[str]) -> bool:
 
 def _is_s1_scene_complete_on_disk(scene_dir: str) -> bool:
     """
-    Returns True only if the complete Sentinel-1 ESA SAFE product hierarchy physically exists on disk:
-    1. manifest.safe exists and is non-empty (>0 bytes)
-    2. measurement/ folder exists and contains valid .tif/.tiff rasters
-    3. annotation/ folder exists and contains files
-    4. preview/ folder exists
-    An empty, legacy, or partial folder (e.g. only root VV.tiff/VH.tiff) -> False -> triggers full re-download.
+    True only if the full ESA SAFE hierarchy exists: non-empty manifest.safe,
+    measurement/ with rasters, annotation/ with files, and preview/.
     """
     if not os.path.isdir(scene_dir):
         return False
@@ -504,15 +479,9 @@ def perform_gap_check(
     state_name: Optional[str] = None
 ) -> Dict[str, Any]:
     """
-    SRS M2 Gap Check:
-    1. Resolves tiles for district and state.
-    2. Queries AWS Open Data S3 for available scenes (Sentinel-2 COGs and/or Sentinel-1 GRD).
-    3. Filters scenes by max_cloud_cover threshold before downloading.
-    4. Cross-references PostgreSQL database AND physically verifies NAS band files on disk.
-    5. A scene is HELD only if BOTH: (a) DB record exists as HELD/DOWNLOADED AND
-       (b) ALL required band TIF files physically exist on NAS with size > 0.
-       If NAS files were deleted, scene is flagged MISSING regardless of DB status.
-    6. Returns summary, held scenes details, and list of genuinely missing scenes.
+    SRS M2 gap check: lists AWS scenes, filters by max_cloud_cover, and cross-checks DB and NAS.
+    A scene is HELD only if its DB record is HELD/DOWNLOADED and all band files exist on NAS;
+    otherwise it is MISSING. Returns summary, held scenes and missing scenes.
     """
     if required_bands is None:
         required_bands = ["B02", "B03", "B04", "B08", "TCI", "B8A", "B11", "SCL"]
@@ -555,7 +524,7 @@ def perform_gap_check(
         if "S1_SAR" not in tiles:
             tiles.append("S1_SAR")
 
-    # Cloud cover threshold filtering (SRS requirement: only download scenes <= max_cloud_cover)
+    # SRS: only download scenes <= max_cloud_cover
     all_aws_scenes = []
     skipped_high_cloud_scenes = []
     seen_aws_ids = set()
@@ -576,13 +545,10 @@ def perform_gap_check(
         f"Filtered by Max Cloud Cover ({max_cloud_cover}%): {len(all_aws_scenes)} scenes passed, {len(skipped_high_cloud_scenes)} skipped."
     )
 
-    # Ensure NAS connection before checking local/network raw archive storage
+    # Ensure NAS is connected
     ensure_nas_connection(settings.RAW_ARCHIVE_DIR)
 
-    # ------------------------------------------------------------------
-    # FIX: Build DB lookup by scene_id and product_name (not by S3 prefix
-    # which is never stored in tile_path / scene_path DB columns).
-    # ------------------------------------------------------------------
+    # DB lookups by scene_id/product_name (S3 prefix is never stored in the DB)
     # SceneModel: scene_id + status == "HELD"
     held_scene_ids_in_db = set(
         r[0] for r in db.query(SceneModel.scene_id).filter(
@@ -595,12 +561,13 @@ def perform_gap_check(
             TileSceneMetadataModel.download_status == "DOWNLOADED"
         ).all() if r[0]
     )
-    # Sentinel-1 scene folder names marked DOWNLOADED
     s1_downloaded_folders_in_db = set(
         r[0] for r in db.query(Sentinel1SceneMetadataModel.scene_path).filter(
             Sentinel1SceneMetadataModel.download_status == "DOWNLOADED"
         ).all() if r[0]
     )
+
+    backend_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 
     def audit_scene_on_nas_and_db(sc: Dict[str, Any]) -> tuple:
         s_id = sc["scene_id"]
@@ -613,7 +580,7 @@ def perform_gap_check(
         is_s1_scene = sc_sat == "Sentinel-1"
         sat_subfolder = "Sentinel-1" if is_s1_scene else "Sentinel-2"
 
-        # Resolve NAS path first (district-aware for Sentinel-1, both subfolder and legacy layouts), fallback to local archive
+        # NAS path first (district-aware for S1, subfolder and legacy layouts), then local archive
         if is_s1_scene and district_name:
             cand_dist_nas = os.path.join(settings.RAW_ARCHIVE_DIR, sat_subfolder, tile, district_name, year, month, folder)
             if os.path.isdir(cand_dist_nas):
@@ -640,8 +607,8 @@ def perform_gap_check(
                                         scene_archive_dir_nas = os.path.join(parent_nas, cand)
                                         found = True
                                         break
-                            except Exception:
-                                pass
+                            except Exception as e:
+                                logger.debug(f"Could not list '{parent_nas}': {e}")
                         if not found:
                             scene_archive_dir_nas = cand_dist_nas
         else:
@@ -660,10 +627,9 @@ def perform_gap_check(
                                 if cand.startswith(folder) or folder.startswith(cand):
                                     scene_archive_dir_nas = os.path.join(parent_nas, cand)
                                     break
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            logger.debug(f"Could not list '{parent_nas}': {e}")
 
-        backend_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
         if is_s1_scene and district_name:
             cand_dist_loc = os.path.abspath(os.path.join(backend_root, "data", "archive", sat_subfolder, tile, district_name, year, month, folder))
             if os.path.isdir(cand_dist_loc):
@@ -686,21 +652,20 @@ def perform_gap_check(
                             if cand.startswith(folder) or folder.startswith(cand):
                                 scene_archive_dir_local = os.path.join(parent_loc, cand)
                                 break
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.debug(f"Could not list '{parent_loc}': {e}")
 
         scene_archive_dir = scene_archive_dir_nas
         if not os.path.isdir(scene_archive_dir_nas) and os.path.isdir(scene_archive_dir_local):
             scene_archive_dir = scene_archive_dir_local
 
         if sc_sat == "Sentinel-1":
-            # For Sentinel-1, physically verify full ESA SAFE product hierarchy on NAS
+            # S1: verify the full SAFE hierarchy on NAS
             has_disk_bands = _is_s1_scene_complete_on_disk(scene_archive_dir)
         else:
             bands_to_verify = required_bands if required_bands else ["B02", "B03", "B04", "B08", "TCI", "B8A", "B11", "SCL"]
             has_disk_bands = _band_files_exist_on_disk(scene_archive_dir, bands_to_verify)
 
-        # ── FIX: DB check uses scene_id and product_name (correct fields) ──
         is_held_in_db = (
             s_id in held_scene_ids_in_db
             or s_id in downloaded_product_names_in_db
@@ -708,8 +673,7 @@ def perform_gap_check(
             or any(folder in p for p in s1_downloaded_folders_in_db)
         )
 
-        # ── FIX: HELD = DB record EXISTS + ALL band files on disk ──────────
-        # If DB says HELD but NAS files are gone → MISSING → triggers re-download
+        # DB says HELD but NAS files gone: MISSING (re-download)
         if has_disk_bands:
             held_info = dict(sc)
             held_info["archive_path"] = scene_archive_dir
@@ -723,7 +687,6 @@ def perform_gap_check(
                 )
             return True, held_info
         else:
-            # Files not on NAS — mark MISSING regardless of DB status
             if is_held_in_db:
                 logger.warning(
                     f"Scene '{s_id}' is marked HELD in DB but band files are MISSING from NAS "
@@ -734,7 +697,7 @@ def perform_gap_check(
     held_scenes = []
     missing_scenes = []
 
-    # Parallel multi-threaded audit across NAS and PostgreSQL (up to 32 concurrent workers)
+    # Parallel audit of NAS and DB (up to 32 workers)
     max_audit_workers = min(32, max(4, len(all_aws_scenes))) if all_aws_scenes else 1
     with ThreadPoolExecutor(max_workers=max_audit_workers) as executor:
         audit_results = list(executor.map(audit_scene_on_nas_and_db, all_aws_scenes))

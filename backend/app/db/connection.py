@@ -1,13 +1,7 @@
-"""
-=============================================================================
-SDAP Database Engine & Connection Pooling
-=============================================================================
-Location: backend/app/db/connection.py
+"""SDAP Database Engine & Connection Pooling
 
-Description:
-    Configures PostgreSQL connection parameters, pooling, synchronous engine,
-    SQLAlchemy session factory, and database diagnostic health checks.
-=============================================================================
+Configures PostgreSQL connection parameters, pooling, synchronous engine,
+SQLAlchemy session factory, and database diagnostic health checks.
 """
 
 import logging

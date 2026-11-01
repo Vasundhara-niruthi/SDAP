@@ -1,30 +1,11 @@
-"""
-=============================================================================
-SDAP GeoTIFF Data Retrieval Script (SRS Stage 2/3/4)
-=============================================================================
-Location: backend/app/db/scripts/retrieve_downloaded_data.py
+"""Query downloaded and verified GeoTIFFs from PostgreSQL/NAS and list, export or copy them.
 
-Description:
-    Command-line utility to query downloaded and verified GeoTIFF (.tif)
-    rasters from PostgreSQL and NAS storage by State, District, Date Range,
-    Satellite, Band, or Composite Interval.
-    Supports both Sentinel-1 (VV, VH, VV_VH) and Sentinel-2 (NDVI, LSWI,
-    spectral bands) composite deliverables as well as individual scene rasters.
-    Supports exporting to CSV, JSON, TXT, or copying files to an output folder.
+Filters: request, state, district, date range, satellite, band, composite interval.
 
-Usage Examples:
-    # 1. Retrieve all deliverables by Request ID:
+Examples:
     python backend/app/db/scripts/retrieve_downloaded_data.py --request-id 34
-
-    # 2. Retrieve composites only for Sentinel-1:
     python backend/app/db/scripts/retrieve_downloaded_data.py --district "Agar Malwa" --satellite Sentinel-1 --composites-only
-
-    # 3. Retrieve Sentinel-2 composites with monthly interval:
-    python backend/app/db/scripts/retrieve_downloaded_data.py --district Chittoor --satellite Sentinel-2 --composite-interval monthly
-
-    # 4. Export all matching paths to a text file:
     python backend/app/db/scripts/retrieve_downloaded_data.py --district Chittoor --export-paths paths.txt
-=============================================================================
 """
 
 import os
@@ -35,10 +16,10 @@ import shutil
 import argparse
 import logging
 
-# Adjust Python path to include backend root directory
+# Make the backend root importable
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../../..")))
 
-from app.core.database import SessionLocal
+from app.db import SessionLocal
 from app.services.downloader_service import (
     get_downloaded_tifs_for_request,
     search_downloaded_tifs_by_region
@@ -140,7 +121,6 @@ def main():
             print(f"  ... and {len(tifs) - 25} more GeoTIFF files.")
         print("-" * 78)
 
-        # Export Options
         if args.export_paths:
             out_p = os.path.abspath(args.export_paths)
             with open(out_p, "w", encoding="utf-8") as f:

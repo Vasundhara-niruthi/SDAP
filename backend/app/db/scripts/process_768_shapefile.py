@@ -1,15 +1,5 @@
-"""
-=============================================================================
-SDAP 768 Shapefile Direct Extractor & Reverse Geocoder
-=============================================================================
-Location: backend/scripts/process_768_shapefile.py
-
-Description:
-    Reads 'All_India_Distwise_UID.shp' directly (768 shapes), reverse-geocodes
-    each representative point to fetch the exact real State & District name,
-    updates PostgreSQL tables (district_boundaries, state_boundaries, country_boundaries,
-    district_tiles_mapping), and exports all 3 administrative level GeoJSON files.
-=============================================================================
+"""Read the 768 shapes in 'All_India_Distwise_UID.shp', reverse-geocode State/District names,
+update the boundary tables and export the three GeoJSON levels.
 """
 
 import os
@@ -20,7 +10,7 @@ import urllib.request
 import logging
 from typing import Dict, Any, List
 
-# Ensure backend root is registered in Python path
+# Make the backend root importable
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import shapefile
@@ -29,7 +19,6 @@ from shapely.ops import unary_union
 from sqlalchemy import create_engine, text
 from app.core.config import settings
 
-# Configure Logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("sdap.shp_768_processor")
 
@@ -98,7 +87,6 @@ def process_768_shapefile():
     shapes = sf.shapes()
     logger.info(f"Loaded {len(shapes)} geometry shapes from shapefile.")
 
-    # Load cache if available
     geocode_cache = {}
     if os.path.exists(CACHE_FILE):
         try:
@@ -108,7 +96,6 @@ def process_768_shapefile():
         except Exception as e:
             logger.warning(f"Could not load geocode cache: {e}")
 
-    # Process all 768 shapes
     districts = []
     updated_cache = False
 
@@ -147,7 +134,6 @@ def process_768_shapefile():
 
     logger.info(f"[SUCCESS] Processed and enriched all {len(districts)} shapes from {SHP_PATH}.")
 
-    # Grouping by State
     state_groups = {}
     for d in districts:
         st = d["state_name"]

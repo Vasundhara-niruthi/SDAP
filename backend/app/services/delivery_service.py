@@ -1,22 +1,11 @@
 """
-=============================================================================
-SDAP Joining, Reprojection & District Delivery Clipping Service (SRS 8.4.4 & 8.5)
-=============================================================================
-Location: backend/app/services/delivery_service.py
+Reprojection, mosaicing and district clipping (SRS 8.4.4 & 8.5).
 
-Description:
-    1. Reprojection: Reprojects every input tile raster to a unified projection
-       (e.g., EPSG:4326 / EPSG:3857) to prevent UTM zone boundary shift artifacts.
-    2. Mosaic/Join: Merges reprojected rasters into a single contiguous image.
-    3. District Clipping: Clips mosaic to the district boundary polygon, setting
-       pixels outside the boundary to no-data.
-    4. Coverage & Stats: Calculates district average of valid pixels and records
-       the cloud-free coverage percentage of the district.
-=============================================================================
+Reprojects tiles to one CRS (avoids UTM zone shifts), mosaics them, clips to the
+district polygon, and computes the valid-pixel average and cloud-free coverage.
 """
 
 import os
-import sys
 import json
 import logging
 from typing import Dict, Any, List, Tuple, Optional
@@ -26,7 +15,7 @@ import rasterio
 from rasterio.mask import mask
 from rasterio.warp import calculate_default_transform, reproject, Resampling
 from rasterio.merge import merge
-from shapely.geometry import shape, mapping
+from shapely.geometry import shape
 from sqlalchemy.orm import Session
 from sqlalchemy import text
 
@@ -89,7 +78,7 @@ def get_district_geometry_from_db(
 
 def reproject_raster_to_target_crs(input_path: str, output_path: str, target_crs: str = "EPSG:4326") -> str:
     """
-    Reprojects input raster to target CRS (SRS 8.4.4 mandatory step to prevent UTM zone offset).
+    Reprojects a raster to the target CRS (SRS 8.4.4; prevents UTM zone offsets).
     """
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
@@ -130,11 +119,7 @@ def produce_district_delivery_output(
     target_crs: str = "EPSG:4326"
 ) -> Dict[str, Any]:
     """
-    SRS 8.4.4 & 8.5 Delivery Step:
-    1. Reprojects tile rasters to single target CRS.
-    2. Joins / Mosaics rasters into single image.
-    3. Clips mosaic to district boundary polygon.
-    4. Computes district average and cloud-free coverage statistic.
+    SRS 8.4.4 & 8.5 delivery: reproject, mosaic, clip to the district, and compute average and coverage.
     """
     if not index_raster_paths:
         raise ValueError("No index raster paths provided for delivery clipping.")
@@ -142,70 +127,66 @@ def produce_district_delivery_output(
     delivery_dir = os.path.join(DELIVERIES_DIR, f"request_{request_id}")
     os.makedirs(delivery_dir, exist_ok=True)
 
-    # 1. Fetch District Geometry
     geom_dict, state_name = get_district_geometry_from_db(db, district_name)
     if not geom_dict:
         raise ValueError(f"District geometry for '{district_name}' not found in PostgreSQL database.")
 
     district_geom = shape(geom_dict)
 
-    # 2. Reproject each tile raster to unified target CRS
     reprojected_paths = []
-    for idx, r_path in enumerate(index_raster_paths):
-        if not os.path.exists(r_path):
-            continue
-        reproj_out = os.path.join(delivery_dir, f"reprojected_{idx}.tif")
-        reproject_raster_to_target_crs(r_path, reproj_out, target_crs)
-        reprojected_paths.append(reproj_out)
-
-    if not reprojected_paths:
-        raise FileNotFoundError("None of the specified index rasters could be reprojected.")
-
-    # 3. Join / Mosaic reprojected rasters (strictly bounded to district bounds to safeguard memory)
-    opened_srcs = [rasterio.open(p) for p in reprojected_paths]
-    mosaic_array, mosaic_transform = merge(opened_srcs, bounds=district_geom.bounds, nodata=np.nan)
-    
-    mosaic_meta = opened_srcs[0].meta.copy()
-    mosaic_meta.update({
-        "height": mosaic_array.shape[1],
-        "width": mosaic_array.shape[2],
-        "transform": mosaic_transform,
-        "crs": target_crs,
-        "nodata": np.nan
-    })
-
-    # Save temporary mosaic
     temp_mosaic_path = os.path.join(delivery_dir, "temp_mosaic.tif")
-    with rasterio.open(temp_mosaic_path, "w", **mosaic_meta) as dst:
-        dst.write(mosaic_array)
-
-    for src in opened_srcs:
-        src.close()
-
-    # 4. Clip Mosaic to District Polygon Boundary
     final_output_path = os.path.join(delivery_dir, output_filename)
-    with rasterio.open(temp_mosaic_path) as src:
-        out_image, out_transform = mask(src, [geom_dict], crop=True, nodata=np.nan)
-        out_meta = src.meta.copy()
+    try:
+        for idx, r_path in enumerate(index_raster_paths):
+            if not os.path.exists(r_path):
+                continue
+            reproj_out = os.path.join(delivery_dir, f"reprojected_{idx}.tif")
+            reprojected_paths.append(reproj_out)
+            reproject_raster_to_target_crs(r_path, reproj_out, target_crs)
 
-    out_meta.update({
-        "height": out_image.shape[1],
-        "width": out_image.shape[2],
-        "transform": out_transform,
-        "nodata": np.nan
-    })
+        if not reprojected_paths:
+            raise FileNotFoundError("None of the specified index rasters could be reprojected.")
 
-    # Save final clipped deliverable
-    with rasterio.open(final_output_path, "w", **out_meta) as dst:
-        dst.write(out_image)
+        opened_srcs = []
+        try:
+            for p in reprojected_paths:
+                opened_srcs.append(rasterio.open(p))
+            mosaic_array, mosaic_transform = merge(opened_srcs, bounds=district_geom.bounds, nodata=np.nan)
 
-    # Clean up temporary reprojected files
-    if os.path.exists(temp_mosaic_path):
-        os.remove(temp_mosaic_path)
-    for p in reprojected_paths:
-        if os.path.exists(p): os.remove(p)
+            mosaic_meta = opened_srcs[0].meta.copy()
+            mosaic_meta.update({
+                "height": mosaic_array.shape[1],
+                "width": mosaic_array.shape[2],
+                "transform": mosaic_transform,
+                "crs": target_crs,
+                "nodata": np.nan
+            })
 
-    # 5. Calculate District Average & Cloud-Free Coverage
+            with rasterio.open(temp_mosaic_path, "w", **mosaic_meta) as dst:
+                dst.write(mosaic_array)
+        finally:
+            for src in opened_srcs:
+                src.close()
+
+        with rasterio.open(temp_mosaic_path) as src:
+            out_image, out_transform = mask(src, [geom_dict], crop=True, nodata=np.nan)
+            out_meta = src.meta.copy()
+
+        out_meta.update({
+            "height": out_image.shape[1],
+            "width": out_image.shape[2],
+            "transform": out_transform,
+            "nodata": np.nan
+        })
+
+        with rasterio.open(final_output_path, "w", **out_meta) as dst:
+            dst.write(out_image)
+    finally:
+        # Intermediates are removed on success and on failure
+        for p in [temp_mosaic_path] + reprojected_paths:
+            if os.path.exists(p):
+                os.remove(p)
+
     valid_data = out_image[~np.isnan(out_image)]
     total_pixels = out_image.size
     valid_count = valid_data.size

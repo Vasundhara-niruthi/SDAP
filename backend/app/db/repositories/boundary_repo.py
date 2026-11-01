@@ -1,13 +1,7 @@
-"""
-=============================================================================
-SDAP Boundary Repository (Reusable Database Queries)
-=============================================================================
-Location: backend/app/db/repositories/boundary_repo.py
+"""SDAP Boundary Repository (Reusable Database Queries)
 
-Description:
-    Reusable database queries for querying State and District boundaries,
-    spatial geometries, and administrative lookup without duplicated SQL.
-=============================================================================
+Reusable database queries for querying State and District boundaries,
+spatial geometries, and administrative lookup without duplicated SQL.
 """
 
 import json

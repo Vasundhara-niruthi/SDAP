@@ -1,13 +1,7 @@
-"""
-=============================================================================
-SDAP Request Repository (Reusable Database Queries)
-=============================================================================
-Location: backend/app/db/repositories/request_repo.py
+"""SDAP Request Repository (Reusable Database Queries)
 
-Description:
-    Reusable database queries for managing and fetching satellite acquisition
-    requests, status queries, pagination, and user filtering.
-=============================================================================
+Reusable database queries for managing and fetching satellite acquisition
+requests, status queries, pagination, and user filtering.
 """
 
 from typing import List, Optional

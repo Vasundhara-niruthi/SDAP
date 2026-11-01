@@ -1,14 +1,8 @@
-"""
-=============================================================================
-SDAP Multi-Band Layer Stacking API Routes
-=============================================================================
-Location: backend/app/routes/layer_stack.py
+"""SDAP Multi-Band Layer Stacking API Routes
 
-Description:
-    Exposes endpoints for creating layer stack jobs, polling execution status,
-    cancelling running tasks, downloading stacked GeoTIFF outputs, and
-    querying task history.
-=============================================================================
+Exposes endpoints for creating layer stack jobs, polling execution status,
+cancelling running tasks, downloading stacked GeoTIFF outputs, and
+querying task history.
 """
 
 import os
@@ -22,15 +16,16 @@ except (ImportError, ModuleNotFoundError):
     from starlette.responses import FileResponse  # type: ignore
 from sqlalchemy.orm import Session
 
-from app.core.database import get_db
+from app.db import get_db
 from app.core.security import get_current_user
-from app.models.sdap_models import UserModel, LayerStackJobModel
+from app.db.models import UserModel, LayerStackJobModel, RequestModel
 from app.schemas.request_schema import LayerStackCreate, LayerStackTaskResponse
-from app.services.downloader_service import resolve_tif_path
+from app.services.downloader_service import safe_resolve_tif_path
 from app.services.stacker_service import (
     launch_layer_stack_task,
     find_matching_layer_stacks_on_nas,
     get_stack_job,
+    get_stack_job_owner,
     cancel_layer_stack_task,
     get_latest_stack_job,
     list_db_stack_jobs,
@@ -40,6 +35,29 @@ from app.services.stacker_service import (
 
 logger = logging.getLogger("sdap.routes.layer_stack")
 router = APIRouter()
+
+
+def _is_admin(user: UserModel) -> bool:
+    return (getattr(user, "role", None) or "").strip().upper() == "ADMIN"
+
+
+def _owns_request(db: Session, request_id: Optional[int], user: UserModel) -> bool:
+    if request_id is None:
+        return False
+    row = db.query(RequestModel.user_id).filter(RequestModel.id == request_id).first()
+    return bool(row and row[0] == user.id)
+
+
+def _can_access_task(db: Session, task_id: str, user: UserModel) -> bool:
+    """Owner of the job, owner of its request, or ADMIN."""
+    if _is_admin(user):
+        return True
+    owner = get_stack_job_owner(task_id, db=db)
+    if not owner:
+        return False
+    if owner.get("user_id") is not None and owner["user_id"] == user.id:
+        return True
+    return _owns_request(db, owner.get("request_id"), user)
 
 
 @router.post("/layer-stack", response_model=LayerStackTaskResponse, summary="Execute multi-band layer stacking across bands and indices")
@@ -146,6 +164,9 @@ def get_layer_stack_task_status(
     current_user: UserModel = Depends(get_current_user)
 ):
     """Poll live progress percentage and real-time execution logs for a layer stacking task (checks in-memory & PostgreSQL)."""
+    # Non-owners get the same 404 as unknown tasks
+    if not _can_access_task(db, task_id, current_user):
+        raise HTTPException(status_code=404, detail=f"Layer stacking task '{task_id}' not found.")
     job = get_stack_job(task_id, db=db)
     if not job:
         raise HTTPException(status_code=404, detail=f"Layer stacking task '{task_id}' not found.")
@@ -160,7 +181,14 @@ def stop_layer_stack_task(
     current_user: UserModel = Depends(get_current_user)
 ):
     """Cancels/stops an active layer stacking task immediately, terminates background workers, and marks status as CANCELLED."""
-    cancel_layer_stack_task(task_id)
+    is_all = not task_id or task_id.strip().lower() == "all"
+    if is_all:
+        # 'all' = every task for ADMIN, only the caller's own tasks otherwise
+        cancel_layer_stack_task(task_id, owner_user_id=None if _is_admin(current_user) else current_user.id)
+    else:
+        if not _can_access_task(db, task_id.strip(), current_user):
+            raise HTTPException(status_code=404, detail=f"Layer stacking task '{task_id}' not found.")
+        cancel_layer_stack_task(task_id)
     return {
         "status": "CANCELLED",
         "task_id": task_id,
@@ -175,7 +203,8 @@ def get_latest_layer_stack_task(
     current_user: UserModel = Depends(get_current_user)
 ):
     """Retrieves the latest running or completed layer stack job from PostgreSQL."""
-    job = get_latest_stack_job(district=district, db=db)
+    owner = None if _is_admin(current_user) else current_user.id
+    job = get_latest_stack_job(district=district, db=db, owner_user_id=owner)
     return job or {}
 
 
@@ -194,7 +223,8 @@ def get_layer_stack_jobs(
         request_id=request_id,
         limit=limit,
         include_logs=include_logs,
-        db=db
+        db=db,
+        owner_user_id=None if _is_admin(current_user) else current_user.id
     )
 
 
@@ -205,7 +235,14 @@ def get_layer_stack_jobs_by_request(
     current_user: UserModel = Depends(get_current_user)
 ):
     """Returns all layer stacking jobs and real-time execution logs for a request."""
-    jobs = list_db_stack_jobs(request_id=request_id, limit=50, include_logs=True, db=db)
+    owner = None
+    if not _is_admin(current_user):
+        row = db.query(RequestModel.user_id).filter(RequestModel.id == request_id).first()
+        if not row:
+            raise HTTPException(status_code=404, detail="Request not found")
+        # Request owner sees all its jobs; others see only jobs they launched
+        owner = None if row[0] == current_user.id else current_user.id
+    jobs = list_db_stack_jobs(request_id=request_id, limit=50, include_logs=True, db=db, owner_user_id=owner)
     return {
         "request_id": request_id,
         "total_jobs": len(jobs),
@@ -220,7 +257,10 @@ def download_layer_stack(
     db: Session = Depends(get_db),
     current_user: UserModel = Depends(get_current_user)
 ):
-    resolved_path, exists = resolve_tif_path(file_path)
+    try:
+        resolved_path, exists = safe_resolve_tif_path(file_path)
+    except PermissionError:
+        raise HTTPException(status_code=403, detail="Access to the requested file path is not permitted.")
     if not exists or not os.path.exists(resolved_path):
         raise HTTPException(status_code=404, detail=f"Layer-stacked GeoTIFF file not found on disk: {file_path}")
 

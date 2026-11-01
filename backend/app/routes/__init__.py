@@ -1,12 +1,6 @@
-"""
-=============================================================================
-SDAP Routes Package
-=============================================================================
-Location: backend/app/routes/__init__.py
+"""SDAP Routes Package
 
-Description:
-    Exposes modular route definitions and the primary api_router.
-=============================================================================
+Exposes modular route definitions and the primary api_router.
 """
 
 from app.routes.api import api_router

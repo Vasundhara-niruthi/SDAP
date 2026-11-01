@@ -1,13 +1,7 @@
-"""
-=============================================================================
-SDAP Database Models Package
-=============================================================================
-Location: backend/app/db/models/__init__.py
+"""SDAP Database Models Package
 
-Description:
-    Exposes all ORM entity models, enums, PostGIS geometry models, and
-    compatibility aliases.
-=============================================================================
+Exposes all ORM entity models, enums, PostGIS geometry models, and
+compatibility aliases.
 """
 
 from app.db.models.sdap_models import (

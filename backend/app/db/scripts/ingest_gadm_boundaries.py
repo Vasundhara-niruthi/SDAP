@@ -1,15 +1,7 @@
-"""
-=============================================================================
-SDAP Modern Administrative Boundary Ingester (GADM 4.1 - 676 Districts, 36 States)
-=============================================================================
-Location: backend/scripts/ingest_gadm_boundaries.py
+"""Ingest GADM 4.1 district (676) and state (36) boundaries for India.
 
-Description:
-    Ingests all 676 modern districts across all 36 States/UTs of India from GADM 4.1
-    (including all 33 modern Telangana districts, Ladakh, Odisha, Uttarakhand, etc.).
-    Populates PostgreSQL tables (district_boundaries, state_boundaries, country_boundaries,
-    district_tiles_mapping) and refreshes all 3 GeoJSON files in backend/data/boundaries/.
-=============================================================================
+Populates the boundary and district_tiles_mapping tables and refreshes the GeoJSON
+files in backend/data/boundaries/.
 """
 
 import os
@@ -20,7 +12,7 @@ import time
 import logging
 from typing import Dict, Any, List
 
-# Ensure backend root is registered in Python path
+# Make the backend root importable
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from shapely.geometry import shape, mapping
@@ -28,7 +20,6 @@ from shapely.ops import unary_union
 from sqlalchemy import create_engine, text
 from app.core.config import settings
 
-# Configure Logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("sdap.gadm_ingester")
 

@@ -1,24 +1,21 @@
-"""
-=============================================================================
-SDAP Authentication & User Access API Routes
-=============================================================================
-Location: backend/app/routes/auth.py
+"""SDAP Authentication & User Access API Routes
 
-Description:
-    Exposes endpoints for user registration, OAuth2 password login,
-    JSON payload login, profile querying, and self-service password reset.
-=============================================================================
+Exposes endpoints for user registration, OAuth2 password login,
+JSON payload login, and profile querying.
 """
+
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy.orm import Session
 from sqlalchemy import func
 
-from app.core.database import get_db
-from app.core.security import hash_password, verify_password, create_access_token, get_current_user
-from app.models.sdap_models import UserModel
-from app.schemas.user_schema import TokenResponse, UserResponse, UserCreate, LoginRequest, PasswordResetRequest
+from app.db import get_db
+from app.core.security import (
+    hash_password, verify_password, create_access_token, get_current_user
+)
+from app.db.models import UserModel
+from app.schemas.user_schema import TokenResponse, UserResponse, UserCreate, LoginRequest
 
 router = APIRouter()
 
@@ -121,32 +118,4 @@ def get_me(current_user: UserModel = Depends(get_current_user)):
     Return current user details.
     """
     return current_user
-
-
-@router.post("/reset-password", summary="Reset User Account Password")
-def reset_password(
-    body: PasswordResetRequest,
-    db: Session = Depends(get_db)
-):
-    """
-    Password reset endpoint allowing users to securely update their account password.
-    """
-    if body.new_password != body.confirm_password:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="New password and confirm password do not match."
-        )
-
-    clean_email = body.email.strip().lower() if body.email else ""
-    user = db.query(UserModel).filter(func.lower(UserModel.email) == clean_email).first()
-    if not user:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"No account found with email '{clean_email}'."
-        )
-
-    user.hashed_password = hash_password(body.new_password.strip())
-    db.commit()
-
-    return {"message": f"Password for account '{user.email}' updated successfully. Please sign in with your new password."}
 

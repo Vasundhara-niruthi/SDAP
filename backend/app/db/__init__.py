@@ -1,13 +1,7 @@
-"""
-=============================================================================
-SDAP Database Package
-=============================================================================
-Location: backend/app/db/__init__.py
+"""SDAP Database Package
 
-Description:
-    Primary access point for database engine, connections, session dependencies,
-    ORM models, query repositories, seeds, and operational scripts.
-=============================================================================
+Primary access point for database engine, connections, session dependencies,
+ORM models, query repositories, seeds, and operational scripts.
 """
 
 from app.db.connection import engine, SessionLocal, Base, check_database_connection

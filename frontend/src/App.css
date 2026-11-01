@@ -7,7 +7,6 @@
   border: 2px solid transparent;
   transition: border-color 0.3s;
   margin-bottom: 24px;
-/* App.css - Clean SDAP Global Utility Styles */
 
   &:hover {
     border-color: var(--accent-border);

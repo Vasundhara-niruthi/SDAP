@@ -1,13 +1,7 @@
-"""
-=============================================================================
-SDAP Database Seeds Package
-=============================================================================
-Location: backend/app/db/seeds/__init__.py
+"""SDAP Database Seeds Package
 
-Description:
-    Exposes initial database seeding routines for default roles, admin users,
-    and reference accounts.
-=============================================================================
+Exposes initial database seeding routines for default roles, admin users,
+and reference accounts.
 """
 
 from app.db.seeds.user_seeds import (

@@ -1,24 +1,7 @@
-"""
-=============================================================================
-SDAP Administrative Boundary Processor & PostgreSQL Importer
-=============================================================================
-Location: backend/scripts/process_and_upload_shapefile.py
+"""Build district, state and country boundaries from 'All_India_Distwise_UID.shp'.
 
-Description:
-    Interacts with 'All_India_Distwise_UID.shp', extracts 768 district geometries,
-    performs spatial aggregation (unary_union) to generate Country, State, and
-    District level boundaries, and uploads all 3 administrative tiers to PostgreSQL.
-
-Output:
-    1. PostgreSQL Database Tables:
-       - country_boundaries
-       - state_boundaries
-       - district_boundaries
-    2. Exported GeoJSON Files:
-       - backend/data/boundaries/country_level.geojson
-       - backend/data/boundaries/state_level.geojson
-       - backend/data/boundaries/district_level.geojson
-=============================================================================
+Writes them to PostgreSQL (district/state/country_boundaries) and to GeoJSON files
+under backend/data/boundaries/.
 """
 
 import os
@@ -28,7 +11,7 @@ import logging
 from datetime import datetime
 from typing import List, Dict, Any
 
-# Ensure backend path is registered
+# Make the backend root importable
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import shapefile
@@ -37,7 +20,6 @@ from shapely.ops import unary_union
 from sqlalchemy import create_engine, text
 from app.core.config import settings
 
-# Configure Logger
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("sdap.shapefile_processor")
 
